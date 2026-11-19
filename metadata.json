@@ -1,0 +1,5 @@
+{
+  "name": "TestDisk & PhotoRec Recovery Suite",
+  "description": "Browser-based disk partition analyzer, boot sector inspector, file carver, and binary signature identifier inspired by TestDisk, QPhotoRec, and fidentify.",
+  "requestFramePermissions": []
+}

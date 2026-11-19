@@ -46,6 +46,7 @@ class QPhotorec: public QWidget
 		void qphotorec_formats();
 		void qphotorec_search();
 		void buttons_updateUI();
+		void destination_changed();
 		/* Recovery UI */
 		void qphotorec_search_updateUI();
 		void stop_and_quit();
@@ -64,6 +65,7 @@ class QPhotorec: public QWidget
 		pstatus_t photorec_find_blocksize(alloc_data_t *list_search_space);
 		pstatus_t photorec_aux(alloc_data_t *list_search_space);
 		void qphotorec_search_setupUI();
+		bool change_recovery_destination();
 		void photorec_info(const file_stat_t *file_stats);
 		void select_disk(disk_t *disk);
 	signals:
@@ -77,6 +79,7 @@ class QPhotorec: public QWidget
 		struct ph_param 	*params;
 		struct ph_options 	*options;
 		bool			stop_the_recovery;
+		QString			recovery_result;
 		/* Setup recovery UI */
                 QComboBox 		*HDDlistWidget;
                 QTableWidget 		*PartListWidget;

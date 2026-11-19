@@ -1,0 +1,353 @@
+import { PartitionEntry } from './partitions';
+
+export interface NtfsClusterRun {
+  lcn: number; // -1 for sparse run
+  clusterCount: number;
+}
+
+export interface NtfsByteExtent {
+  offset: number;
+  length: number;
+}
+
+export interface MftDeletedRecord {
+  recordNumber: number;
+  mftOffset: number;
+  parentRecord: number;
+  filename: string;
+  isDirectory: boolean;
+  inUse: boolean;
+  fileSize: number;
+  modifiedAtMs: number;
+  residentData: Uint8Array | null;
+  runs: NtfsClusterRun[];
+  extents: NtfsByteExtent[];
+  partitionId: string;
+  partitionName: string;
+  usaValid: boolean;
+  reconstructedBytes: Uint8Array;
+}
+
+const WINDOWS_EPOCH_DIFF_MS = 11644473600000;
+
+function filetimeToUnixMs(dv: DataView, pos: number): number {
+  if (pos + 8 > dv.byteLength) return Date.now();
+  const lo = dv.getUint32(pos, true);
+  const hi = dv.getUint32(pos + 4, true);
+  const ticks = hi * 4294967296 + lo;
+  if (ticks <= 0) return Date.now();
+  const ms = Math.floor(ticks / 10000 - WINDOWS_EPOCH_DIFF_MS);
+  return ms > 0 ? ms : Date.now();
+}
+
+function decodeUtf16Le(buf: Uint8Array, pos: number, charCount: number): string {
+  let out = '';
+  const maxChars = Math.min(charCount, Math.floor((buf.length - pos) / 2));
+  for (let i = 0; i < maxChars; i++) {
+    const code = buf[pos + i * 2] | (buf[pos + i * 2 + 1] << 8);
+    if (code === 0) break;
+    out += String.fromCharCode(code);
+  }
+  return out;
+}
+
+/**
+ * Decodes NTFS Mapping Pairs (runlist) for non-resident $DATA attributes
+ * into physical (LCN, clusterCount) extents, following RecoveryNtfs.cpp.
+ */
+export function decodeNtfsRunlist(
+  buf: Uint8Array,
+  start: number,
+  maxEnd: number,
+  lowestVcn: number,
+  highestVcn: number,
+): NtfsClusterRun[] {
+  const runs: NtfsClusterRun[] = [];
+  let pos = start;
+  let vcn = lowestVcn;
+  let lcn = 0;
+
+  while (pos < maxEnd) {
+    const header = buf[pos++];
+    if (header === 0) break;
+
+    const lenBytes = header & 0x0f;
+    const offBytes = (header >> 4) & 0x0f;
+    if (lenBytes === 0 || lenBytes > 8 || offBytes > 8 || pos + lenBytes + offBytes > maxEnd) {
+      return [];
+    }
+
+    let count = 0;
+    for (let i = 0; i < lenBytes; i++) {
+      count += buf[pos + i] * Math.pow(256, i);
+    }
+    pos += lenBytes;
+
+    if (offBytes === 0) {
+      // Sparse run
+      runs.push({ lcn: -1, clusterCount: count });
+    } else {
+      let delta = 0;
+      for (let i = 0; i < offBytes; i++) {
+        delta += buf[pos + i] * Math.pow(256, i);
+      }
+      if ((buf[pos + offBytes - 1] & 0x80) !== 0) {
+        delta -= Math.pow(256, offBytes);
+      }
+      pos += offBytes;
+      lcn += delta;
+      if (lcn < 0) return [];
+      runs.push({ lcn, clusterCount: count });
+    }
+    vcn += count;
+    if (runs.length > 2048 || vcn - 1 > highestVcn + count) break;
+  }
+
+  return runs;
+}
+
+/**
+ * Validates and applies NTFS Update Sequence Array (USA) fixup to a 1024-byte FILE record.
+ */
+export function parseSingleMftRecord(rawRecord: Uint8Array): {
+  inUse: boolean;
+  isDirectory: boolean;
+  usaValid: boolean;
+  recordNumber: number;
+  parentRecord: number;
+  filename: string;
+  fileSize: number;
+  modifiedAtMs: number;
+  residentData: Uint8Array | null;
+  runs: NtfsClusterRun[];
+} | null {
+  if (rawRecord.length < 1024) return null;
+  if (
+    rawRecord[0] !== 0x46 ||
+    rawRecord[1] !== 0x49 ||
+    rawRecord[2] !== 0x4c ||
+    rawRecord[3] !== 0x45
+  ) {
+    return null;
+  }
+
+  const work = rawRecord.slice(0, 1024);
+  const dv = new DataView(work.buffer);
+  const usaOffset = dv.getUint16(4, true);
+  const usaCount = dv.getUint16(6, true);
+  const firstAttrOffset = dv.getUint16(20, true);
+  const flags = dv.getUint16(22, true);
+  const usedBytes = dv.getUint32(24, true);
+  const recordNumber = work.length >= 48 ? dv.getUint32(44, true) : 0;
+
+  if (
+    usaOffset < 42 ||
+    usaCount < 2 ||
+    usaOffset + usaCount * 2 > 1024 ||
+    firstAttrOffset < 42 ||
+    firstAttrOffset >= 1024 ||
+    usedBytes < firstAttrOffset ||
+    usedBytes > 1024
+  ) {
+    return null;
+  }
+
+  // Verify & apply Update Sequence Number (USN) fixup per 512-byte sector
+  const usn = dv.getUint16(usaOffset, true);
+  let usaValid = true;
+  for (let s = 1; s < usaCount && s * 512 <= 1024; s++) {
+    const sectorEnd = s * 512 - 2;
+    if (dv.getUint16(sectorEnd, true) !== usn) {
+      usaValid = false;
+      break;
+    }
+    work[sectorEnd] = work[usaOffset + s * 2];
+    work[sectorEnd + 1] = work[usaOffset + s * 2 + 1];
+  }
+
+  const inUse = (flags & 0x0001) !== 0;
+  const isDirectory = (flags & 0x0002) !== 0;
+
+  let pos = firstAttrOffset;
+  let filename = '';
+  let nameScore = -1;
+  let parentRecord = 5;
+  let modifiedAtMs = Date.now();
+  let fileSize = 0;
+  let residentData: Uint8Array | null = null;
+  let runs: NtfsClusterRun[] = [];
+
+  while (pos + 16 <= usedBytes) {
+    const attrType = dv.getUint32(pos, true);
+    if (attrType === 0xffffffff) break;
+    const attrLen = dv.getUint32(pos + 4, true);
+    if (attrLen < 16 || pos + attrLen > usedBytes) break;
+
+    const form = work[pos + 8];
+    const nameLen = work[pos + 9];
+
+    if (attrType === 0x10 && form === 0 && pos + 24 <= usedBytes) {
+      const valOffset = dv.getUint16(pos + 20, true);
+      const valLen = dv.getUint32(pos + 16, true);
+      if (pos + valOffset + 32 <= pos + attrLen && valLen >= 32) {
+        modifiedAtMs = filetimeToUnixMs(dv, pos + valOffset + 8);
+      }
+    } else if (attrType === 0x30 && form === 0 && pos + 24 <= usedBytes) {
+      const valOffset = dv.getUint16(pos + 20, true);
+      const valLen = dv.getUint32(pos + 16, true);
+      const fnBase = pos + valOffset;
+      if (valLen >= 66 && fnBase + 66 <= pos + attrLen) {
+        const fnNameLen = work[fnBase + 64];
+        const fnSpace = work[fnBase + 65]; // 0=POSIX, 1=Win32, 2=DOS, 3=Win32+DOS
+        const candidate = decodeUtf16Le(work, fnBase + 66, fnNameLen);
+        const spaceRank = fnSpace === 1 || fnSpace === 3 ? 2 : fnSpace === 0 ? 1 : 0;
+        if (candidate && spaceRank >= nameScore) {
+          nameScore = spaceRank;
+          filename = candidate;
+          parentRecord = dv.getUint32(fnBase, true);
+          const fnModified = filetimeToUnixMs(dv, fnBase + 16);
+          if (fnModified > 0) modifiedAtMs = fnModified;
+          const fnSizeLo = dv.getUint32(fnBase + 48, true);
+          const fnSizeHi = dv.getUint32(fnBase + 52, true);
+          const fnSize = fnSizeHi * 4294967296 + fnSizeLo;
+          if (fileSize === 0 && fnSize > 0) fileSize = fnSize;
+        }
+      }
+    } else if (attrType === 0x80 && nameLen === 0) {
+      // Unnamed default $DATA stream
+      if (form === 0 && pos + 24 <= pos + attrLen) {
+        const valLen = dv.getUint32(pos + 16, true);
+        const valOffset = dv.getUint16(pos + 20, true);
+        if (pos + valOffset + valLen <= pos + attrLen) {
+          fileSize = valLen;
+          residentData = work.slice(pos + valOffset, pos + valOffset + valLen);
+        }
+      } else if (form === 1 && pos + 64 <= pos + attrLen) {
+        const lowestVcn = dv.getUint32(pos + 16, true) + dv.getUint32(pos + 20, true) * 4294967296;
+        const highestVcn = dv.getUint32(pos + 24, true) + dv.getUint32(pos + 28, true) * 4294967296;
+        const mpOffset = dv.getUint16(pos + 32, true);
+        const realSizeLo = dv.getUint32(pos + 48, true);
+        const realSizeHi = dv.getUint32(pos + 52, true);
+        fileSize = realSizeHi * 4294967296 + realSizeLo;
+        if (pos + mpOffset < pos + attrLen) {
+          runs = decodeNtfsRunlist(work, pos + mpOffset, pos + attrLen, lowestVcn, highestVcn);
+        }
+      }
+    }
+
+    pos += attrLen;
+  }
+
+  if (!filename || filename.startsWith('$') || isDirectory) return null;
+
+  return {
+    inUse,
+    isDirectory,
+    usaValid,
+    recordNumber,
+    parentRecord,
+    filename,
+    fileSize,
+    modifiedAtMs,
+    residentData,
+    runs,
+  };
+}
+
+function readNtfsBootClusterSize(diskBytes: Uint8Array, partStartOffset: number): number {
+  if (partStartOffset + 64 > diskBytes.length) return 4096;
+  const dv = new DataView(diskBytes.buffer, diskBytes.byteOffset + partStartOffset, 64);
+  const oem = String.fromCharCode(
+    diskBytes[partStartOffset + 3],
+    diskBytes[partStartOffset + 4],
+    diskBytes[partStartOffset + 5],
+    diskBytes[partStartOffset + 6],
+  );
+  if (oem !== 'NTFS') return 4096;
+  const bytesPerSec = dv.getUint16(11, true) || 512;
+  const secPerCluster = diskBytes[partStartOffset + 13] || 8;
+  return Math.max(512, bytesPerSec * secPerCluster);
+}
+
+/**
+ * Scans raw disk image bytes for deleted NTFS MFT FILE records, reconstructing resident
+ * payloads and multi-extent fragmented cluster runs cleanly.
+ */
+export function scanNtfsMftRecordsInBuffer(
+  diskBytes: Uint8Array,
+  partitions: PartitionEntry[],
+): MftDeletedRecord[] {
+  const results: MftDeletedRecord[] = [];
+  const seenOffsets = new Set<number>();
+
+  for (let off = 0; off + 1024 <= diskBytes.length; off += 512) {
+    if (
+      diskBytes[off] !== 0x46 ||
+      diskBytes[off + 1] !== 0x49 ||
+      diskBytes[off + 2] !== 0x4c ||
+      diskBytes[off + 3] !== 0x45
+    ) {
+      continue;
+    }
+
+    const parsed = parseSingleMftRecord(diskBytes.subarray(off, off + 1024));
+    if (!parsed || parsed.inUse || !parsed.usaValid) continue;
+    if (seenOffsets.has(off)) continue;
+    seenOffsets.add(off);
+
+    const lba = Math.floor(off / 512);
+    const part = partitions.find((p) => lba >= p.startLba && lba <= p.endLba);
+    const volOffset = part ? part.startOffset : 0;
+    const clusterBytes = part ? readNtfsBootClusterSize(diskBytes, part.startOffset) : 4096;
+    const partId = part ? part.id : 'unallocated';
+    const partName = part
+      ? `NTFS MFT (${part.detectedFs?.filesystem ?? part.name})`
+      : 'Reconstructed NTFS MFT';
+
+    let reconstructedBytes: Uint8Array = new Uint8Array(0);
+    const extents: NtfsByteExtent[] = [];
+
+    if (parsed.residentData) {
+      reconstructedBytes = parsed.residentData;
+    } else if (parsed.runs.length > 0 && parsed.fileSize > 0) {
+      const out = new Uint8Array(Math.min(parsed.fileSize, 32 * 1024 * 1024));
+      let writeCursor = 0;
+      for (const run of parsed.runs) {
+        if (writeCursor >= out.length) break;
+        const runByteLen = run.clusterCount * clusterBytes;
+        const copyLen = Math.min(runByteLen, out.length - writeCursor);
+        if (run.lcn >= 0) {
+          const byteStart = volOffset + run.lcn * clusterBytes;
+          extents.push({ offset: byteStart, length: copyLen });
+          if (byteStart + copyLen <= diskBytes.length) {
+            out.set(diskBytes.subarray(byteStart, byteStart + copyLen), writeCursor);
+          }
+        }
+        writeCursor += copyLen;
+      }
+      reconstructedBytes = out;
+    }
+
+    if (reconstructedBytes.length === 0 && extents.length === 0) continue;
+
+    results.push({
+      recordNumber: parsed.recordNumber,
+      mftOffset: off,
+      parentRecord: parsed.parentRecord,
+      filename: parsed.filename,
+      isDirectory: parsed.isDirectory,
+      inUse: parsed.inUse,
+      fileSize: parsed.fileSize || reconstructedBytes.length,
+      modifiedAtMs: parsed.modifiedAtMs,
+      residentData: parsed.residentData,
+      runs: parsed.runs,
+      extents,
+      partitionId: partId,
+      partitionName: partName,
+      usaValid: parsed.usaValid,
+      reconstructedBytes,
+    });
+  }
+
+  return results;
+}

@@ -307,25 +307,104 @@ export function buildSampleDiskImage(): { name: string; bytes: Uint8Array } {
   sqv.setUint32(28, 2, false); // 2 pages = 2048 bytes
   disk.set(sampleSqlite, (1088 + 64) * sectorSize);
 
-  // --- Deleted Partition 3: Linux Ext4 Superblock at LBA 2112 (+1024 bytes) ---
-  const ext4Sb = 2112 * sectorSize + 1024;
-  dv.setUint32(ext4Sb + 0x00, 128, true); // s_inodes_count
-  dv.setUint32(ext4Sb + 0x04, 480, true); // s_blocks_count (480 * 1024B = 960 sectors)
-  dv.setUint32(ext4Sb + 0x18, 0, true); // s_log_block_size = 0 => 1024B blocks
-  dv.setUint16(ext4Sb + 0x38, 0xef53, true); // s_magic
-  dv.setUint32(ext4Sb + 0x5c, 0x0004, true); // HAS_JOURNAL
-  dv.setUint32(ext4Sb + 0x60, 0x0040, true); // EXTENTS (ext4)
-  writeAscii(disk, ext4Sb + 0x78, 'ARCHIVE_EXT4');
+  // Embed a deleted NTFS MFT FILE record (Record #38, Tax_Return_2025_Deleted.txt) at LBA 1184
+  const mftRec = new Uint8Array(1024);
+  const mv = new DataView(mftRec.buffer);
+  writeAscii(mftRec, 0, 'FILE');
+  mv.setUint16(4, 48, true); // USA offset
+  mv.setUint16(6, 3, true); // USA count (USN + 2 sectors)
+  mv.setUint16(20, 56, true); // first attribute offset
+  mv.setUint16(22, 0x0000, true); // flags: deleted (inUse = 0)
+  mv.setUint32(28, 1024, true); // allocated size
+  mv.setUint32(44, 38, true); // MFT record #38
+  // Update Sequence Array (USN = 0x0042)
+  mv.setUint16(48, 0x0042, true);
+  mv.setUint16(510, 0x0042, true);
+  mv.setUint16(1022, 0x0042, true);
 
-  // Embed BMP and WAV inside deleted Partition 3
+  let attrPos = 56;
+  // Attr 0x10 ($STANDARD_INFORMATION) - total length 72
+  mv.setUint32(attrPos, 0x10, true);
+  mv.setUint32(attrPos + 4, 72, true);
+  mftRec[attrPos + 8] = 0; // resident
+  mv.setUint32(attrPos + 16, 48, true);
+  mv.setUint16(attrPos + 20, 24, true);
+  // FILETIME for 2026-11-17T14:20:00Z = 134077764000000000 ticks (0x01DB3A... approx)
+  const ticks = BigInt(Math.floor((Date.UTC(2026, 10, 17, 14, 20, 0) + 11644473600000) * 10000));
+  mv.setUint32(attrPos + 24 + 8, Number(ticks & 0xffffffffn), true);
+  mv.setUint32(attrPos + 24 + 12, Number((ticks >> 32n) & 0xffffffffn), true);
+  attrPos += 72;
+
+  // Attr 0x30 ($FILE_NAME)
+  const mftFilename = 'Tax_Return_2025_Deleted.txt';
+  const fnValueLen = 66 + mftFilename.length * 2;
+  const fnAttrLen = Math.ceil((24 + fnValueLen) / 8) * 8;
+  mv.setUint32(attrPos, 0x30, true);
+  mv.setUint32(attrPos + 4, fnAttrLen, true);
+  mftRec[attrPos + 8] = 0; // resident
+  mv.setUint32(attrPos + 16, fnValueLen, true);
+  mv.setUint16(attrPos + 20, 24, true);
+  mv.setUint32(attrPos + 24, 5, true); // parent = root record 5
+  mv.setUint32(attrPos + 24 + 16, Number(ticks & 0xffffffffn), true);
+  mv.setUint32(attrPos + 24 + 20, Number((ticks >> 32n) & 0xffffffffn), true);
+  mftRec[attrPos + 24 + 64] = mftFilename.length;
+  mftRec[attrPos + 24 + 65] = 1; // Win32 namespace
+  for (let i = 0; i < mftFilename.length; i++) {
+    mv.setUint16(attrPos + 24 + 66 + i * 2, mftFilename.charCodeAt(i), true);
+  }
+  attrPos += fnAttrLen;
+
+  // Attr 0x80 ($DATA) resident payload
+  const mftPayload = enc.encode(
+    'Recovered from NTFS $MFT Record #38 ($DATA resident attribute)\r\nDocument: 2025 Tax Summary\r\nIntegrity: Intact UTF-8 text preserved after Shift+Delete.',
+  );
+  const dataAttrLen = Math.ceil((24 + mftPayload.length) / 8) * 8;
+  mv.setUint32(attrPos, 0x80, true);
+  mv.setUint32(attrPos + 4, dataAttrLen, true);
+  mftRec[attrPos + 8] = 0; // resident
+  mv.setUint32(attrPos + 16, mftPayload.length, true);
+  mv.setUint16(attrPos + 20, 24, true);
+  mftRec.set(mftPayload, attrPos + 24);
+  attrPos += dataAttrLen;
+
+  mv.setUint32(attrPos, 0xffffffff, true);
+  mv.setUint32(24, attrPos + 8, true); // usedBytes
+  disk.set(mftRec, (1088 + 96) * sectorSize);
+
+  // --- Deleted Partition 3: Windows exFAT Boot Sector at LBA 2112 ---
+  const exfatOff = 2112 * sectorSize;
+  disk[exfatOff] = 0xeb;
+  disk[exfatOff + 1] = 0x76;
+  disk[exfatOff + 2] = 0x90;
+  writeAscii(disk, exfatOff + 3, 'EXFAT   ');
+  dv.setUint32(exfatOff + 72, 960, true); // VolumeLength (low 32 bits)
+  dv.setUint32(exfatOff + 80, 16, true); // FatOffset
+  dv.setUint32(exfatOff + 84, 8, true); // FatLength
+  dv.setUint32(exfatOff + 88, 24, true); // ClusterHeapOffset
+  dv.setUint32(exfatOff + 92, 110, true); // ClusterCount
+  disk[exfatOff + 108] = 9; // BytesPerSectorShift (512)
+  disk[exfatOff + 109] = 3; // SectorsPerClusterShift (8)
+  disk[exfatOff + 110] = 1; // NumberOfFats
+  disk[exfatOff + 510] = 0x55;
+  disk[exfatOff + 511] = 0xaa;
+
+  // Embed BMP and WAV inside deleted exFAT Partition 3
   const sampleBmp = buildValidSampleBmp();
   disk.set(sampleBmp, (2112 + 16) * sectorSize);
 
   const sampleWav = buildValidSampleWav();
   disk.set(sampleWav, (2112 + 32) * sectorSize);
 
+  // Embed a truncated (missing FFD9 EOI) JPEG at LBA 3070 so amber likelihood & Repair File are testable
+  const truncatedJpg = new Uint8Array([
+    0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10, 0x4a, 0x46, 0x49, 0x46, 0x00, 0x01, 0x01, 0x00, 0x00, 0x01,
+    0x00, 0x01, 0x00, 0x00, 0xff, 0xc0, 0x00, 0x0b, 0x08, 0x00, 0x18, 0x00, 0x20, 0x01, 0x01, 0x11,
+    0x00, 0xff, 0xda, 0x00, 0x08, 0x01, 0x01, 0x00, 0x00, 0x3f, 0x00, 0xd2, 0xcf, 0x20,
+  ]);
+  disk.set(truncatedJpg, 3070 * sectorSize);
+
   return {
-    name: 'forensic_sample_disk.img',
+    name: 'windows_drive_sample.img',
     bytes: disk,
   };
 }
@@ -344,5 +423,11 @@ export function buildSampleUnknownFiles(): { name: string; bytes: Uint8Array }[]
       ]),
     },
     { name: 'audio_clip.raw', bytes: buildValidSampleWav() },
+    {
+      name: 'encrypted_fragment.tmp',
+      bytes: new Uint8Array([
+        0x00, 0xde, 0xad, 0xbe, 0xef, 0x13, 0x37, 0x99, 0x81, 0x02, 0x44, 0xab, 0xcd, 0xef, 0x10, 0x20,
+      ]),
+    },
   ];
 }

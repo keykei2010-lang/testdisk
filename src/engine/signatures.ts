@@ -1,4 +1,6 @@
-export type FileFamily = 'Images' | 'Documents' | 'Archives' | 'Media' | 'Databases' | 'System';
+import { parseExifFromJpeg } from './exif';
+
+export type FileFamily = 'Pictures' | 'Videos' | 'Documents' | 'Audio' | 'Archives' | 'Others';
 
 export interface FileFormatDefinition {
   id: string;
@@ -17,6 +19,15 @@ export interface IdentifyMetadata {
   height?: number;
   details?: string;
   subExtension?: string;
+  camera?: string;
+  takenAtMs?: number;
+  jpegValid?: {
+    hasDqt: boolean;
+    hasDht: boolean;
+    hasSof: boolean;
+    hasExif: boolean;
+    hasEoi: boolean;
+  };
 }
 
 export interface IdentifyResult {
@@ -44,9 +55,12 @@ export interface CarvedFile {
   offset: number;
   sector: number;
   size: number;
+  calculatedSize: number | null;
   status: 'OK' | 'OK_TRUNCATED';
   metadata: IdentifyMetadata;
   data: Uint8Array;
+  partitionId?: string;
+  partitionName?: string;
 }
 
 export interface CarveOptions {
@@ -58,6 +72,15 @@ export interface CarveOptions {
   enabledFormats: Set<string>;
 }
 
+export interface CarveProgress {
+  currentSector: number;
+  totalSectors: number;
+  percent: number;
+  foundCount: number;
+  foundBytes: number;
+  latestFile?: CarvedFile;
+}
+
 const MB = 1024 * 1024;
 
 export const FILE_FORMATS: FileFormatDefinition[] = [
@@ -65,7 +88,7 @@ export const FILE_FORMATS: FileFormatDefinition[] = [
     id: 'jpg',
     extension: 'jpg',
     description: 'JPG picture (JPEG / JFIF / Exif)',
-    family: 'Images',
+    family: 'Pictures',
     mimeType: 'image/jpeg',
     signatureHex: 'FF D8 FF',
     signatureOffset: 0,
@@ -76,7 +99,7 @@ export const FILE_FORMATS: FileFormatDefinition[] = [
     id: 'png',
     extension: 'png',
     description: 'Portable Network Graphics (PNG)',
-    family: 'Images',
+    family: 'Pictures',
     mimeType: 'image/png',
     signatureHex: '89 50 4E 47 0D 0A 1A 0A',
     signatureOffset: 0,
@@ -87,7 +110,7 @@ export const FILE_FORMATS: FileFormatDefinition[] = [
     id: 'gif',
     extension: 'gif',
     description: 'Graphics Interchange Format (GIF87a/89a)',
-    family: 'Images',
+    family: 'Pictures',
     mimeType: 'image/gif',
     signatureHex: '47 49 46 38',
     signatureOffset: 0,
@@ -98,7 +121,7 @@ export const FILE_FORMATS: FileFormatDefinition[] = [
     id: 'bmp',
     extension: 'bmp',
     description: 'Windows Bitmap Image (BMP)',
-    family: 'Images',
+    family: 'Pictures',
     mimeType: 'image/bmp',
     signatureHex: '42 4D',
     signatureOffset: 0,
@@ -109,7 +132,7 @@ export const FILE_FORMATS: FileFormatDefinition[] = [
     id: 'webp',
     extension: 'webp',
     description: 'WebP RIFF Image',
-    family: 'Images',
+    family: 'Pictures',
     mimeType: 'image/webp',
     signatureHex: '52 49 46 46 ... 57 45 42 50',
     signatureOffset: 0,
@@ -120,7 +143,7 @@ export const FILE_FORMATS: FileFormatDefinition[] = [
     id: 'tiff',
     extension: 'tif',
     description: 'Tagged Image File Format (TIFF / RAW)',
-    family: 'Images',
+    family: 'Pictures',
     mimeType: 'image/tiff',
     signatureHex: '49 49 2A 00 / 4D 4D 00 2A',
     signatureOffset: 0,
@@ -186,7 +209,7 @@ export const FILE_FORMATS: FileFormatDefinition[] = [
     id: 'sqlite',
     extension: 'sqlite',
     description: 'SQLite 3.x database',
-    family: 'Databases',
+    family: 'Others',
     mimeType: 'application/vnd.sqlite3',
     signatureHex: '53 51 4C 69 74 65 20 66 6F 72 6D 61 74 20 33 00',
     signatureOffset: 0,
@@ -197,7 +220,7 @@ export const FILE_FORMATS: FileFormatDefinition[] = [
     id: 'mp4',
     extension: 'mp4',
     description: 'MPEG-4 / QuickTime ISO BMFF Video',
-    family: 'Media',
+    family: 'Videos',
     mimeType: 'video/mp4',
     signatureHex: '66 74 79 70',
     signatureOffset: 4,
@@ -208,7 +231,7 @@ export const FILE_FORMATS: FileFormatDefinition[] = [
     id: 'wav',
     extension: 'wav',
     description: 'Microsoft RIFF WAVE Audio',
-    family: 'Media',
+    family: 'Audio',
     mimeType: 'audio/wav',
     signatureHex: '52 49 46 46 ... 57 41 56 45',
     signatureOffset: 0,
@@ -219,7 +242,7 @@ export const FILE_FORMATS: FileFormatDefinition[] = [
     id: 'avi',
     extension: 'avi',
     description: 'Microsoft RIFF AVI Video',
-    family: 'Media',
+    family: 'Videos',
     mimeType: 'video/x-msvideo',
     signatureHex: '52 49 46 46 ... 41 56 49 20',
     signatureOffset: 0,
@@ -230,7 +253,7 @@ export const FILE_FORMATS: FileFormatDefinition[] = [
     id: 'mp3',
     extension: 'mp3',
     description: 'MPEG Audio Layer III (ID3v2)',
-    family: 'Media',
+    family: 'Audio',
     mimeType: 'audio/mpeg',
     signatureHex: '49 44 33',
     signatureOffset: 0,
@@ -241,7 +264,7 @@ export const FILE_FORMATS: FileFormatDefinition[] = [
     id: 'flac',
     extension: 'flac',
     description: 'Free Lossless Audio Codec (FLAC)',
-    family: 'Media',
+    family: 'Audio',
     mimeType: 'audio/flac',
     signatureHex: '66 4C 61 43',
     signatureOffset: 0,
@@ -252,7 +275,7 @@ export const FILE_FORMATS: FileFormatDefinition[] = [
     id: 'ogg',
     extension: 'ogg',
     description: 'Ogg Vorbis / Opus Container',
-    family: 'Media',
+    family: 'Audio',
     mimeType: 'audio/ogg',
     signatureHex: '4F 67 67 53',
     signatureOffset: 0,
@@ -263,7 +286,7 @@ export const FILE_FORMATS: FileFormatDefinition[] = [
     id: 'elf',
     extension: 'elf',
     description: 'Executable and Linkable Format (ELF)',
-    family: 'System',
+    family: 'Others',
     mimeType: 'application/x-elf',
     signatureHex: '7F 45 4C 46',
     signatureOffset: 0,
@@ -274,7 +297,7 @@ export const FILE_FORMATS: FileFormatDefinition[] = [
     id: 'exe',
     extension: 'exe',
     description: 'Windows Portable Executable (MZ/PE)',
-    family: 'System',
+    family: 'Others',
     mimeType: 'application/vnd.microsoft.portable-executable',
     signatureHex: '4D 5A',
     signatureOffset: 0,
@@ -355,35 +378,71 @@ function validateAndMeasureJpg(
   if (start + 4 > maxEnd) return null;
   if (buf[start] !== 0xff || buf[start + 1] !== 0xd8 || buf[start + 2] !== 0xff) return null;
   const m4 = buf[start + 3];
-  if (m4 !== 0xe0 && m4 !== 0xe1 && m4 !== 0xe2 && m4 !== 0xdb && m4 !== 0xee && m4 !== 0xfe && m4 !== 0xc0 && m4 !== 0xc2) {
+  if (
+    m4 !== 0xe0 &&
+    m4 !== 0xe1 &&
+    m4 !== 0xe2 &&
+    m4 !== 0xdb &&
+    m4 !== 0xee &&
+    m4 !== 0xfe &&
+    m4 !== 0xc0 &&
+    m4 !== 0xc2
+  ) {
     return null;
   }
 
   let pos = start + 2;
   let width: number | undefined;
   let height: number | undefined;
+  let hasDqt = false;
+  let hasDht = false;
+  let hasSof = false;
+  let hasExif = false;
   let sawSos = false;
 
-  while (pos + 4 <= maxEnd) {
+  const exif = parseExifFromJpeg(buf, start, maxEnd);
+  const attachMeta = (baseDetails: string, hasEoi: boolean): IdentifyMetadata => ({
+    width,
+    height,
+    camera: exif?.camera,
+    takenAtMs: exif?.takenAtMs,
+    jpegValid: { hasDqt, hasDht, hasSof, hasExif, hasEoi },
+    details: exif?.camera ? `${baseDetails} · ${exif.camera}` : baseDetails,
+  });
+
+  // Digler-inspired JPEG marker walker + bulk_extractor entropy scan (skips embedded EXIF thumbnails cleanly)
+  while (pos + 2 <= maxEnd) {
     if (buf[pos] !== 0xff) {
       if (sawSos) {
-        // Scan inside entropy stream for FFD9
-        const eoi = indexOfBytes(buf, [0xff, 0xd9], pos, maxEnd);
-        if (eoi !== -1) {
+        // Walk entropy-coded scan stream handling 0xFF 0x00 stuffing & RSTn markers
+        let scanPos = pos;
+        let foundEoi = -1;
+        while (scanPos + 1 < maxEnd) {
+          if (buf[scanPos] === 0xff) {
+            const nextB = buf[scanPos + 1];
+            if (nextB === 0xd9) {
+              foundEoi = scanPos;
+              break;
+            }
+            if (nextB === 0x00 || nextB === 0xff || (nextB >= 0xd0 && nextB <= 0xd7)) {
+              scanPos += nextB === 0xff ? 1 : 2;
+              continue;
+            }
+          }
+          scanPos++;
+        }
+        if (foundEoi !== -1) {
+          const dimText = width && height ? `${width}x${height} px` : 'JFIF/Exif stream';
           return {
-            size: eoi + 2 - start,
+            size: foundEoi + 2 - start,
             truncated: false,
-            meta: {
-              width,
-              height,
-              details: width && height ? `${width}x${height} px` : 'JFIF/Exif stream',
-            },
+            meta: attachMeta(dimText, true),
           };
         }
         return {
-          size: maxEnd - start,
+          size: Math.min(maxEnd - start, 2 * MB),
           truncated: true,
-          meta: { width, height, details: 'Missing FFD9 EOI' },
+          meta: attachMeta('Missing FFD9 EOI', false),
         };
       }
       return null;
@@ -395,10 +454,11 @@ function validateAndMeasureJpg(
     pos++;
 
     if (marker === 0xd9) {
+      const dimText = width && height ? `${width}x${height} px` : 'JPEG';
       return {
         size: pos - start,
         truncated: false,
-        meta: { width, height, details: width && height ? `${width}x${height} px` : 'JPEG' },
+        meta: attachMeta(dimText, true),
       };
     }
     if (marker === 0x00 || (marker >= 0xd0 && marker <= 0xd8)) {
@@ -410,33 +470,28 @@ function validateAndMeasureJpg(
       if (sawSos) break;
       return null;
     }
+
+    if (marker === 0xdb) hasDqt = true;
+    if (marker === 0xc4) hasDht = true;
+    if (marker === 0xe1) hasExif = true;
     if ((marker === 0xc0 || marker === 0xc1 || marker === 0xc2) && segLen >= 7 && pos + 7 <= maxEnd) {
+      hasSof = true;
       height = readUint16BE(buf, pos + 3);
       width = readUint16BE(buf, pos + 5);
     }
     if (marker === 0xda) {
       sawSos = true;
     }
+
     pos += segLen;
-    if (sawSos) {
-      const eoi = indexOfBytes(buf, [0xff, 0xd9], pos, maxEnd);
-      if (eoi !== -1) {
-        return {
-          size: eoi + 2 - start,
-          truncated: false,
-          meta: {
-            width,
-            height,
-            details: width && height ? `${width}x${height} px` : 'JPEG stream',
-          },
-        };
-      }
-      return {
-        size: Math.min(maxEnd - start, 2 * MB),
-        truncated: true,
-        meta: { width, height, details: 'Truncated JPEG stream' },
-      };
-    }
+  }
+
+  if (sawSos) {
+    return {
+      size: Math.min(maxEnd - start, 2 * MB),
+      truncated: true,
+      meta: attachMeta('Truncated JPEG stream', false),
+    };
   }
   return null;
 }
@@ -1160,6 +1215,35 @@ export function identifyBuffer(
     }
   }
 
+  // 19b. Windows UTF-16LE Text / INI / REG / Log (adapted from apfs-excavate orphan_post.c)
+  if (isEnabled('txt') && buf.length >= 8) {
+    const hasUtf16Bom = buf[0] === 0xff && buf[1] === 0xfe;
+    const samplePairs = Math.min(256, Math.floor(buf.length / 2));
+    let asciiLePairs = 0;
+    for (let p = hasUtf16Bom ? 1 : 0; p < samplePairs; p++) {
+      const lo = buf[p * 2];
+      const hi = buf[p * 2 + 1];
+      if (hi === 0 && (lo === 9 || lo === 10 || lo === 13 || (lo >= 32 && lo <= 126))) {
+        asciiLePairs++;
+      }
+    }
+    const denom = hasUtf16Bom ? Math.max(1, samplePairs - 1) : samplePairs;
+    if (denom >= 4 && asciiLePairs / denom >= 0.85) {
+      return {
+        formatId: 'txt',
+        extension: 'txt',
+        description: 'Windows UTF-16LE Unicode Text',
+        family: 'Documents',
+        mimeType: 'text/plain',
+        matchedOffset: 0,
+        matchedLength: hasUtf16Bom ? 2 : 0,
+        calculatedSize: buf.length,
+        status: 'OK',
+        metadata: { details: `${buf.length} bytes UTF-16LE text` },
+      };
+    }
+  }
+
   return null;
 }
 
@@ -1228,6 +1312,7 @@ export function carveDiskBuffer(
             offset: cursor,
             sector,
             size: clampedSize,
+            calculatedSize: match.calculatedSize,
             status: isTruncated ? 'OK_TRUNCATED' : 'OK',
             metadata: match.metadata,
             data: carvedData,
@@ -1247,3 +1332,148 @@ export function carveDiskBuffer(
 
   return results;
 }
+
+export interface AsyncCarveControls {
+  isCancelled: () => boolean;
+  isPaused: () => boolean;
+}
+
+/**
+ * Chunked asynchronous carver that yields to the main thread and streams live sector progress.
+ */
+export async function carveDiskBufferAsync(
+  diskBytes: Uint8Array,
+  options: CarveOptions,
+  onProgress: (progress: CarveProgress) => void,
+  controls?: AsyncCarveControls,
+): Promise<CarvedFile[]> {
+  const results: CarvedFile[] = [];
+  const start = Math.max(0, options.startByte);
+  const end = Math.min(diskBytes.length, options.endByte);
+  const step = Math.max(512, options.blockSize);
+  const totalSectors = Math.max(1, Math.floor((end - start) / 512));
+  let fileIndex = 1;
+  let foundBytes = 0;
+  let cursor = start;
+  let stepsSinceYield = 0;
+
+  while (cursor + 16 <= end) {
+    if (controls?.isCancelled()) {
+      break;
+    }
+    while (controls?.isPaused()) {
+      if (controls.isCancelled()) break;
+      await new Promise((r) => setTimeout(r, 80));
+    }
+    if (controls?.isCancelled()) {
+      break;
+    }
+
+    const b0 = diskBytes[cursor];
+    const b1 = diskBytes[cursor + 1];
+    const b2 = diskBytes[cursor + 2];
+    const b4 = diskBytes[cursor + 4];
+
+    const maybeMatch =
+      (b0 === 0xff && b1 === 0xd8 && b2 === 0xff) ||
+      (b0 === 0x89 && b1 === 0x50 && b2 === 0x4e) ||
+      (b0 === 0x47 && b1 === 0x49 && b2 === 0x46) ||
+      (b0 === 0x42 && b1 === 0x4d) ||
+      (b0 === 0x52 && b1 === 0x49 && b2 === 0x46) ||
+      (b0 === 0x25 && b1 === 0x50 && b2 === 0x44) ||
+      (b0 === 0x50 && b1 === 0x4b && b2 === 0x03) ||
+      (b0 === 0x37 && b1 === 0x7a && b2 === 0xbc) ||
+      (b0 === 0x1f && b1 === 0x8b && b2 === 0x08) ||
+      (b0 === 0x52 && b1 === 0x61 && b2 === 0x72) ||
+      (b0 === 0x53 && b1 === 0x51 && b2 === 0x4c) ||
+      (b4 === 0x66 && diskBytes[cursor + 5] === 0x74 && diskBytes[cursor + 6] === 0x79) ||
+      (b0 === 0x49 && b1 === 0x44 && b2 === 0x33) ||
+      (b0 === 0x66 && b1 === 0x4c && b2 === 0x61) ||
+      (b0 === 0x4f && b1 === 0x67 && b2 === 0x67) ||
+      (b0 === 0x7f && b1 === 0x45 && b2 === 0x4c) ||
+      (b0 === 0x4d && b1 === 0x5a);
+
+    if (maybeMatch) {
+      const slice = diskBytes.subarray(cursor, Math.min(end, cursor + 16 * MB));
+      const match = identifyBuffer(slice, options.enabledFormats);
+      if (match && match.calculatedSize && match.calculatedSize >= 16) {
+        const isTruncated = match.status === 'OK_TRUNCATED';
+        if (!isTruncated || !options.paranoid || options.keepCorrupted) {
+          const clampedSize = Math.min(match.calculatedSize, end - cursor);
+          const dirNum = Math.floor((fileIndex - 1) / 500) + 1;
+          const recupDir = `recup_dir.${dirNum}`;
+          const sector = Math.floor(cursor / 512);
+          const padNum = String(fileIndex).padStart(6, '0');
+          const carvedData = diskBytes.slice(cursor, cursor + clampedSize);
+
+          const carved: CarvedFile = {
+            id: `${cursor}-${match.extension}`,
+            filename: `${match.extension.toUpperCase()}_${padNum}.${match.extension}`,
+            recupDir,
+            formatId: match.formatId,
+            extension: match.extension,
+            description: match.description,
+            family: match.family,
+            mimeType: match.mimeType,
+            offset: cursor,
+            sector,
+            size: clampedSize,
+            calculatedSize: match.calculatedSize,
+            status: isTruncated ? 'OK_TRUNCATED' : 'OK',
+            metadata: match.metadata,
+            data: carvedData,
+          };
+
+          results.push(carved);
+          foundBytes += clampedSize;
+          fileIndex++;
+
+          const currentSector = Math.floor((cursor - start) / 512);
+          onProgress({
+            currentSector,
+            totalSectors,
+            percent: Math.min(99, Math.round((currentSector / totalSectors) * 100)),
+            foundCount: results.length,
+            foundBytes,
+            latestFile: carved,
+          });
+
+          const alignedAdvance = Math.max(step, Math.ceil(clampedSize / step) * step);
+          cursor += alignedAdvance;
+          stepsSinceYield += 1;
+          if (stepsSinceYield >= 400) {
+            stepsSinceYield = 0;
+            await new Promise((r) => setTimeout(r, 0));
+          }
+          continue;
+        }
+      }
+    }
+
+    cursor += step;
+    stepsSinceYield++;
+    if (stepsSinceYield >= 1200) {
+      stepsSinceYield = 0;
+      const currentSector = Math.floor((cursor - start) / 512);
+      onProgress({
+        currentSector,
+        totalSectors,
+        percent: Math.min(99, Math.round((currentSector / totalSectors) * 100)),
+        foundCount: results.length,
+        foundBytes,
+      });
+      await new Promise((r) => setTimeout(r, 0));
+    }
+  }
+
+  onProgress({
+    currentSector: totalSectors,
+    totalSectors,
+    percent: 100,
+    foundCount: results.length,
+    foundBytes,
+  });
+
+  return results;
+}
+

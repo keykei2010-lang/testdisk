@@ -31,12 +31,12 @@ export const HexViewer: React.FC<HexViewerProps> = ({
   const rows = useMemo(() => {
     const out: {
       offset: number;
-      hexBytes: { val: number; absPos: number; highlighted: boolean }[];
+      hexBytes: { val: number; highlighted: boolean }[];
       asciiChars: { ch: string; highlighted: boolean }[];
     }[] = [];
 
     for (let i = 0; i < slice.length; i += 16) {
-      const hexBytes: { val: number; absPos: number; highlighted: boolean }[] = [];
+      const hexBytes: { val: number; highlighted: boolean }[] = [];
       const asciiChars: { ch: string; highlighted: boolean }[] = [];
       for (let j = 0; j < 16 && i + j < slice.length; j++) {
         const val = slice[i + j];
@@ -46,7 +46,7 @@ export const HexViewer: React.FC<HexViewerProps> = ({
           highlightEnd !== undefined &&
           rel >= highlightStart &&
           rel < highlightEnd;
-        hexBytes.push({ val, absPos: baseOffset + rel, highlighted });
+        hexBytes.push({ val, highlighted });
         asciiChars.push({
           ch: val >= 32 && val <= 126 ? String.fromCharCode(val) : '.',
           highlighted,
@@ -62,71 +62,71 @@ export const HexViewer: React.FC<HexViewerProps> = ({
   }, [slice, baseOffset, highlightStart, highlightEnd]);
 
   return (
-    <div className="bg-slate-900 text-slate-100 rounded-lg border border-slate-800 overflow-hidden">
-      <div className="flex items-center justify-between px-4 py-2.5 bg-slate-950/60 border-b border-slate-800">
-        <div className="flex items-center gap-3 min-w-0">
+    <div className="bg-[#11151C] text-slate-200 rounded-md border border-[#2A3446] overflow-hidden">
+      <div className="flex items-center justify-between px-3 py-2 bg-[#141922] border-b border-[#2A3446] gap-2">
+        <div className="flex items-center gap-2 min-w-0">
           <span className="text-xs font-medium text-slate-200 truncate">{title}</span>
-          <span className="text-xs font-mono text-slate-400 tabular-nums whitespace-nowrap">
-            0x{baseOffset.toString(16).padStart(8, '0').toUpperCase()} ({slice.length} B)
+          <span className="text-[11px] font-mono text-slate-400 tabular-nums whitespace-nowrap">
+            0x{baseOffset.toString(16).padStart(6, '0').toUpperCase()}
           </span>
         </div>
         {onStepSector && currentLba !== undefined && (
-          <div className="flex items-center gap-1.5 shrink-0">
+          <div className="flex items-center gap-1 shrink-0">
             <button
               type="button"
               onClick={() => onStepSector(-1)}
               disabled={currentLba <= 0}
-              className="inline-flex items-center gap-1 px-2 py-1 text-xs font-medium rounded bg-slate-800 text-slate-200 hover:bg-slate-700 disabled:opacity-40 disabled:cursor-not-allowed transition-colors whitespace-nowrap"
+              className="inline-flex items-center p-1 text-xs rounded bg-[#1F2735] text-slate-200 hover:bg-[#283244] disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
+              aria-label="Previous sector"
             >
               <ChevronLeft className="w-3.5 h-3.5" />
-              Prev
             </button>
-            <span className="text-xs font-mono text-slate-300 tabular-nums px-1.5">
+            <span className="text-[11px] font-mono text-slate-300 tabular-nums px-1">
               LBA {currentLba}
             </span>
             <button
               type="button"
               onClick={() => onStepSector(1)}
               disabled={maxLba !== undefined && currentLba >= maxLba}
-              className="inline-flex items-center gap-1 px-2 py-1 text-xs font-medium rounded bg-slate-800 text-slate-200 hover:bg-slate-700 disabled:opacity-40 disabled:cursor-not-allowed transition-colors whitespace-nowrap"
+              className="inline-flex items-center p-1 text-xs rounded bg-[#1F2735] text-slate-200 hover:bg-[#283244] disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
+              aria-label="Next sector"
             >
-              Next
               <ChevronRight className="w-3.5 h-3.5" />
             </button>
           </div>
         )}
       </div>
 
-      <div className="overflow-x-auto max-h-80 p-3 font-mono text-xs leading-5 tracking-wide">
-        <div className="min-w-[640px]">
+      <div className="overflow-x-auto max-h-56 p-2.5 font-mono text-[11px] leading-5">
+        <div className="min-w-[460px]">
           {rows.map((row) => (
-            <div key={row.offset} className="flex items-center gap-4 hover:bg-slate-800/60 px-1 rounded">
-              <span className="text-slate-500 select-none tabular-nums w-20 shrink-0">
-                {row.offset.toString(16).padStart(8, '0')}
+            <div key={row.offset} className="flex items-center gap-2.5 hover:bg-[#1F2735]/70 px-1 rounded">
+              <span className="text-slate-500 select-none tabular-nums w-16 shrink-0">
+                {row.offset.toString(16).padStart(6, '0')}
               </span>
-              <div className="flex items-center gap-1.5 flex-1">
+              <div className="flex items-center gap-1 flex-1">
                 {row.hexBytes.map((b, idx) => (
                   <span
                     key={idx}
-                    className={`w-5 text-center tabular-nums ${
-                      idx === 8 ? 'ml-1.5' : ''
+                    className={`w-4 text-center tabular-nums ${
+                      idx === 8 ? 'ml-1' : ''
                     } ${
                       b.highlighted
-                        ? 'bg-sky-500/25 text-sky-300 rounded-xs font-semibold'
+                        ? 'bg-[#2E7CF6]/30 text-[#60A5FA] rounded-xs font-semibold'
                         : b.val === 0
                           ? 'text-slate-600'
-                          : 'text-slate-200'
+                          : 'text-slate-300'
                     }`}
                   >
                     {b.val.toString(16).padStart(2, '0')}
                   </span>
                 ))}
               </div>
-              <div className="text-slate-400 border-l border-slate-800 pl-3 select-text shrink-0 w-36">
+              <div className="text-slate-400 border-l border-[#2A3446] pl-2 select-text shrink-0 w-28">
                 {row.asciiChars.map((a, idx) => (
                   <span
                     key={idx}
-                    className={a.highlighted ? 'text-sky-300 font-semibold' : ''}
+                    className={a.highlighted ? 'text-[#60A5FA] font-semibold' : ''}
                   >
                     {a.ch}
                   </span>

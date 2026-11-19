@@ -69,6 +69,9 @@
 #include <QGroupBox>
 #include <QRadioButton>
 #include <QFileDialog>
+#include <QDir>
+#include <QFileInfo>
+#include <QUrl>
 #include <QComboBox>
 #include <QTimer>
 #include <QMessageBox>
@@ -160,7 +163,6 @@ void QPhotorec::setExistingDirectory()
   if (!directory.isEmpty())
   {
     directoryLabel->setText(directory);
-    buttons_updateUI();
   }
 }
 
@@ -181,6 +183,12 @@ void QPhotorec::newSourceFile()
       select_disk(new_disk);
       HDDlistWidget_updateUI();
       PartListWidget_updateUI();
+      buttons_updateUI();
+    }
+    else
+    {
+      QMessageBox::warning(this, tr("Unable to open disk image"),
+          tr("Could not open the selected image for reading."));
     }
   }
 }
@@ -427,7 +435,13 @@ void QPhotorec::buttons_updateUI()
       qfreeRadioButton->setEnabled(false);
       break;
   }
-  button_search->setEnabled(!directoryLabel->text().isEmpty());
+  destination_changed();
+}
+
+void QPhotorec::destination_changed()
+{
+  button_search->setEnabled(selected_disk!=NULL && selected_partition!=NULL &&
+      !directoryLabel->text().trimmed().isEmpty());
 }
 
 void QPhotorec::HDDlistWidget_updateUI()
@@ -517,7 +531,7 @@ void QPhotorec::setupUI()
   groupBox->setLayout(groupBoxLayout);
 
 
-  QLabel *dstWidget= new QLabel(tr("Please select a destination to save the recovered files to."));
+  QLabel *dstWidget= new QLabel(tr("Choose a destination on a different drive from the source."));
   directoryLabel=new QLineEdit("");
   QPushButton *dst_button = new QPushButton(
       QIcon::fromTheme("folder", QIcon(":res/gnome/folder.png")),
@@ -575,7 +589,7 @@ void QPhotorec::setupUI()
   connect(HDDlistWidget, SIGNAL(activated(int)),this,SLOT(disk_changed(int)));
   connect(PartListWidget, SIGNAL(itemSelectionChanged()), this, SLOT(partition_selected()));
   connect(dst_button, SIGNAL(clicked()), this, SLOT(setExistingDirectory()));
-  connect(directoryLabel, SIGNAL(editingFinished()), this, SLOT(buttons_updateUI()));
+  connect(directoryLabel, SIGNAL(textChanged(const QString &)), this, SLOT(destination_changed()));
 }
 
 void QPhotorec::clearWidgets()
@@ -640,13 +654,13 @@ void QPhotorec::qphotorec_search_updateUI()
   const partition_t *partition=params->partition;
   const unsigned int sector_size=params->disk->sector_size;
   QString tmp;
-  QString txt = QString(directoryLabel->text()).toHtmlEscaped();
-  folder_txt->setText(tr("Destination:")+" <a href=\"file://" + txt + "/" +
-      DEFAULT_RECUP_DIR + "." + QString::number(params->dir_num) + "\">" +
-      txt + "</a>");
+  const QString output=QFileInfo(QString::fromUtf8(params->recup_dir)).absolutePath();
+  const QString url=QString::fromLatin1(QUrl::fromLocalFile(output).toEncoded());
+  folder_txt->setText(tr("Destination:")+" <a href=\"" + url.toHtmlEscaped() + "\">" +
+      QDir::toNativeSeparators(output).toHtmlEscaped() + "</a>");
   if(params->status==STATUS_QUIT)
   {
-    tmp=QString(tr("Recovery completed"));
+    tmp=recovery_result.isEmpty() ? tr("Recovery completed") : recovery_result;
   }
   else if(params->status==STATUS_EXT2_ON_BF || params->status==STATUS_EXT2_OFF_BF)
   {
@@ -673,7 +687,8 @@ void QPhotorec::qphotorec_search_updateUI()
   {
     progress_bar->setMinimum(0);
     progress_bar->setMaximum(100);
-    progress_bar->setValue(100);
+    if(recovery_result.isEmpty())
+      progress_bar->setValue(100);
   }
   else if(params->status==STATUS_FIND_OFFSET)
   {
@@ -779,6 +794,21 @@ void QPhotorec::qphotorec_search_setupUI()
   connect(timer, SIGNAL(timeout()), this, SLOT(qphotorec_search_updateUI()));
 }
 
+bool QPhotorec::change_recovery_destination()
+{
+  const QString directory=QFileDialog::getExistingDirectory(this,
+      tr("Choose a different recovery destination"),
+      QFileInfo(QString::fromUtf8(params->recup_dir)).absolutePath(),
+      QFileDialog::ShowDirsOnly);
+  if(directory.isEmpty())
+    return false;
+  const QByteArray path=QDir(directory).filePath(DEFAULT_RECUP_DIR).toUtf8();
+  free(params->recup_dir);
+  params->recup_dir=strdup(path.constData());
+  params->dir_num=photorec_mkdir(params->recup_dir, params->dir_num);
+  return true;
+}
+
 void QPhotorec::stop_and_quit()
 {
   stop_the_recovery=true;
@@ -790,6 +820,7 @@ int QPhotorec::photorec(alloc_data_t *list_search_space)
   pstatus_t ind_stop=PSTATUS_OK;
   const unsigned int blocksize_is_known=params->blocksize;
   params_reset(params, options);
+  recovery_result.clear();
   /* make the first recup_dir */
   params->dir_num=photorec_mkdir(params->recup_dir, params->dir_num);
   for(params->pass=0; params->status!=STATUS_QUIT; params->pass++)
@@ -836,17 +867,10 @@ int QPhotorec::photorec(alloc_data_t *list_search_space)
 	      tr("QPhotoRec: Failed to create file!"),
 	      tr("Failed to create file! Please choose another destination"),
 	      QMessageBox::Ok| QMessageBox::Cancel, QMessageBox::Ok);
-	  if(ret==QMessageBox::Cancel)
+	  if(ret==QMessageBox::Cancel || !change_recovery_destination())
 	  {
+	    recovery_result=tr("Recovery stopped: could not write to the destination");
 	    params->status=STATUS_QUIT;
-	  }
-	  else
-	  {
-	    setExistingDirectory();
-	    free(params->recup_dir);
-	    QByteArray byteArray = (directoryLabel->text() + "/" + DEFAULT_RECUP_DIR).toUtf8();
-	    params->recup_dir=strdup(byteArray.constData());
-	    params->dir_num=photorec_mkdir(params->recup_dir, params->dir_num);
 	  }
 	}
 	break;
@@ -856,17 +880,10 @@ int QPhotorec::photorec(alloc_data_t *list_search_space)
 	      tr("QPhotoRec: Not enough space!"),
 	      tr("There is not enough space left! Please free disk space and/or choose another destination"),
 	      QMessageBox::Ok| QMessageBox::Cancel, QMessageBox::Ok);
-	  if(ret==QMessageBox::Cancel)
+	  if(ret==QMessageBox::Cancel || !change_recovery_destination())
 	  {
+	    recovery_result=tr("Recovery stopped: could not write to the destination");
 	    params->status=STATUS_QUIT;
-	  }
-	  else
-	  {
-	    setExistingDirectory();
-	    free(params->recup_dir);
-	    QByteArray byteArray = (directoryLabel->text() + "/" + DEFAULT_RECUP_DIR).toUtf8();
-	    params->recup_dir=strdup(byteArray.constData());
-	    params->dir_num=photorec_mkdir(params->recup_dir, params->dir_num);
 	  }
 	}
 break;
@@ -876,6 +893,7 @@ break;
 	  unlink("photorec.ses");
 	break;
       case PSTATUS_STOP:
+	recovery_result=tr("Recovery stopped");
 	params->status=STATUS_QUIT;
 	break;
     }
@@ -896,7 +914,15 @@ void QPhotorec::qphotorec_search()
   alloc_data_t list_search_space;
   TD_INIT_LIST_HEAD(&list_search_space.list);
 
-  QByteArray byteArray = (directoryLabel->text() + "/" + DEFAULT_RECUP_DIR).toUtf8();
+  const QFileInfo destination(directoryLabel->text());
+  if(directoryLabel->text().trimmed().isEmpty() || !destination.isDir() || !destination.isWritable())
+  {
+    QMessageBox::warning(this, tr("Invalid recovery destination"),
+        tr("Choose an existing, writable folder on a different drive from the source."));
+    return;
+  }
+  directoryLabel->setText(destination.absoluteFilePath());
+  QByteArray byteArray = QDir(destination.absoluteFilePath()).filePath(DEFAULT_RECUP_DIR).toUtf8();
   params->recup_dir=strdup(byteArray.constData());
   params->carve_free_space_only=qfreeRadioButton->isChecked();
   params->disk=selected_disk;

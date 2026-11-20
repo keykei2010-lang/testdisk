@@ -47,7 +47,7 @@ If you have **Node.js 20+** installed on Windows:
 1. Open **PowerShell** inside the project directory.
 2. Install dependencies and build the Windows x64 ZIP + portable `.exe`:
    ```powershell
-   npm ci
+   npm install
    npm install --no-save electron electron-builder
    npm run dist:win
    ```

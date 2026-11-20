@@ -21,10 +21,9 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: 22
-          cache: npm
 
       - name: Install project dependencies
-        run: npm ci
+        run: npm install
 
       - name: Install Electron & electron-builder
         run: npm install --no-save electron electron-builder

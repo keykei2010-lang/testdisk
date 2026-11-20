@@ -1,7 +1,12 @@
 import React from 'react';
 import { Check, SlidersHorizontal, X } from 'lucide-react';
 import { FILE_FORMATS, FileFamily } from '../engine/signatures';
-import { RecoveryLikelihoodTier } from '../engine/explorerTypes';
+import {
+  GroupByKey,
+  RecoveryLikelihoodTier,
+  SortDir,
+  SortKey,
+} from '../engine/explorerTypes';
 
 interface FilterPopoverProps {
   blockSize: number;
@@ -12,6 +17,9 @@ interface FilterPopoverProps {
   likelihoodFilter: 'all' | RecoveryLikelihoodTier;
   sizeFilter: 'all' | 'small' | 'medium' | 'large';
   hideDuplicates: boolean;
+  sortKey: SortKey;
+  sortDir: SortDir;
+  groupBy: GroupByKey;
   onChangeBlockSize: (size: number) => void;
   onChangeParanoid: (val: boolean) => void;
   onChangeKeepCorrupted: (val: boolean) => void;
@@ -20,6 +28,9 @@ interface FilterPopoverProps {
   onChangeLikelihoodFilter: (val: 'all' | RecoveryLikelihoodTier) => void;
   onChangeSizeFilter: (val: 'all' | 'small' | 'medium' | 'large') => void;
   onChangeHideDuplicates: (val: boolean) => void;
+  onChangeSortKey: (val: SortKey) => void;
+  onChangeSortDir: (val: SortDir) => void;
+  onChangeGroupBy: (val: GroupByKey) => void;
   onApplyAndRescan: () => void;
   onClose: () => void;
 }
@@ -35,6 +46,9 @@ export const FilterPopover: React.FC<FilterPopoverProps> = ({
   likelihoodFilter,
   sizeFilter,
   hideDuplicates,
+  sortKey,
+  sortDir,
+  groupBy,
   onChangeBlockSize,
   onChangeParanoid,
   onChangeKeepCorrupted,
@@ -43,6 +57,9 @@ export const FilterPopover: React.FC<FilterPopoverProps> = ({
   onChangeLikelihoodFilter,
   onChangeSizeFilter,
   onChangeHideDuplicates,
+  onChangeSortKey,
+  onChangeSortDir,
+  onChangeGroupBy,
   onApplyAndRescan,
   onClose,
 }) => {
@@ -65,13 +82,18 @@ export const FilterPopover: React.FC<FilterPopoverProps> = ({
   };
 
   return (
-    <div className="fixed inset-0 z-50 bg-black/60 flex items-center justify-center p-4 animate-backdrop-in">
-      <div className="w-full max-w-2xl max-h-[86vh] flex flex-col rounded-lg bg-[#181E29] border border-[#2A3446] shadow-2xl overflow-hidden animate-modal-in">
-        <div className="flex items-center justify-between px-5 py-3.5 border-b border-[#2A3446]">
+    <div
+      className="fixed inset-0 z-50 bg-black/65 flex items-center justify-center p-4 animate-backdrop-in"
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="filter-modal-title"
+    >
+      <div className="w-full max-w-2xl max-h-[86vh] flex flex-col rounded-lg bg-[#222630] border border-[#343A48] shadow-2xl overflow-hidden animate-modal-in">
+        <div className="flex items-center justify-between px-5 py-3.5 border-b border-[#2E3340]">
           <div className="flex items-center gap-2">
-            <SlidersHorizontal className="w-4 h-4 text-[#38BDF8]" />
-            <h3 className="text-sm font-semibold text-slate-100">
-              Scan Options &amp; Signature Filters
+            <SlidersHorizontal className="w-4 h-4 text-[#4C8DFF]" />
+            <h3 id="filter-modal-title" className="text-sm font-semibold text-slate-100">
+              Filter, Sort &amp; Scan Options
             </h3>
           </div>
           <button
@@ -85,7 +107,48 @@ export const FilterPopover: React.FC<FilterPopoverProps> = ({
         </div>
 
         <div className="overflow-y-auto p-5 space-y-5 text-xs">
-          <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 bg-[#1F2735] p-4 rounded-md border border-[#2A3446]">
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 bg-[#181B22] p-4 rounded-md border border-[#2C313E]">
+            <div>
+              <label className="block font-medium text-slate-300 mb-1.5">Sort By</label>
+              <div className="flex gap-2">
+                <select
+                  value={sortKey}
+                  onChange={(e) => onChangeSortKey(e.target.value as SortKey)}
+                  className="flex-1 px-3 py-1.5 rounded bg-[#222630] border border-[#343A48] text-slate-100"
+                >
+                  <option value="name">Name</option>
+                  <option value="date">Date Modified</option>
+                  <option value="type">File Type</option>
+                  <option value="size">File Size</option>
+                  <option value="likelihood">Recovery Health</option>
+                  <option value="origin">Origin / Partition</option>
+                </select>
+                <select
+                  value={sortDir}
+                  onChange={(e) => onChangeSortDir(e.target.value as SortDir)}
+                  className="px-2.5 py-1.5 rounded bg-[#222630] border border-[#343A48] text-slate-100"
+                >
+                  <option value="asc">Asc ↑</option>
+                  <option value="desc">Desc ↓</option>
+                </select>
+              </div>
+            </div>
+
+            <div>
+              <label className="block font-medium text-slate-300 mb-1.5">Group Files By</label>
+              <select
+                value={groupBy}
+                onChange={(e) => onChangeGroupBy(e.target.value as GroupByKey)}
+                className="w-full px-3 py-1.5 rounded bg-[#222630] border border-[#343A48] text-slate-100"
+              >
+                <option value="none">None (Flat List)</option>
+                <option value="likelihood">Recovery Health Tier</option>
+                <option value="type">File Type</option>
+                <option value="origin">Origin / Partition</option>
+                <option value="date">Date Modified</option>
+              </select>
+            </div>
+
             <div>
               <label className="block font-medium text-slate-300 mb-1.5">
                 Sector / Block Alignment
@@ -93,7 +156,7 @@ export const FilterPopover: React.FC<FilterPopoverProps> = ({
               <select
                 value={blockSize}
                 onChange={(e) => onChangeBlockSize(Number(e.target.value))}
-                className="w-full px-3 py-1.5 rounded bg-[#11151C] border border-[#2A3446] text-slate-100"
+                className="w-full px-3 py-1.5 rounded bg-[#222630] border border-[#343A48] text-slate-100"
               >
                 <option value={512}>512 bytes (Standard Sector)</option>
                 <option value={1024}>1024 bytes (1 KiB Block)</option>
@@ -110,7 +173,7 @@ export const FilterPopover: React.FC<FilterPopoverProps> = ({
                 onChange={(e) =>
                   onChangeStatusFilter(e.target.value as 'all' | 'ok' | 'truncated')
                 }
-                className="w-full px-3 py-1.5 rounded bg-[#11151C] border border-[#2A3446] text-slate-100"
+                className="w-full px-3 py-1.5 rounded bg-[#222630] border border-[#343A48] text-slate-100"
               >
                 <option value="all">All Carved Files</option>
                 <option value="ok">Intact Files Only</option>
@@ -120,19 +183,19 @@ export const FilterPopover: React.FC<FilterPopoverProps> = ({
 
             <div>
               <label className="block font-medium text-slate-300 mb-1.5">
-                Recovery Likelihood Tier
+                Recovery Health Tier
               </label>
               <select
                 value={likelihoodFilter}
                 onChange={(e) =>
                   onChangeLikelihoodFilter(e.target.value as 'all' | RecoveryLikelihoodTier)
                 }
-                className="w-full px-3 py-1.5 rounded bg-[#11151C] border border-[#2A3446] text-slate-100"
+                className="w-full px-3 py-1.5 rounded bg-[#222630] border border-[#343A48] text-slate-100"
               >
-                <option value="all">All Likelihood Tiers</option>
-                <option value="high">High (85–100% · Green)</option>
-                <option value="medium">Fair (50–84% · Amber)</option>
-                <option value="low">Low (&lt; 50% · Red)</option>
+                <option value="all">All Health Tiers</option>
+                <option value="high">High (85–100%)</option>
+                <option value="medium">Fair (50–84%)</option>
+                <option value="low">Low (&lt; 50%)</option>
               </select>
             </div>
 
@@ -145,7 +208,7 @@ export const FilterPopover: React.FC<FilterPopoverProps> = ({
                 onChange={(e) =>
                   onChangeSizeFilter(e.target.value as 'all' | 'small' | 'medium' | 'large')
                 }
-                className="w-full px-3 py-1.5 rounded bg-[#11151C] border border-[#2A3446] text-slate-100"
+                className="w-full px-3 py-1.5 rounded bg-[#222630] border border-[#343A48] text-slate-100"
               >
                 <option value="all">Any File Size</option>
                 <option value="small">Small (&lt; 2 KB)</option>
@@ -159,7 +222,7 @@ export const FilterPopover: React.FC<FilterPopoverProps> = ({
                 type="checkbox"
                 checked={paranoid}
                 onChange={(e) => onChangeParanoid(e.target.checked)}
-                className="rounded border-slate-600 bg-[#11151C] text-[#2E7CF6]"
+                className="rounded border-slate-600 bg-[#16181F] accent-[#3A7AFE]"
               />
               Paranoid validation (verify structural footers)
             </label>
@@ -169,7 +232,7 @@ export const FilterPopover: React.FC<FilterPopoverProps> = ({
                 type="checkbox"
                 checked={keepCorrupted}
                 onChange={(e) => onChangeKeepCorrupted(e.target.checked)}
-                className="rounded border-slate-600 bg-[#11151C] text-[#2E7CF6]"
+                className="rounded border-slate-600 bg-[#16181F] accent-[#3A7AFE]"
               />
               Keep corrupted / truncated files
             </label>
@@ -179,7 +242,7 @@ export const FilterPopover: React.FC<FilterPopoverProps> = ({
                 type="checkbox"
                 checked={hideDuplicates}
                 onChange={(e) => onChangeHideDuplicates(e.target.checked)}
-                className="rounded border-slate-600 bg-[#11151C] text-[#2E7CF6]"
+                className="rounded border-slate-600 bg-[#16181F] accent-[#3A7AFE]"
               />
               Hide duplicate files (deduplicate by byte size + CRC32 fingerprint)
             </label>
@@ -190,7 +253,7 @@ export const FilterPopover: React.FC<FilterPopoverProps> = ({
               <button
                 type="button"
                 onClick={() => onChangeEnabledFormats(new Set(FILE_FORMATS.map((f) => f.id)))}
-                className="px-2.5 py-1 rounded bg-[#1F2735] border border-[#2A3446] text-slate-200 hover:bg-[#283244]"
+                className="px-2.5 py-1 rounded bg-[#2B303C] border border-[#343A48] text-slate-200 hover:bg-[#343B49]"
               >
                 Enable All
               </button>
@@ -201,14 +264,14 @@ export const FilterPopover: React.FC<FilterPopoverProps> = ({
                     new Set(FILE_FORMATS.filter((f) => f.enableByDefault).map((f) => f.id)),
                   )
                 }
-                className="px-2.5 py-1 rounded bg-[#1F2735] border border-[#2A3446] text-slate-200 hover:bg-[#283244]"
+                className="px-2.5 py-1 rounded bg-[#2B303C] border border-[#343A48] text-slate-200 hover:bg-[#343B49]"
               >
                 Reset Default
               </button>
               <button
                 type="button"
                 onClick={() => onChangeEnabledFormats(new Set())}
-                className="px-2.5 py-1 rounded bg-[#1F2735] border border-[#2A3446] text-slate-200 hover:bg-[#283244]"
+                className="px-2.5 py-1 rounded bg-[#2B303C] border border-[#343A48] text-slate-200 hover:bg-[#343B49]"
               >
                 Disable All
               </button>
@@ -224,12 +287,12 @@ export const FilterPopover: React.FC<FilterPopoverProps> = ({
               const allSelected = list.every((f) => enabledFormats.has(f.id));
               return (
                 <div key={family} className="space-y-2">
-                  <div className="flex items-center justify-between border-b border-[#2A3446] pb-1">
+                  <div className="flex items-center justify-between border-b border-[#2E3340] pb-1">
                     <span className="font-semibold text-slate-200">{family}</span>
                     <button
                       type="button"
                       onClick={() => toggleFamily(family, !allSelected)}
-                      className="text-[#60A5FA] hover:underline"
+                      className="text-[#4C8DFF] hover:underline"
                     >
                       {allSelected ? 'Uncheck all' : 'Check all'}
                     </button>
@@ -242,15 +305,15 @@ export const FilterPopover: React.FC<FilterPopoverProps> = ({
                           key={fmt.id}
                           className={`flex items-start gap-2.5 p-2 rounded border cursor-pointer transition-colors ${
                             checked
-                              ? 'border-[#3B4963] bg-[#1F2735]'
-                              : 'border-[#2A3446] bg-[#141922] opacity-65'
+                              ? 'border-[#3E4C66] bg-[#262B36]'
+                              : 'border-[#2C313E] bg-[#181B22] opacity-65'
                           }`}
                         >
                           <input
                             type="checkbox"
                             checked={checked}
                             onChange={() => toggleFormat(fmt.id)}
-                            className="mt-0.5 rounded border-slate-600 bg-[#11151C] text-[#2E7CF6]"
+                            className="mt-0.5 rounded border-slate-600 bg-[#16181F] accent-[#3A7AFE]"
                           />
                           <div className="min-w-0">
                             <div className="font-mono font-semibold text-slate-100 uppercase">
@@ -268,11 +331,11 @@ export const FilterPopover: React.FC<FilterPopoverProps> = ({
           </div>
         </div>
 
-        <div className="px-5 py-3.5 border-t border-[#2A3446] bg-[#141922] flex justify-end gap-2.5">
+        <div className="px-5 py-3.5 border-t border-[#2E3340] bg-[#181B22] flex justify-end gap-2.5">
           <button
             type="button"
             onClick={onClose}
-            className="px-4 py-1.5 text-xs font-medium text-slate-300 bg-[#1F2735] hover:bg-[#283244] rounded-md"
+            className="px-4 py-1.5 text-xs font-medium text-slate-300 bg-[#2B303C] hover:bg-[#343B49] rounded-md"
           >
             Cancel
           </button>
@@ -283,7 +346,7 @@ export const FilterPopover: React.FC<FilterPopoverProps> = ({
               onClose();
             }}
             disabled={enabledFormats.size === 0}
-            className="inline-flex items-center gap-1.5 px-4 py-1.5 text-xs font-medium text-white bg-[#2E7CF6] hover:bg-[#2569D6] disabled:opacity-40 rounded-md"
+            className="inline-flex items-center gap-1.5 px-4 py-1.5 text-xs font-medium text-white bg-[#3A7AFE] hover:bg-[#2F6EEB] disabled:opacity-40 rounded-md"
           >
             <Check className="w-3.5 h-3.5" />
             Apply &amp; Re-scan

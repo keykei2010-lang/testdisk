@@ -56,6 +56,7 @@ export function computeRecoveryLikelihood(params: {
   repaired?: boolean;
   mftResident?: boolean;
   mftOverwritten?: boolean;
+  mftBitmapIntact?: boolean;
 }): RecoveryLikelihoodAssessment {
   const {
     status,
@@ -68,6 +69,7 @@ export function computeRecoveryLikelihood(params: {
     repaired,
     mftResident,
     mftOverwritten,
+    mftBitmapIntact,
   } = params;
   const hasRichMeta = Boolean(metadata.width || metadata.subExtension || metadata.details);
   const inUnallocated = partitionId === 'unallocated';
@@ -78,10 +80,13 @@ export function computeRecoveryLikelihood(params: {
 
   if (mftOverwritten) {
     chance = 24;
-    reason = 'NTFS MFT record recovered, but disk clusters were reallocated';
+    reason = 'Filesystem record recovered, but disk clusters were reallocated/overwritten';
   } else if (mftResident) {
     chance = 98;
     reason = 'Resident NTFS MFT payload (stored intact inside MFT record)';
+  } else if (mftBitmapIntact && status === 'OK') {
+    chance = 98;
+    reason = 'Deleted filesystem entry verified intact via cluster bitmap (0 clusters overwritten)';
   } else if (repaired) {
     chance = 86;
     reason = 'Structural footer/header patched for recovery';
@@ -181,8 +186,20 @@ export function formatShortDate(ms: number): string {
   return `${yyyy}-${mm}-${dd} ${hh}:${min}`;
 }
 
+export function formatCompactCount(count: number): string {
+  if (count >= 1_000_000) return `${(count / 1_000_000).toFixed(1).replace(/\.0$/, '')}M`;
+  if (count >= 1000) return `${(count / 1000).toFixed(1).replace(/\.0$/, '')}K`;
+  return String(count);
+}
+
 /**
- * Structural repair for truncated/damaged carved buffers (JPEG EOI, PNG IEND, RIFF size, PDF EOF, BMP size).
+ * Structural repair for truncated/damaged carved buffers:
+ * - JPEG EOI (0xFFD9)
+ * - PNG IEND + CRC
+ * - PDF %%EOF trailer
+ * - RIFF WAV/AVI/WEBP length patching
+ * - BMP bfSize header patching
+ * - MP4 / MOV ISO BMFF atom size patching & tail cleanup (Smart Video Reorganization)
  */
 export function repairFileBuffer(
   extension: string,
@@ -252,6 +269,43 @@ export function repairFileBuffer(
       data: patched,
       note: 'Recalculated RIFF header payload length.',
     };
+  }
+
+  if ((ext === 'mp4' || ext === 'mov' || ext === 'm4v') && data.length >= 16) {
+    const patched = data.slice();
+    const dv = new DataView(patched.buffer);
+    let pos = 0;
+    let changed = false;
+
+    while (pos + 8 <= patched.length) {
+      const size = dv.getUint32(pos, false);
+      const type = String.fromCharCode(
+        patched[pos + 4],
+        patched[pos + 5],
+        patched[pos + 6],
+        patched[pos + 7],
+      );
+      if (!/^[\x20-\x7e]{4}$/.test(type)) break;
+
+      if (size === 0 || pos + size > patched.length) {
+        const clamped = patched.length - pos;
+        if (clamped >= 8) {
+          dv.setUint32(pos, clamped, false);
+          changed = true;
+        }
+        break;
+      }
+      if (size < 8) break;
+      pos += size;
+    }
+
+    if (changed) {
+      return {
+        repaired: true,
+        data: patched,
+        note: 'Reorganized ISO BMFF atom sizes and patched truncated mdat container length.',
+      };
+    }
   }
 
   if (ext === 'bmp' && data.length >= 18) {

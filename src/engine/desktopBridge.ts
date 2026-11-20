@@ -9,6 +9,15 @@ export interface WindowsDriveInfo {
   letters: string[];
 }
 
+export interface WindowsVolumeInfo {
+  driveLetter: string; // e.g. 'C:'
+  rootPath: string; // e.g. 'C:\\'
+  label: string;
+  fileSystem: string;
+  freeBytes: number;
+  totalBytes: number;
+}
+
 export interface NativeScannedEntry {
   id: string;
   filename: string;
@@ -26,6 +35,7 @@ export interface NativeScannedEntry {
   runs?: { offset: number; length: number }[];
   mftResident?: boolean;
   mftOverwritten?: boolean;
+  mftBitmapIntact?: boolean;
 }
 
 export interface NativeScanProgressEvent {
@@ -36,6 +46,11 @@ export interface NativeScanProgressEvent {
   foundCount: number;
   foundBytes: number;
   latestName?: string;
+}
+
+export interface NativeScanBatchEvent {
+  scanId: string;
+  entries: NativeScannedEntry[];
 }
 
 export interface NativeRecoverRequestItem {
@@ -56,6 +71,7 @@ export interface DesktopBridge {
   isDesktop: boolean;
   platform: string;
   listWindowsDrives: () => Promise<WindowsDriveInfo[]>;
+  listWindowsVolumes: () => Promise<WindowsVolumeInfo[]>;
   readDiskBytes: (
     devicePath: string,
     startByte?: number,
@@ -65,6 +81,7 @@ export interface DesktopBridge {
   pickFolder: () => Promise<string | null>;
   scanFolder: (folderPath: string) => Promise<NativeScannedEntry[]>;
   scanRecycleBin: () => Promise<NativeScannedEntry[]>;
+  scanDesktop: () => Promise<{ path: string; entries: NativeScannedEntry[] }>;
   startDriveScan: (params: {
     scanId: string;
     devicePath: string;
@@ -76,6 +93,7 @@ export interface DesktopBridge {
   resumeDriveScan: (scanId: string) => Promise<void>;
   cancelDriveScan: (scanId: string) => Promise<void>;
   onDriveScanProgress: (cb: (ev: NativeScanProgressEvent) => void) => () => void;
+  onDriveScanBatch: (cb: (ev: NativeScanBatchEvent) => void) => () => void;
   recoverFilesToFolder: (params: {
     destinationDir: string | null;
     items: NativeRecoverRequestItem[];

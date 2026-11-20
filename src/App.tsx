@@ -1,7 +1,6 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   Archive,
-  ArrowDownUp,
   ArrowLeft,
   ArrowUp,
   Check,
@@ -14,20 +13,23 @@ import {
   FileQuestion,
   FileText,
   Film,
+  Filter,
+  Folder,
   FolderOpen,
-  FolderSearch,
   HardDrive,
   Home,
+  Image as ImageIcon,
+  Layers,
   LayoutGrid,
   LayoutList,
   Music,
   Pause,
   Play,
   RotateCcw,
+  Save,
   Search,
   ShieldAlert,
-  SlidersHorizontal,
-  Trash2,
+  Square,
   Upload,
   Wrench,
   X,
@@ -45,15 +47,13 @@ import {
   identifyBuffer,
 } from './engine/signatures';
 import {
-  buildSampleDiskImage,
-  buildSampleUnknownFiles,
-} from './engine/sampleDisk';
-import {
   ExplorerFileItem,
   GroupByKey,
   itemMatchesNode,
   RecoveryLikelihoodTier,
+  SavedScanSession,
   SelectedTreeNode,
+  SerializedScanSessionItem,
   SortDir,
   SortKey,
   TreeMode,
@@ -68,7 +68,9 @@ import {
 } from './engine/recoveryHealth';
 import { formatBytes } from './engine/crc32';
 import { scanNtfsMftRecordsInBuffer } from './engine/ntfsMft';
+import { scanFatAndExfatDeletedInBuffer } from './engine/fatExfat';
 import { buildDfxmlReport } from './engine/dfxml';
+import { useMediaUrl } from './utils/useMediaUrl';
 import {
   getDesktopBridge,
   NativeScannedEntry,
@@ -80,7 +82,8 @@ import { ExplorerInspector } from './components/ExplorerInspector';
 import { FilterPopover } from './components/FilterPopover';
 import { RecoveryModal } from './components/RecoveryModal';
 import { DriveHubModal } from './components/DriveHubModal';
-import { OfflineIndicator, PWAInstallButton } from './components/PWAInstallButton';
+import { LostPartitionsModal } from './components/LostPartitionsModal';
+import { HomeView } from './components/HomeView';
 
 interface ScanProgressState {
   currentSector: number;
@@ -139,45 +142,37 @@ function inferFallbackFromExt(ext: string): {
   };
 }
 
-function toFileUrl(winOrPosixPath: string): string {
-  const normalized = winOrPosixPath.replace(/\\/g, '/').replace(/^\/+/, '');
-  return `file:///${normalized}`;
-}
-
 interface ThumbnailProps {
   item: ExplorerFileItem;
   size?: 'sm' | 'lg';
 }
 
 const FileThumbnail: React.FC<ThumbnailProps> = ({ item, size = 'sm' }) => {
-  const imgUrl = useMemo(() => {
-    if (item.family !== 'Pictures') return null;
-    if (item.sourceRef?.browserFile) {
-      return URL.createObjectURL(item.sourceRef.browserFile);
-    }
-    if (item.sourceRef?.kind === 'native-file' && item.sourceRef.devicePath) {
-      return toFileUrl(item.sourceRef.devicePath);
-    }
-    const blob = new Blob([item.data.slice().buffer], { type: item.mimeType });
-    return URL.createObjectURL(blob);
-  }, [item]);
-
-  useEffect(() => {
-    return () => {
-      if (imgUrl && imgUrl.startsWith('blob:')) URL.revokeObjectURL(imgUrl);
-    };
-  }, [imgUrl]);
+  const isPicture = item.family === 'Pictures';
+  const cacheKey = `${item.id}:${item.repaired ? '1' : '0'}:${item.data.byteLength}`;
+  const imgUrl = useMediaUrl({
+    enabled: isPicture,
+    cacheKey,
+    browserFile: item.sourceRef?.browserFile,
+    nativeKind: item.sourceRef?.kind,
+    devicePath: item.sourceRef?.devicePath,
+    data: item.data,
+    mimeType: item.mimeType,
+  });
+  const [failedUrl, setFailedUrl] = useState<string | null>(null);
 
   const boxClass = size === 'lg' ? 'w-16 h-16' : 'w-7 h-7';
   const iconClass = size === 'lg' ? 'w-7 h-7' : 'w-4 h-4';
 
-  if (imgUrl) {
+  if (isPicture && imgUrl && failedUrl !== imgUrl) {
     return (
       <img
+        key={imgUrl}
         src={imgUrl}
         alt={item.filename}
         loading="lazy"
         referrerPolicy="no-referrer"
+        onError={() => setFailedUrl(imgUrl)}
         className={`${boxClass} rounded object-cover bg-[#11151C] border border-[#2A3446] shrink-0 transition-transform duration-150 group-hover:scale-105`}
       />
     );
@@ -187,7 +182,13 @@ const FileThumbnail: React.FC<ThumbnailProps> = ({ item, size = 'sm' }) => {
     <div
       className={`${boxClass} rounded bg-[#181E29] border border-[#2A3446] flex items-center justify-center shrink-0 transition-transform duration-150 group-hover:scale-105`}
     >
-      {item.family === 'Videos' ? (
+      {isPicture ? (
+        <ImageIcon
+          className={`${iconClass} ${
+            item.status === 'OK_TRUNCATED' && !item.repaired ? 'text-amber-400' : 'text-sky-400'
+          }`}
+        />
+      ) : item.family === 'Videos' ? (
         <Film className={`${iconClass} text-violet-400`} />
       ) : item.family === 'Documents' ? (
         <FileText className={`${iconClass} text-sky-400`} />
@@ -208,22 +209,22 @@ function likelihoodBadgeClasses(tier: RecoveryLikelihoodTier) {
   return { text: 'text-rose-400', bar: 'bg-rose-500' };
 }
 
-function getGroupLabel(item: ExplorerFileItem, groupBy: GroupByKey): string {
+function getGroupLabel(item: ExplorerFileItem, groupBy: GroupByKey, nowMs: number): string {
   switch (groupBy) {
     case 'none':
       return '';
     case 'likelihood':
       return item.recoveryTier === 'high'
-        ? 'High Likelihood (85% – 100%)'
+        ? 'High Health (85% – 100%)'
         : item.recoveryTier === 'medium'
-          ? 'Fair Likelihood (50% – 84%)'
-          : 'Low Likelihood (< 50%)';
+          ? 'Fair Health (50% – 84%)'
+          : 'Low Health (< 50%)';
     case 'type':
       return `${item.family} (.${item.extension.toUpperCase()})`;
     case 'origin':
       return item.partitionName;
     case 'date': {
-      const ageHours = (Date.now() - item.modifiedAt) / 3600000;
+      const ageHours = (nowMs - item.modifiedAt) / 3600000;
       if (ageHours <= 24) return 'Last 24 Hours';
       if (ageHours <= 120) return 'Earlier This Week';
       return 'Older Volume Snapshot';
@@ -231,11 +232,31 @@ function getGroupLabel(item: ExplorerFileItem, groupBy: GroupByKey): string {
   }
 }
 
-export const App: React.FC = () => {
-  const initialSample = useMemo(() => buildSampleDiskImage(), []);
+function bytesToHexSample(bytes: Uint8Array, limit = 4096): string {
+  const slice = bytes.subarray(0, limit);
+  let out = '';
+  for (let i = 0; i < slice.length; i++) {
+    out += slice[i].toString(16).padStart(2, '0');
+  }
+  return out;
+}
 
-  const [diskName, setDiskName] = useState<string>(initialSample.name);
-  const [diskBytes, setDiskBytes] = useState<Uint8Array>(initialSample.bytes);
+function hexSampleToBytes(hex?: string): Uint8Array {
+  if (!hex || hex.length < 2) return new Uint8Array(0);
+  const len = Math.floor(hex.length / 2);
+  const out = new Uint8Array(len);
+  for (let i = 0; i < len; i++) {
+    out[i] = parseInt(hex.slice(i * 2, i * 2 + 2), 16) || 0;
+  }
+  return out;
+}
+
+const EMPTY_DISK_BYTES = new Uint8Array(0);
+
+export const App: React.FC = () => {
+  const [activeScreen, setActiveScreen] = useState<'home' | 'explorer'>('home');
+  const [diskName, setDiskName] = useState<string>('');
+  const [diskBytes, setDiskBytes] = useState<Uint8Array>(EMPTY_DISK_BYTES);
   const [repairedDiskBytes, setRepairedDiskBytes] = useState<Uint8Array | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
 
@@ -253,15 +274,17 @@ export const App: React.FC = () => {
   // View, sort, group & filter options
   const [viewMode, setViewMode] = useState<'list' | 'grid'>('list');
   const [searchQuery, setSearchQuery] = useState<string>('');
-  const [sortKey, setSortKey] = useState<SortKey>('likelihood');
-  const [sortDir, setSortDir] = useState<SortDir>('desc');
+  const [sortKey, setSortKey] = useState<SortKey>('name');
+  const [sortDir, setSortDir] = useState<SortDir>('asc');
   const [groupBy, setGroupBy] = useState<GroupByKey>('none');
   const [collapsedGroups, setCollapsedGroups] = useState<Set<string>>(() => new Set());
-  const [sortMenuOpen, setSortMenuOpen] = useState<boolean>(false);
   const [filterOpen, setFilterOpen] = useState<boolean>(false);
   const [recoveryOpen, setRecoveryOpen] = useState<boolean>(false);
   const [driveHubOpen, setDriveHubOpen] = useState<boolean>(false);
+  const [lostModalOpen, setLostModalOpen] = useState<boolean>(false);
   const [lightboxOpen, setLightboxOpen] = useState<boolean>(false);
+  const [scanBannerDismissed, setScanBannerDismissed] = useState<boolean>(false);
+  const [sessionReferenceMs] = useState<number>(() => Date.now());
 
   // Scanner & PhotoRec options
   const [blockSize, setBlockSize] = useState<number>(512);
@@ -279,7 +302,7 @@ export const App: React.FC = () => {
 
   // Scan execution state
   const [useNativeScan, setUseNativeScan] = useState<boolean>(false);
-  const [isScanning, setIsScanning] = useState<boolean>(true);
+  const [isScanning, setIsScanning] = useState<boolean>(false);
   const [isPaused, setIsPaused] = useState<boolean>(false);
   const isPausedRef = useRef<boolean>(false);
   const activeNativeScanIdRef = useRef<string | null>(null);
@@ -288,13 +311,13 @@ export const App: React.FC = () => {
     totalBytes: number;
     label: string;
   } | null>(null);
-  const [scanProgress, setScanProgress] = useState<ScanProgressState>(() => ({
+  const [scanProgress, setScanProgress] = useState<ScanProgressState>({
     currentSector: 0,
-    totalSectors: Math.max(1, Math.floor(initialSample.bytes.length / 512)),
+    totalSectors: 1,
     percent: 0,
     foundCount: 0,
     foundBytes: 0,
-  }));
+  });
 
   // Discovered items + location scans ($Recycle.Bin / folders) + fidentify queue
   const [carvedItems, setCarvedItems] = useState<ExplorerFileItem[]>([]);
@@ -315,7 +338,7 @@ export const App: React.FC = () => {
   const diskInputRef = useRef<HTMLInputElement>(null);
   const unknownInputRef = useRef<HTMLInputElement>(null);
   const folderInputRef = useRef<HTMLInputElement>(null);
-  const sortMenuRef = useRef<HTMLDivElement>(null);
+  const sessionInputRef = useRef<HTMLInputElement>(null);
 
   const analysis = useMemo(
     () => analyzeDiskImage(diskName, diskBytes),
@@ -324,6 +347,11 @@ export const App: React.FC = () => {
 
   const lostPartitions = useMemo(
     () => analysis.partitions.filter((p) => p.status === 'Deleted / Lost'),
+    [analysis.partitions],
+  );
+
+  const bitlockerPartitions = useMemo(
+    () => analysis.partitions.filter((p) => p.detectedFs?.encrypted === 'BitLocker'),
     [analysis.partitions],
   );
 
@@ -344,21 +372,18 @@ export const App: React.FC = () => {
     [analysis.partitions, analysis.sectorSize],
   );
 
-  // Close sort dropdown or context menu on outside click
+  // Close context menu on outside click
   useEffect(() => {
-    const onDown = (e: MouseEvent) => {
-      if (sortMenuRef.current && !sortMenuRef.current.contains(e.target as Node)) {
-        setSortMenuOpen(false);
-      }
+    const onDown = () => {
       setContextMenu(null);
     };
     window.addEventListener('mousedown', onDown);
     return () => window.removeEventListener('mousedown', onDown);
   }, []);
 
-  // Async sector carver effect for in-memory disk images (skipped during native streaming scans)
+  // Async sector carver effect for in-memory disk images (skipped during native streaming scans or before target loaded)
   useEffect(() => {
-    if (useNativeScan) return;
+    if (useNativeScan || diskBytes.length === 0) return;
     let cancelled = false;
     isPausedRef.current = false;
 
@@ -455,8 +480,9 @@ export const App: React.FC = () => {
         const mimeType = res?.mimeType ?? fallback.mimeType;
         const description = res?.description ?? fallback.description;
         const isResident = m.residentData !== null;
-        const status: ExplorerFileItem['status'] =
-          isResident || m.reconstructedBytes.length >= m.fileSize
+        const status: ExplorerFileItem['status'] = m.overwritten
+          ? 'HEADER_ONLY'
+          : isResident || m.reconstructedBytes.length >= m.fileSize
             ? 'OK'
             : m.reconstructedBytes.length > 0
               ? 'OK_TRUNCATED'
@@ -470,7 +496,14 @@ export const App: React.FC = () => {
           extension: ext,
           data: m.reconstructedBytes,
           mftResident: isResident,
+          mftOverwritten: m.overwritten,
+          mftBitmapIntact: m.bitmapChecked && !m.overwritten,
         });
+        const bitmapNote = m.bitmapChecked
+          ? m.overwritten
+            ? ` · ${m.overwrittenClusters}/${m.totalClusters} clusters overwritten`
+            : ' · $Bitmap verified intact'
+          : '';
         return {
           id: `mft-${m.mftOffset}-${m.recordNumber}`,
           filename: m.filename,
@@ -483,6 +516,7 @@ export const App: React.FC = () => {
           sourceKind: 'ntfs-mft',
           partitionId: m.partitionId,
           partitionName: m.partitionName,
+          originalPath: m.reconstructedPath,
           offset: m.extents[0]?.offset ?? m.mftOffset,
           sector: Math.floor((m.extents[0]?.offset ?? m.mftOffset) / analysis.sectorSize),
           matchedOffset: res?.matchedOffset ?? 0,
@@ -491,7 +525,7 @@ export const App: React.FC = () => {
             ...(res?.metadata ?? {}),
             details: isResident
               ? `NTFS MFT Record #${m.recordNumber} (Resident Data)`
-              : `NTFS MFT Record #${m.recordNumber} (${m.extents.length} extent${m.extents.length === 1 ? '' : 's'})`,
+              : `NTFS MFT Record #${m.recordNumber} (${m.extents.length} extent${m.extents.length === 1 ? '' : 's'}${bitmapNote})`,
           },
           description,
           data: m.reconstructedBytes,
@@ -509,7 +543,75 @@ export const App: React.FC = () => {
         };
       });
 
-      const combined = [...mapped, ...mftMapped];
+      const rawFatExfat = scanFatAndExfatDeletedInBuffer(diskBytes, analysis.partitions).filter(
+        (f) => !scopedPartition || f.partitionId === scopedPartition.id,
+      );
+      const fatExfatMapped: ExplorerFileItem[] = rawFatExfat.map((f) => {
+        const res = f.reconstructedBytes.length > 0 ? identifyBuffer(f.reconstructedBytes) : null;
+        const extHint = (f.filename.split('.').pop() || '').toLowerCase();
+        const fallback = inferFallbackFromExt(extHint);
+        const ext = res?.extension || extHint || 'bin';
+        const family = res?.family ?? fallback.family;
+        const mimeType = res?.mimeType ?? fallback.mimeType;
+        const description = res?.description ?? fallback.description;
+        const status: ExplorerFileItem['status'] = f.overwritten
+          ? 'HEADER_ONLY'
+          : f.reconstructedBytes.length >= f.fileSize
+            ? 'OK'
+            : f.reconstructedBytes.length > 0
+              ? 'OK_TRUNCATED'
+              : 'HEADER_ONLY';
+        const assessment = computeRecoveryLikelihood({
+          status,
+          size: f.fileSize,
+          calculatedSize: f.fileSize,
+          partitionId: f.partitionId,
+          metadata: res?.metadata ?? {},
+          extension: ext,
+          data: f.reconstructedBytes,
+          mftOverwritten: f.overwritten,
+          mftBitmapIntact: f.bitmapChecked && !f.overwritten,
+        });
+        return {
+          id: f.id,
+          filename: f.filename,
+          extension: ext,
+          family,
+          mimeType,
+          size: f.fileSize,
+          calculatedSize: f.fileSize,
+          status,
+          sourceKind: 'ntfs-mft',
+          partitionId: f.partitionId,
+          partitionName: f.partitionName,
+          originalPath: f.reconstructedPath,
+          offset: f.extents[0]?.offset ?? 0,
+          sector: Math.floor((f.extents[0]?.offset ?? 0) / analysis.sectorSize),
+          matchedOffset: res?.matchedOffset ?? 0,
+          matchedLength: res?.matchedLength ?? 0,
+          metadata: {
+            ...(res?.metadata ?? {}),
+            details: `${f.fsType} deleted entry (${f.extents.length} cluster run${f.extents.length === 1 ? '' : 's'}${
+              f.bitmapChecked ? (f.overwritten ? ' · cluster reallocated' : ' · bitmap intact') : ''
+            })`,
+          },
+          description,
+          data: f.reconstructedBytes,
+          sourceRef: {
+            kind: 'memory',
+            offset: f.extents[0]?.offset ?? 0,
+            size: f.fileSize,
+            runs: f.extents.length > 0 ? f.extents : undefined,
+          },
+          modifiedAt: res?.metadata.takenAtMs ?? f.modifiedAtMs,
+          recoveryChance: assessment.chance,
+          recoveryTier: assessment.tier,
+          recoveryReason: assessment.reason,
+          contentFingerprint: computeContentFingerprint(f.fileSize, f.reconstructedBytes),
+        };
+      });
+
+      const combined = [...mapped, ...mftMapped, ...fatExfatMapped];
       setCarvedItems(combined);
       setIsScanning(false);
       setIsPaused(false);
@@ -586,6 +688,17 @@ export const App: React.FC = () => {
       navigateToNode({ kind: 'family', family: selectedNode.family });
     } else if (selectedNode.kind === 'family') {
       navigateToNode({ kind: 'all-types' });
+    } else if (selectedNode.kind === 'folder-node') {
+      const segs = selectedNode.folderPath.split('/').filter(Boolean);
+      if (segs.length > 1) {
+        navigateToNode({
+          kind: 'folder-node',
+          partitionId: selectedNode.partitionId,
+          folderPath: segs.slice(0, -1).join('/'),
+        });
+      } else {
+        navigateToNode({ kind: 'partition', partitionId: selectedNode.partitionId });
+      }
     } else if (
       selectedNode.kind === 'partition' ||
       selectedNode.kind === 'unallocated' ||
@@ -596,14 +709,12 @@ export const App: React.FC = () => {
   };
 
   const handleNavHome = () => {
-    if (treeMode === 'type') {
-      navigateToNode({ kind: 'all-types' });
-    } else {
-      navigateToNode({ kind: 'disk-root' });
-    }
+    setActiveScreen('home');
   };
 
   const startFreshScanState = (bytes: Uint8Array, scopePartitionId?: string | null) => {
+    if (bytes.length === 0) return;
+    setActiveScreen('explorer');
     setUseNativeScan(false);
     nativeDriveTargetRef.current = null;
     isPausedRef.current = false;
@@ -688,6 +799,7 @@ export const App: React.FC = () => {
         data: sample,
         mftResident: entry.mftResident,
         mftOverwritten: entry.mftOverwritten,
+        mftBitmapIntact: entry.mftBitmapIntact,
       });
 
       return {
@@ -711,7 +823,7 @@ export const App: React.FC = () => {
           details: isLocationItem
             ? `Streamed handle (${formatBytes(entry.size)})`
             : isMftItem
-              ? `NTFS $MFT deleted record (${entry.runs?.length ?? 0} extent${entry.runs?.length === 1 ? '' : 's'})`
+              ? `Deleted filesystem record (${entry.runs?.length ?? 0} extent${entry.runs?.length === 1 ? '' : 's'})`
               : 'Streamed disk signature',
         },
         description,
@@ -776,6 +888,7 @@ export const App: React.FC = () => {
     activeNativeScanIdRef.current = scanId;
     nativeDriveTargetRef.current = { devicePath, totalBytes, label };
 
+    setActiveScreen('explorer');
     setUseNativeScan(true);
     setDiskName(label);
     setDiskBytes(headBytes);
@@ -794,7 +907,7 @@ export const App: React.FC = () => {
       foundBytes: 0,
     });
 
-    const unsub = bridge.onDriveScanProgress((ev) => {
+    const unsubProgress = bridge.onDriveScanProgress((ev) => {
       if (ev.scanId !== scanId) return;
       setScanProgress({
         currentSector: Math.floor(ev.currentBytes / 512),
@@ -805,6 +918,25 @@ export const App: React.FC = () => {
         latestFilename: ev.latestName,
       });
     });
+
+    const unsubBatch = bridge.onDriveScanBatch((batchEv) => {
+      if (batchEv.scanId !== scanId || batchEv.entries.length === 0) return;
+      const incoming = batchEv.entries.map((e) =>
+        mapNativeEntryToExplorerItem(e, resolveLocalPart),
+      );
+      setCarvedItems((prev) => {
+        const existingIds = new Set(prev.map((x) => x.id));
+        const fresh = incoming.filter((x) => !existingIds.has(x.id));
+        return fresh.length > 0 ? [...prev, ...fresh] : prev;
+      });
+    });
+
+    const hasLostOnTarget = localAnalysis.partitions.some(
+      (p) => p.status === 'Deleted / Lost',
+    );
+    if (hasLostOnTarget) {
+      setLostModalOpen(true);
+    }
 
     try {
       const entries = await bridge.startDriveScan({
@@ -819,7 +951,8 @@ export const App: React.FC = () => {
       setIsScanning(false);
       setFocusedFileId(mapped[0]?.id ?? null);
     } finally {
-      unsub();
+      unsubProgress();
+      unsubBatch();
       if (activeNativeScanIdRef.current === scanId) {
         activeNativeScanIdRef.current = null;
       }
@@ -832,15 +965,20 @@ export const App: React.FC = () => {
     setMbrActionNotice(null);
     if (file.size > 256 * 1024 * 1024) {
       setLoadError(
-        `Image "${file.name}" exceeds the 256 MiB browser memory limit. In the Windows .exe, use "Open Disk Image" for multi-GB streaming.`,
+        `Image "${file.name}" exceeds the 256 MiB browser memory limit. In the Windows .exe, use "Select Drive / Image" for multi-GB streaming.`,
       );
       return;
     }
     const buf = new Uint8Array(await file.arrayBuffer());
+    const localCheck = analyzeDiskImage(file.name, buf);
     setDiskName(file.name);
     setDiskBytes(buf);
     setRepairedDiskBytes(null);
     setLostBannerDismissed(false);
+    setScanBannerDismissed(false);
+    if (localCheck.partitions.some((p) => p.status === 'Deleted / Lost')) {
+      setLostModalOpen(true);
+    }
     startFreshScanState(buf, null);
   };
 
@@ -857,10 +995,15 @@ export const App: React.FC = () => {
         await runNativeStreamingScan(picked.path, picked.sizeBytes, picked.name);
       } else {
         const bytes = await bridge.readDiskBytes(picked.path, 0, picked.sizeBytes);
+        const localCheck = analyzeDiskImage(picked.name, bytes);
         setDiskName(picked.name);
         setDiskBytes(bytes);
         setRepairedDiskBytes(null);
         setLostBannerDismissed(false);
+        setScanBannerDismissed(false);
+        if (localCheck.partitions.some((p) => p.status === 'Deleted / Lost')) {
+          setLostModalOpen(true);
+        }
         startFreshScanState(bytes, null);
       }
     } catch {
@@ -897,17 +1040,47 @@ export const App: React.FC = () => {
       if (!folderPath) return;
       const entries = await bridge.scanFolder(folderPath);
       const mapped = entries.map((e) => mapNativeEntryToExplorerItem(e));
+      if (!diskName) setDiskName(folderPath);
       setLocationItems((prev) => [
         ...mapped,
         ...prev.filter((i) => i.sourceKind !== 'folder'),
       ]);
       setFocusedFileId(mapped[0]?.id ?? null);
+      setActiveScreen('explorer');
       navigateToNode({ kind: 'folder-scan' });
       if (mapped.length === 0) {
         setMbrActionNotice(`No files found inside "${folderPath}".`);
       }
     } catch {
       setLoadError('Could not read the selected folder.');
+    }
+  };
+
+  const handleScanDesktop = async () => {
+    const bridge = getDesktopBridge();
+    setLoadError(null);
+    setMbrActionNotice(null);
+    if (!bridge) {
+      setRecycleTargetMode(false);
+      folderInputRef.current?.click();
+      return;
+    }
+    try {
+      const res = await bridge.scanDesktop();
+      const mapped = res.entries.map((e) => mapNativeEntryToExplorerItem(e));
+      if (!diskName) setDiskName(res.path || 'Desktop');
+      setLocationItems((prev) => [
+        ...mapped,
+        ...prev.filter((i) => i.sourceKind !== 'folder'),
+      ]);
+      setFocusedFileId(mapped[0]?.id ?? null);
+      setActiveScreen('explorer');
+      navigateToNode({ kind: 'folder-scan' });
+      if (mapped.length === 0) {
+        setMbrActionNotice('No files found inside Windows Desktop.');
+      }
+    } catch {
+      setLoadError('Could not read the Windows Desktop folder.');
     }
   };
 
@@ -923,11 +1096,13 @@ export const App: React.FC = () => {
     try {
       const entries = await bridge.scanRecycleBin();
       const mapped = entries.map((e) => mapNativeEntryToExplorerItem(e));
+      if (!diskName) setDiskName('Recycle Bin ($Recycle.Bin)');
       setLocationItems((prev) => [
         ...mapped,
         ...prev.filter((i) => i.sourceKind !== 'recycle-bin'),
       ]);
       setFocusedFileId(mapped[0]?.id ?? null);
+      setActiveScreen('explorer');
       navigateToNode({ kind: 'recycle-bin' });
       if (mapped.length === 0) {
         setMbrActionNotice(
@@ -1073,23 +1248,23 @@ export const App: React.FC = () => {
       });
     }
 
+    if (!diskName) {
+      setDiskName(isRecycle ? 'Recycle Bin ($Recycle.Bin)' : 'Scanned Folder');
+    }
     setLocationItems((prev) => [
       ...added,
       ...prev.filter((i) => i.sourceKind !== (isRecycle ? 'recycle-bin' : 'folder')),
     ]);
+    setScanProgress({
+      currentSector: added.length,
+      totalSectors: Math.max(1, added.length),
+      percent: 100,
+      foundCount: added.length,
+      foundBytes: added.reduce((s, f) => s + f.size, 0),
+    });
     setFocusedFileId(added[0]?.id ?? null);
+    setActiveScreen('explorer');
     navigateToNode(isRecycle ? { kind: 'recycle-bin' } : { kind: 'folder-scan' });
-  };
-
-  const handleResetSample = () => {
-    const sample = buildSampleDiskImage();
-    setLoadError(null);
-    setMbrActionNotice(null);
-    setDiskName(sample.name);
-    setDiskBytes(sample.bytes);
-    setRepairedDiskBytes(null);
-    setLostBannerDismissed(false);
-    startFreshScanState(sample.bytes, null);
   };
 
   const handleInspectUnknownFiles = async (files: FileList | File[]) => {
@@ -1145,54 +1320,10 @@ export const App: React.FC = () => {
       });
     }
 
+    if (!diskName) setDiskName('File Identification');
     setFidentifyItems((prev) => [...added, ...prev]);
     setFocusedFileId(added[0].id);
-    navigateToNode({ kind: 'fidentify' });
-  };
-
-  const handleLoadSampleUnknown = () => {
-    const samples = buildSampleUnknownFiles();
-    const now = Date.now();
-    const added: ExplorerFileItem[] = samples.map((s, idx) => {
-      const res = identifyBuffer(s.bytes);
-      const status = res?.status ?? 'UNKNOWN';
-      const assessment = computeRecoveryLikelihood({
-        status,
-        size: s.bytes.length,
-        calculatedSize: res?.calculatedSize ?? null,
-        partitionId: 'fidentify',
-        metadata: res?.metadata ?? {},
-        extension: res?.extension ?? 'unknown',
-        data: s.bytes,
-      });
-      return {
-        id: `fid-sample-${now}-${idx}`,
-        filename: s.name,
-        extension: res?.extension ?? 'unknown',
-        family: res?.family ?? 'Others',
-        mimeType: res?.mimeType ?? 'application/octet-stream',
-        size: s.bytes.length,
-        calculatedSize: res?.calculatedSize ?? null,
-        status,
-        sourceKind: 'fidentify',
-        partitionId: 'fidentify',
-        partitionName: 'Unknown Files (fidentify)',
-        offset: 0,
-        sector: 0,
-        matchedOffset: res?.matchedOffset ?? 0,
-        matchedLength: res?.matchedLength ?? 0,
-        metadata: res?.metadata ?? { details: 'Unrecognized binary header' },
-        description: res?.description ?? 'Unrecognized binary signature',
-        data: s.bytes,
-        modifiedAt: res?.metadata.takenAtMs ?? (now - idx * 3600000),
-        recoveryChance: assessment.chance,
-        recoveryTier: assessment.tier,
-        recoveryReason: assessment.reason,
-        contentFingerprint: computeContentFingerprint(s.bytes.length, s.bytes),
-      };
-    });
-    setFidentifyItems((prev) => [...added, ...prev]);
-    setFocusedFileId(added[0].id);
+    setActiveScreen('explorer');
     navigateToNode({ kind: 'fidentify' });
   };
 
@@ -1398,19 +1529,158 @@ export const App: React.FC = () => {
     URL.revokeObjectURL(url);
   };
 
+  const handleExportSession = async () => {
+    if (allItems.length === 0) return;
+    const serialized: SerializedScanSessionItem[] = allItems.slice(0, 5000).map((item) => ({
+      id: item.id,
+      filename: item.filename,
+      extension: item.extension,
+      family: item.family,
+      mimeType: item.mimeType,
+      size: item.size,
+      calculatedSize: item.calculatedSize,
+      status: item.status,
+      sourceKind: item.sourceKind,
+      partitionId: item.partitionId,
+      partitionName: item.partitionName,
+      originalPath: item.originalPath,
+      offset: item.offset,
+      sector: item.sector,
+      matchedOffset: item.matchedOffset,
+      matchedLength: item.matchedLength,
+      metadata: item.metadata,
+      description: item.description,
+      sourceRef: item.sourceRef
+        ? {
+            kind: item.sourceRef.kind,
+            devicePath: item.sourceRef.devicePath,
+            offset: item.sourceRef.offset,
+            size: item.sourceRef.size,
+            runs: item.sourceRef.runs,
+          }
+        : undefined,
+      modifiedAt: item.modifiedAt,
+      recoveryChance: item.recoveryChance,
+      recoveryTier: item.recoveryTier,
+      recoveryReason: item.recoveryReason,
+      contentFingerprint: item.contentFingerprint,
+      headerSampleHex:
+        item.size <= 131072
+          ? bytesToHexSample(item.data, item.data.length)
+          : bytesToHexSample(item.data, 4096),
+    }));
+
+    const session: SavedScanSession = {
+      version: 1,
+      savedAt: new Date().toISOString(),
+      diskName,
+      diskSizeBytes: analysis.diskSizeBytes,
+      devicePath: nativeDriveTargetRef.current?.devicePath,
+      resumeOffset: scanProgress.currentSector * 512,
+      items: serialized,
+    };
+
+    const json = JSON.stringify(session);
+    const baseName = diskName.replace(/[^a-zA-Z0-9._-]+/g, '_').replace(/\.[^.]+$/, '');
+    const defaultName = `${baseName || 'recovery'}.tdscan.json`;
+    const bridge = getDesktopBridge();
+    if (bridge) {
+      const res = await bridge.saveTextReport({
+        defaultName,
+        title: 'Save Scan Session (.tdscan.json)',
+        filters: [{ name: 'TestDisk Scan Session', extensions: ['json', 'tdscan.json'] }],
+        content: json,
+      });
+      if (!res.canceled && res.filePath) {
+        setMbrActionNotice(`Scan session saved to ${res.filePath}`);
+      }
+      return;
+    }
+    const blob = new Blob([json], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = defaultName;
+    a.click();
+    URL.revokeObjectURL(url);
+  };
+
+  const handleImportSession = async (file: File | undefined) => {
+    if (!file) return;
+    setLoadError(null);
+    setMbrActionNotice(null);
+    try {
+      const parsed = JSON.parse(await file.text()) as SavedScanSession;
+      if (!parsed || parsed.version !== 1 || !Array.isArray(parsed.items)) {
+        setLoadError('Invalid scan session file format.');
+        return;
+      }
+      const restored: ExplorerFileItem[] = parsed.items.map((s) => ({
+        id: s.id,
+        filename: s.filename,
+        extension: s.extension,
+        family: s.family,
+        mimeType: s.mimeType,
+        size: s.size,
+        calculatedSize: s.calculatedSize,
+        status: s.status,
+        sourceKind: s.sourceKind,
+        partitionId: s.partitionId,
+        partitionName: s.partitionName,
+        originalPath: s.originalPath,
+        offset: s.offset,
+        sector: s.sector,
+        matchedOffset: s.matchedOffset,
+        matchedLength: s.matchedLength,
+        metadata: s.metadata,
+        description: s.description,
+        data: hexSampleToBytes(s.headerSampleHex),
+        sourceRef: s.sourceRef,
+        modifiedAt: s.modifiedAt,
+        recoveryChance: s.recoveryChance,
+        recoveryTier: s.recoveryTier,
+        recoveryReason: s.recoveryReason,
+        contentFingerprint: s.contentFingerprint,
+      }));
+
+      setActiveScreen('explorer');
+      setUseNativeScan(true);
+      setIsScanning(false);
+      setIsPaused(false);
+      setDiskName(parsed.diskName);
+      setCarvedItems(restored.filter((i) => i.sourceKind === 'carved' || i.sourceKind === 'ntfs-mft'));
+      setLocationItems(restored.filter((i) => i.sourceKind === 'recycle-bin' || i.sourceKind === 'folder'));
+      setFidentifyItems(restored.filter((i) => i.sourceKind === 'fidentify'));
+      setCheckedIds(new Set());
+      setFocusedFileId(restored[0]?.id ?? null);
+      setScanProgress({
+        currentSector: Math.floor((parsed.resumeOffset ?? parsed.diskSizeBytes) / 512),
+        totalSectors: Math.max(1, Math.floor(parsed.diskSizeBytes / 512)),
+        percent: 100,
+        foundCount: restored.length,
+        foundBytes: restored.reduce((sum, x) => sum + x.size, 0),
+      });
+      setMbrActionNotice(
+        `Loaded saved scan session (${restored.length} files from ${parsed.diskName}).`,
+      );
+    } catch {
+      setLoadError('Could not parse scan session JSON file.');
+    }
+  };
+
   const groupedSections = useMemo(() => {
     if (groupBy === 'none') {
       return [{ label: '', items: visibleItems }];
     }
     const map = new Map<string, ExplorerFileItem[]>();
     for (const item of visibleItems) {
-      const label = getGroupLabel(item, groupBy);
+      const label = getGroupLabel(item, groupBy, sessionReferenceMs);
       const list = map.get(label);
       if (list) list.push(item);
       else map.set(label, [item]);
     }
     return Array.from(map.entries()).map(([label, items]) => ({ label, items }));
-  }, [visibleItems, groupBy]);
+  }, [visibleItems, groupBy, sessionReferenceMs]);
 
   const toggleSort = (key: SortKey) => {
     if (sortKey === key) {
@@ -1538,16 +1808,32 @@ export const App: React.FC = () => {
         crumbs.push({ label: 'Scanned Folder', node: selectedNode });
       } else {
         crumbs.push({ label: diskName, node: { kind: 'disk-root' } });
-        if (selectedNode.kind === 'partition') {
+        if (selectedNode.kind === 'partition' || selectedNode.kind === 'folder-node') {
           const p = analysis.partitions.find((x) => x.id === selectedNode.partitionId);
           const fs = p?.detectedFs?.filesystem ?? p?.typeName ?? 'Partition';
           const lbl =
             p?.status === 'Deleted / Lost'
               ? `Lost Partition (${fs})`
               : `${fs} (${p?.name ?? selectedNode.partitionId})`;
-          crumbs.push({ label: lbl, node: selectedNode });
+          crumbs.push({
+            label: lbl,
+            node: { kind: 'partition', partitionId: selectedNode.partitionId },
+          });
+          if (selectedNode.kind === 'folder-node') {
+            const segs = selectedNode.folderPath.split('/').filter(Boolean);
+            for (let i = 0; i < segs.length; i++) {
+              crumbs.push({
+                label: segs[i],
+                node: {
+                  kind: 'folder-node',
+                  partitionId: selectedNode.partitionId,
+                  folderPath: segs.slice(0, i + 1).join('/'),
+                },
+              });
+            }
+          }
         } else if (selectedNode.kind === 'ntfs-mft') {
-          crumbs.push({ label: 'Deleted NTFS ($MFT)', node: selectedNode });
+          crumbs.push({ label: 'Deleted Filesystem ($MFT / FAT)', node: selectedNode });
         } else if (selectedNode.kind === 'unallocated') {
           crumbs.push({ label: 'Reconstructed', node: selectedNode });
         }
@@ -1565,23 +1851,50 @@ export const App: React.FC = () => {
     !paranoid ||
     !keepCorrupted ||
     hideDuplicates ||
+    groupBy !== 'none' ||
     statusFilter !== 'all' ||
     likelihoodFilter !== 'all' ||
     sizeFilter !== 'all' ||
     enabledFormats.size !== FILE_FORMATS.filter((f) => f.enableByDefault).length;
 
-  const sortLabels: Record<SortKey, string> = {
-    name: 'Name',
-    date: 'Date Modified',
-    type: 'Type',
-    size: 'Size',
-    likelihood: 'Likelihood',
-    origin: 'Origin',
+  const truncatedVideoCount = useMemo(
+    () =>
+      allItems.filter(
+        (i) => i.family === 'Videos' && i.status === 'OK_TRUNCATED' && !i.repaired,
+      ).length,
+    [allItems],
+  );
+
+  const renderBreadcrumbLeadIcon = () => {
+    if (treeMode === 'type') {
+      const fam =
+        selectedNode.kind === 'family' || selectedNode.kind === 'ext'
+          ? selectedNode.family
+          : null;
+      switch (fam) {
+        case 'Pictures':
+          return <ImageIcon className="w-4 h-4 text-amber-400 shrink-0" />;
+        case 'Videos':
+          return <Film className="w-4 h-4 text-violet-400 shrink-0" />;
+        case 'Documents':
+          return <FileText className="w-4 h-4 text-sky-400 shrink-0" />;
+        case 'Audio':
+          return <Music className="w-4 h-4 text-rose-400 shrink-0" />;
+        case 'Archives':
+          return <Archive className="w-4 h-4 text-emerald-400 shrink-0" />;
+        default:
+          return <Layers className="w-4 h-4 text-[#4C8DFF] shrink-0" />;
+      }
+    }
+    if (selectedNode.kind === 'folder-node') {
+      return <Folder className="w-4 h-4 text-[#4C8DFF] fill-[#4C8DFF]/30 shrink-0" />;
+    }
+    return <HardDrive className="w-4 h-4 text-[#4C8DFF] shrink-0" />;
   };
 
   return (
     <div
-      className="h-screen flex flex-col bg-[#11151C] text-slate-100 overflow-hidden"
+      className="h-screen flex flex-col bg-[#1A1D24] text-slate-100 overflow-hidden"
       onDragOver={(e) => {
         e.preventDefault();
         setDragActive(true);
@@ -1595,78 +1908,72 @@ export const App: React.FC = () => {
         const first = files[0];
         if (/\.(img|dd|raw|iso|bin|dmg)$/i.test(first.name)) {
           void handleOpenDiskImage(first);
+        } else if (/\.tdscan\.json$/i.test(first.name)) {
+          void handleImportSession(first);
         } else {
           void handleInspectUnknownFiles(files);
         }
       }}
     >
-      {/* Top Window Bar */}
-      <header className="h-14 shrink-0 bg-[#181E29] border-b border-[#2A3446] px-4 flex items-center justify-between gap-4">
-        <div className="flex items-center gap-3 min-w-0">
-          <div className="w-7 h-7 rounded-md bg-[#2E7CF6] flex items-center justify-center shrink-0">
-            <HardDrive className="w-4 h-4 text-white" />
+      {/* Top Window Bar (Minimal Charcoal Header) */}
+      <header className="h-11 shrink-0 bg-[#16181F] border-b border-[#262A34] px-4 flex items-center justify-between gap-3 select-none">
+        <div className="flex items-center gap-2.5 min-w-0">
+          <div className="w-6 h-6 rounded bg-[#3A7AFE] flex items-center justify-center shrink-0 shadow-sm">
+            <HardDrive className="w-3.5 h-3.5 text-white" />
           </div>
-          <span className="text-sm font-semibold tracking-tight text-slate-100 whitespace-nowrap truncate">
+          <span className="text-[13px] font-semibold tracking-tight text-slate-100 whitespace-nowrap">
             TestDisk &amp; PhotoRec
           </span>
-          <button
-            type="button"
-            onClick={() => setDriveHubOpen(true)}
-            className="hidden md:inline-flex items-center gap-1.5 px-2.5 py-1 rounded bg-[#11151C] border border-[#2A3446] text-[11px] font-mono text-slate-300 hover:text-white hover:border-[#3B4963] transition-colors whitespace-nowrap"
-            title="Inspect partition map and choose scan target"
-          >
-            <span className="text-[#38BDF8]">{diskName}</span>
-            <span className="text-slate-500">·</span>
-            <span>{scanPartitionScope ? 'Targeted Partition' : 'Full Disk'}</span>
-          </button>
+          {activeScreen === 'explorer' && diskName && (
+            <button
+              type="button"
+              onClick={() => setDriveHubOpen(true)}
+              className="hidden md:inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded bg-[#222630] border border-[#303542] text-[11px] font-mono text-slate-300 hover:text-white hover:border-[#41495B] transition-colors whitespace-nowrap"
+              title="Inspect partition map, connected drives, and scan target"
+            >
+              <span className="text-[#60A5FA]">{diskName}</span>
+              <span className="text-slate-500">·</span>
+              <span>{scanPartitionScope ? 'Partition Scope' : 'Full Disk'}</span>
+            </button>
+          )}
         </div>
 
-        <div className="flex items-center gap-2 shrink-0">
-          <OfflineIndicator />
-          <PWAInstallButton />
-          <button
-            type="button"
-            onClick={() => void handleScanRecycleBin()}
-            className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-md bg-[#1F2735] text-slate-200 border border-[#2A3446] hover:bg-[#283244] active:scale-[0.98] transition-all whitespace-nowrap shrink-0"
-            title="Scan Windows $Recycle.Bin ($I/$R deleted files)"
-          >
-            <Trash2 className="w-3.5 h-3.5 text-amber-400" />
-            Recycle Bin
-          </button>
-          <button
-            type="button"
-            onClick={() => void handleScanFolder()}
-            className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-md bg-[#1F2735] text-slate-200 border border-[#2A3446] hover:bg-[#283244] active:scale-[0.98] transition-all whitespace-nowrap shrink-0"
-            title="Scan any folder for photos, videos, or damaged files"
-          >
-            <FolderSearch className="w-3.5 h-3.5 text-[#38BDF8]" />
-            Scan Folder
-          </button>
-          <button
-            type="button"
-            onClick={() => unknownInputRef.current?.click()}
-            className="hidden xl:inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-md bg-[#1F2735] text-slate-200 border border-[#2A3446] hover:bg-[#283244] active:scale-[0.98] transition-all whitespace-nowrap shrink-0"
-          >
-            <FileQuestion className="w-3.5 h-3.5 text-emerald-400" />
-            Inspect Unknown File
-          </button>
-          <button
-            type="button"
-            onClick={handleResetSample}
-            className="hidden lg:inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-md bg-[#1F2735] text-slate-200 border border-[#2A3446] hover:bg-[#283244] active:scale-[0.98] transition-all whitespace-nowrap shrink-0"
-            title="Reload built-in Windows drive sample image"
-          >
-            <RotateCcw className="w-3.5 h-3.5 text-slate-400" />
-            Reset Sample
-          </button>
-          <button
-            type="button"
-            onClick={() => void handleOpenDiskPicker()}
-            className="inline-flex items-center gap-1.5 px-3.5 py-1.5 text-xs font-medium rounded-md bg-[#2E7CF6] text-white hover:bg-[#2569D6] active:scale-[0.98] transition-all whitespace-nowrap shrink-0"
-          >
-            <FolderOpen className="w-3.5 h-3.5" />
-            Open Disk Image
-          </button>
+        <div className="flex items-center gap-1.5 shrink-0">
+          {activeScreen === 'explorer' && (
+            <>
+              {allItems.length > 0 && (
+                <button
+                  type="button"
+                  onClick={() => void handleExportSession()}
+                  className="hidden md:inline-flex items-center gap-1.5 px-2.5 py-1 text-[11px] font-medium rounded bg-[#222630] text-slate-200 border border-[#303542] hover:bg-[#2B303C] transition-all whitespace-nowrap shrink-0"
+                  title="Save discovered file catalog as .tdscan.json session"
+                >
+                  <Save className="w-3.5 h-3.5 text-slate-300" />
+                  Save Session
+                </button>
+              )}
+              {allItems.length > 0 && (
+                <button
+                  type="button"
+                  onClick={() => void handleExportDfxml()}
+                  className="hidden lg:inline-flex items-center gap-1.5 px-2.5 py-1 text-[11px] font-medium rounded bg-[#222630] text-slate-200 border border-[#303542] hover:bg-[#2B303C] transition-all whitespace-nowrap shrink-0"
+                  title="Export forensic inventory & byte runs as DFXML XML"
+                >
+                  <FileCode className="w-3.5 h-3.5 text-[#60A5FA]" />
+                  DFXML
+                </button>
+              )}
+              <button
+                type="button"
+                onClick={() => void handleOpenDiskPicker()}
+                className="inline-flex items-center gap-1.5 px-2.5 py-1 text-[11px] font-medium rounded bg-[#222630] text-slate-200 border border-[#303542] hover:bg-[#2B303C] transition-all whitespace-nowrap shrink-0"
+                title="Open another disk image or physical drive"
+              >
+                <FolderOpen className="w-3.5 h-3.5 text-[#60A5FA]" />
+                Open Image
+              </button>
+            </>
+          )}
 
           <input
             ref={diskInputRef}
@@ -1699,269 +2006,209 @@ export const App: React.FC = () => {
               e.target.value = '';
             }}
           />
+          <input
+            ref={sessionInputRef}
+            type="file"
+            accept=".json,.tdscan.json"
+            className="hidden"
+            onChange={(e) => {
+              void handleImportSession(e.target.files?.[0]);
+              e.target.value = '';
+            }}
+          />
         </div>
       </header>
 
-      {/* Explorer Navigation, Sort & Group, Filter, and Search Toolbar */}
-      <div className="h-12 shrink-0 bg-[#141922] border-b border-[#2A3446] px-4 flex items-center justify-between gap-3">
-        <div className="flex items-center gap-2 min-w-0 flex-1">
-          <div className="flex items-center gap-1 shrink-0">
-            <button
-              type="button"
-              onClick={handleNavHome}
-              className="p-1.5 rounded bg-[#1F2735] border border-[#2A3446] text-slate-300 hover:text-white hover:bg-[#283244] transition-colors"
-              title="Home"
-              aria-label="Home"
-            >
-              <Home className="w-3.5 h-3.5" />
-            </button>
-            <button
-              type="button"
-              onClick={handleNavBack}
-              disabled={navIndex <= 0}
-              className="p-1.5 rounded bg-[#1F2735] border border-[#2A3446] text-slate-300 hover:text-white hover:bg-[#283244] disabled:opacity-35 transition-colors"
-              title="Back"
-              aria-label="Back"
-            >
-              <ArrowLeft className="w-3.5 h-3.5" />
-            </button>
-            <button
-              type="button"
-              onClick={handleNavUp}
-              disabled={
-                selectedNode.kind === 'all-types' ||
-                selectedNode.kind === 'disk-root' ||
-                selectedNode.kind === 'fidentify' ||
-                selectedNode.kind === 'recycle-bin' ||
-                selectedNode.kind === 'folder-scan'
-              }
-              className="p-1.5 rounded bg-[#1F2735] border border-[#2A3446] text-slate-300 hover:text-white hover:bg-[#283244] disabled:opacity-35 transition-colors"
-              title="Up one level"
-              aria-label="Up one level"
-            >
-              <ArrowUp className="w-3.5 h-3.5" />
-            </button>
-          </div>
-
-          <div className="h-5 w-px bg-[#2A3446] mx-1 shrink-0" />
-
-          {/* Interactive Breadcrumb Trail */}
-          <nav aria-label="Breadcrumb" className="flex items-center gap-1 text-xs min-w-0 overflow-hidden">
-            {breadcrumbs.map((crumb, idx) => {
-              const isLast = idx === breadcrumbs.length - 1;
-              return (
-                <React.Fragment key={`${crumb.label}-${idx}`}>
-                  {idx > 0 && <ChevronRight className="w-3.5 h-3.5 text-slate-500 shrink-0" />}
-                  <button
-                    type="button"
-                    onClick={() => navigateToNode(crumb.node)}
-                    className={`px-1.5 py-0.5 rounded truncate transition-colors ${
-                      isLast
-                        ? 'text-slate-100 font-medium'
-                        : 'text-slate-400 hover:text-slate-200 hover:bg-[#1F2735]'
-                    }`}
-                  >
-                    {crumb.label}
-                  </button>
-                </React.Fragment>
-              );
-            })}
-          </nav>
-        </div>
-
-        <div className="flex items-center gap-2 shrink-0">
-          {/* View Mode Toggle */}
-          <div className="flex items-center bg-[#11151C] rounded-md border border-[#2A3446] p-0.5">
-            <button
-              type="button"
-              onClick={() => setViewMode('list')}
-              className={`p-1 rounded transition-colors ${
-                viewMode === 'list' ? 'bg-[#283244] text-white' : 'text-slate-400 hover:text-slate-200'
-              }`}
-              title="List view"
-              aria-label="List view"
-            >
-              <LayoutList className="w-3.5 h-3.5" />
-            </button>
-            <button
-              type="button"
-              onClick={() => setViewMode('grid')}
-              className={`p-1 rounded transition-colors ${
-                viewMode === 'grid' ? 'bg-[#283244] text-white' : 'text-slate-400 hover:text-slate-200'
-              }`}
-              title="Thumbnail grid view"
-              aria-label="Grid view"
-            >
-              <LayoutGrid className="w-3.5 h-3.5" />
-            </button>
-          </div>
-
-          {/* Dedicated Sort & Group Button */}
-          <div className="relative" ref={sortMenuRef}>
-            <button
-              type="button"
-              onClick={() => setSortMenuOpen((o) => !o)}
-              className={`inline-flex items-center gap-1.5 px-3 py-1.5 rounded-md text-xs font-medium border transition-colors whitespace-nowrap ${
-                groupBy !== 'none' || sortMenuOpen
-                  ? 'bg-[#2E7CF6]/15 border-[#2E7CF6] text-[#60A5FA]'
-                  : 'bg-[#1F2735] border-[#2A3446] text-slate-200 hover:bg-[#283244]'
-              }`}
-            >
-              <ArrowDownUp className="w-3.5 h-3.5" />
-              <span>Sort: {sortLabels[sortKey]}</span>
-              <ChevronDown className="w-3 h-3 opacity-70" />
-            </button>
-
-            {sortMenuOpen && (
-              <div className="absolute right-0 mt-1.5 w-60 rounded-lg bg-[#181E29] border border-[#2A3446] shadow-2xl z-40 py-2 text-xs animate-modal-in">
-                <div className="px-3 py-1 text-[11px] font-semibold text-slate-400 uppercase tracking-wider">
-                  Sort By
+      {activeScreen === 'home' ? (
+        <div className="flex-1 min-h-0 flex flex-col relative">
+          {dragActive && (
+            <div className="absolute inset-0 z-40 bg-[#16181F]/85 border-2 border-dashed border-[#3A7AFE] flex items-center justify-center pointer-events-none animate-backdrop-in">
+              <div className="bg-[#222630] border border-[#343A48] rounded-lg px-6 py-4 text-center space-y-1 animate-modal-in">
+                <Upload className="w-6 h-6 text-[#60A5FA] mx-auto" />
+                <div className="text-sm font-medium text-slate-100">
+                  Drop Disk Image (.img / .dd / .raw / .iso), Session (.tdscan.json), or Unknown Files
                 </div>
-                {(
-                  [
-                    ['name', 'Name'],
-                    ['size', 'Size'],
-                    ['date', 'Date Modified'],
-                    ['likelihood', 'Likelihood of Recovery'],
-                    ['type', 'File Type'],
-                    ['origin', 'Origin / Partition'],
-                  ] as [SortKey, string][]
-                ).map(([key, label]) => (
-                  <button
-                    key={key}
-                    type="button"
-                    onClick={() => setSortKey(key)}
-                    className="w-full px-3 py-1.5 flex items-center justify-between text-left text-slate-200 hover:bg-[#283244] transition-colors"
-                  >
-                    <span>{label}</span>
-                    {sortKey === key && <Check className="w-3.5 h-3.5 text-[#38BDF8]" />}
-                  </button>
-                ))}
-
-                <div className="my-1.5 border-t border-[#2A3446]" />
-                <div className="px-3 py-1 text-[11px] font-semibold text-slate-400 uppercase tracking-wider">
-                  Order
+                <div className="text-xs text-slate-400">
+                  All binary parsing runs locally on your machine
                 </div>
-                <div className="px-3 py-1 grid grid-cols-2 gap-1.5">
-                  <button
-                    type="button"
-                    onClick={() => setSortDir('asc')}
-                    className={`py-1 rounded border text-center transition-colors ${
-                      sortDir === 'asc'
-                        ? 'bg-[#2E7CF6] border-[#2E7CF6] text-white'
-                        : 'bg-[#11151C] border-[#2A3446] text-slate-300 hover:bg-[#1F2735]'
-                    }`}
-                  >
-                    Ascending
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => setSortDir('desc')}
-                    className={`py-1 rounded border text-center transition-colors ${
-                      sortDir === 'desc'
-                        ? 'bg-[#2E7CF6] border-[#2E7CF6] text-white'
-                        : 'bg-[#11151C] border-[#2A3446] text-slate-300 hover:bg-[#1F2735]'
-                    }`}
-                  >
-                    Descending
-                  </button>
-                </div>
-
-                <div className="my-1.5 border-t border-[#2A3446]" />
-                <div className="px-3 py-1 text-[11px] font-semibold text-slate-400 uppercase tracking-wider">
-                  Group By
-                </div>
-                {(
-                  [
-                    ['none', 'None (Flat List)'],
-                    ['likelihood', 'Recovery Likelihood'],
-                    ['type', 'File Type'],
-                    ['origin', 'Origin / Partition'],
-                    ['date', 'Date Modified'],
-                  ] as [GroupByKey, string][]
-                ).map(([gKey, gLabel]) => (
-                  <button
-                    key={gKey}
-                    type="button"
-                    onClick={() => {
-                      setGroupBy(gKey);
-                      setCollapsedGroups(new Set());
-                    }}
-                    className="w-full px-3 py-1.5 flex items-center justify-between text-left text-slate-200 hover:bg-[#283244] transition-colors"
-                  >
-                    <span>{gLabel}</span>
-                    {groupBy === gKey && <Check className="w-3.5 h-3.5 text-[#38BDF8]" />}
-                  </button>
-                ))}
               </div>
-            )}
-          </div>
-
-          {/* Filter Modal Trigger */}
-          <button
-            type="button"
-            onClick={() => setFilterOpen(true)}
-            className={`inline-flex items-center gap-1.5 px-3 py-1.5 rounded-md text-xs font-medium border transition-colors whitespace-nowrap ${
-              hasCustomFilters
-                ? 'bg-[#2E7CF6]/15 border-[#2E7CF6] text-[#60A5FA]'
-                : 'bg-[#1F2735] border-[#2A3446] text-slate-200 hover:bg-[#283244]'
-            }`}
-          >
-            <SlidersHorizontal className="w-3.5 h-3.5" />
-            Filter
-          </button>
-
-          {/* Export DFXML Forensic Report */}
-          <button
-            type="button"
-            onClick={() => void handleExportDfxml()}
-            disabled={allItems.length === 0}
-            title="Export forensic inventory & byte runs as DFXML XML"
-            className="hidden sm:inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-md text-xs font-medium border bg-[#1F2735] border-[#2A3446] text-slate-200 hover:bg-[#283244] disabled:opacity-40 transition-colors whitespace-nowrap shrink-0"
-          >
-            <FileCode className="w-3.5 h-3.5 text-[#38BDF8]" />
-            DFXML
-          </button>
-
-          {/* Search Box */}
-          <div className="relative w-48 lg:w-60">
-            <Search className="w-3.5 h-3.5 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2 pointer-events-none" />
-            <input
-              type="text"
-              value={searchQuery}
-              onChange={(e) => setSearchQuery(e.target.value)}
-              placeholder="Search files or folders"
-              className="w-full pl-8 pr-7 py-1.5 rounded-md bg-[#11151C] border border-[#2A3446] text-xs text-slate-100 placeholder:text-slate-500 focus:outline-none focus:border-[#2E7CF6]"
-            />
-            {searchQuery && (
-              <button
-                type="button"
-                onClick={() => setSearchQuery('')}
-                className="absolute right-2 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-200"
-                aria-label="Clear search"
-              >
+            </div>
+          )}
+          {loadError && (
+            <div className="mx-6 mt-3 px-3.5 py-2 rounded-md bg-rose-500/10 border border-rose-500/30 text-rose-300 text-xs flex items-center justify-between gap-3">
+              <span>{loadError}</span>
+              <button type="button" onClick={() => setLoadError(null)} className="text-rose-200">
                 <X className="w-3.5 h-3.5" />
               </button>
-            )}
-          </div>
+            </div>
+          )}
+          <HomeView
+            onScanPhysicalDrive={handleOpenPhysicalDrive}
+            onOpenDiskPicker={() => void handleOpenDiskPicker()}
+            onScanFolder={() => void handleScanFolder()}
+            onScanRecycleBin={handleScanRecycleBin}
+            onScanDesktop={handleScanDesktop}
+            onOpenUnknownFiles={() => unknownInputRef.current?.click()}
+            onOpenSessionPicker={() => sessionInputRef.current?.click()}
+            hasExistingResults={allItems.length > 0 || diskBytes.length > 0}
+            onReturnToResults={() => setActiveScreen('explorer')}
+          />
         </div>
-      </div>
-
-      {/* Main 3-Pane Explorer Body */}
-      <div className="flex-1 min-h-0 flex relative">
-        {dragActive && (
-          <div className="absolute inset-0 z-40 bg-[#11151C]/85 border-2 border-dashed border-[#2E7CF6] flex items-center justify-center pointer-events-none animate-backdrop-in">
-            <div className="bg-[#181E29] border border-[#2A3446] rounded-lg px-6 py-4 text-center space-y-1 animate-modal-in">
-              <Upload className="w-6 h-6 text-[#38BDF8] mx-auto" />
-              <div className="text-sm font-medium text-slate-100">
-                Drop Disk Image (.img / .dd / .raw / .iso) or Unknown Files
+      ) : (
+        <>
+          {/* Explorer Navigation, Breadcrumb, View Toggle, Filter & Search Toolbar (Screenshots 1 & 2) */}
+          <div className="h-11 shrink-0 bg-[#1D2028] border-b border-[#2A2E39] px-4 flex items-center justify-between gap-3">
+            <div className="flex items-center gap-2 min-w-0 flex-1">
+              <div className="flex items-center gap-1 shrink-0">
+                <button
+                  type="button"
+                  onClick={handleNavHome}
+                  className="p-1.5 rounded bg-[#262B36] border border-[#343A48] text-slate-300 hover:text-white hover:bg-[#2F3644] transition-colors"
+                  title="Home"
+                  aria-label="Home"
+                >
+                  <Home className="w-3.5 h-3.5" />
+                </button>
               </div>
-              <div className="text-xs text-slate-400">
-                All binary parsing runs locally in your Windows browser session
+
+              <div className="h-4 w-px bg-[#2E3340] mx-0.5 shrink-0" />
+
+              <div className="flex items-center gap-1 shrink-0">
+                <button
+                  type="button"
+                  onClick={handleNavBack}
+                  disabled={navIndex <= 0}
+                  className="p-1.5 rounded text-slate-300 hover:text-white hover:bg-[#262B36] disabled:opacity-35 transition-colors"
+                  title="Back"
+                  aria-label="Back"
+                >
+                  <ArrowLeft className="w-3.5 h-3.5" />
+                </button>
+                <button
+                  type="button"
+                  onClick={handleNavUp}
+                  disabled={
+                    selectedNode.kind === 'all-types' ||
+                    selectedNode.kind === 'disk-root' ||
+                    selectedNode.kind === 'fidentify' ||
+                    selectedNode.kind === 'recycle-bin' ||
+                    selectedNode.kind === 'folder-scan'
+                  }
+                  className="p-1.5 rounded text-slate-300 hover:text-white hover:bg-[#262B36] disabled:opacity-35 transition-colors"
+                  title="Up one level"
+                  aria-label="Up one level"
+                >
+                  <ArrowUp className="w-3.5 h-3.5" />
+                </button>
+              </div>
+
+              {/* Interactive Breadcrumb Trail with matching leading icon */}
+              <nav
+                aria-label="Breadcrumb"
+                className="flex items-center gap-1.5 text-xs min-w-0 overflow-hidden pl-1"
+              >
+                {renderBreadcrumbLeadIcon()}
+                {breadcrumbs.map((crumb, idx) => {
+                  const isLast = idx === breadcrumbs.length - 1;
+                  return (
+                    <React.Fragment key={`${crumb.label}-${idx}`}>
+                      {idx > 0 && <ChevronRight className="w-3.5 h-3.5 text-slate-500 shrink-0" />}
+                      <button
+                        type="button"
+                        onClick={() => navigateToNode(crumb.node)}
+                        className={`px-1 py-0.5 rounded truncate transition-colors ${
+                          isLast
+                            ? 'text-slate-100 font-medium'
+                            : 'text-slate-300 hover:text-white hover:bg-[#262B36]'
+                        }`}
+                      >
+                        {crumb.label}
+                      </button>
+                    </React.Fragment>
+                  );
+                })}
+              </nav>
+            </div>
+
+            {/* Clean 3-Control Right Toolbar matching Screenshot 1 */}
+            <div className="flex items-center gap-2 shrink-0">
+              <div className="flex items-center bg-[#262B36] rounded border border-[#343A48] p-0.5">
+                <button
+                  type="button"
+                  onClick={() => setViewMode('list')}
+                  className={`p-1 rounded-xs transition-colors ${
+                    viewMode === 'list' ? 'bg-[#363D4E] text-white' : 'text-slate-400 hover:text-slate-200'
+                  }`}
+                  title="List view"
+                  aria-label="List view"
+                >
+                  <LayoutList className="w-3.5 h-3.5" />
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setViewMode('grid')}
+                  className={`p-1 rounded-xs transition-colors ${
+                    viewMode === 'grid' ? 'bg-[#363D4E] text-white' : 'text-slate-400 hover:text-slate-200'
+                  }`}
+                  title="Thumbnail grid view"
+                  aria-label="Grid view"
+                >
+                  <LayoutGrid className="w-3.5 h-3.5" />
+                </button>
+              </div>
+
+              <button
+                type="button"
+                onClick={() => setFilterOpen(true)}
+                className={`inline-flex items-center gap-1.5 px-3 py-1 rounded text-xs font-medium border transition-colors whitespace-nowrap ${
+                  hasCustomFilters
+                    ? 'bg-[#3A7AFE]/20 border-[#3A7AFE] text-[#60A5FA]'
+                    : 'bg-[#262B36] border-[#343A48] text-slate-200 hover:bg-[#2F3644]'
+                }`}
+              >
+                <Filter className="w-3.5 h-3.5" />
+                Filter
+              </button>
+
+              <div className="relative w-52 lg:w-60">
+                <input
+                  type="text"
+                  value={searchQuery}
+                  onChange={(e) => setSearchQuery(e.target.value)}
+                  placeholder="Search files or folders"
+                  className="w-full pl-3 pr-8 py-1 rounded bg-[#262B36] border border-[#343A48] text-xs text-slate-100 placeholder:text-slate-400 focus:outline-none focus:border-[#3A7AFE]"
+                />
+                {searchQuery ? (
+                  <button
+                    type="button"
+                    onClick={() => setSearchQuery('')}
+                    className="absolute right-2.5 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-200"
+                    aria-label="Clear search"
+                  >
+                    <X className="w-3.5 h-3.5" />
+                  </button>
+                ) : (
+                  <Search className="w-3.5 h-3.5 text-slate-400 absolute right-2.5 top-1/2 -translate-y-1/2 pointer-events-none" />
+                )}
               </div>
             </div>
           </div>
-        )}
+
+          {/* Main 3-Pane Explorer Body */}
+          <div className="flex-1 min-h-0 flex relative">
+            {dragActive && (
+              <div className="absolute inset-0 z-40 bg-[#16181F]/85 border-2 border-dashed border-[#3A7AFE] flex items-center justify-center pointer-events-none animate-backdrop-in">
+                <div className="bg-[#222630] border border-[#343A48] rounded-lg px-6 py-4 text-center space-y-1 animate-modal-in">
+                  <Upload className="w-6 h-6 text-[#60A5FA] mx-auto" />
+                  <div className="text-sm font-medium text-slate-100">
+                    Drop Disk Image (.img / .dd / .raw / .iso), Session (.tdscan.json), or Unknown Files
+                  </div>
+                  <div className="text-xs text-slate-400">
+                    All binary parsing runs locally on your machine
+                  </div>
+                </div>
+              </div>
+            )}
 
         {/* Left Sidebar */}
         <ExplorerSidebar
@@ -1975,10 +2222,10 @@ export const App: React.FC = () => {
           onToggleNodeCheck={handleToggleNodeCheck}
         />
 
-        {/* Center File List & Contextual Action Strip */}
-        <main className="flex-1 min-w-0 flex flex-col bg-[#11151C]">
+        {/* Center File List & Contextual Strips */}
+        <main className="flex-1 min-w-0 flex flex-col bg-[#1A1D24]">
           {loadError && (
-            <div className="mx-4 mt-3 px-3.5 py-2.5 rounded-md bg-rose-500/10 border border-rose-500/30 text-rose-300 text-xs flex items-center justify-between gap-3 animate-slide-down">
+            <div className="mx-3 mt-2.5 px-3.5 py-2 rounded-md bg-rose-500/10 border border-rose-500/30 text-rose-300 text-xs flex items-center justify-between gap-3 animate-slide-down">
               <span>{loadError}</span>
               <button type="button" onClick={() => setLoadError(null)} className="text-rose-200">
                 <X className="w-3.5 h-3.5" />
@@ -1987,20 +2234,22 @@ export const App: React.FC = () => {
           )}
 
           {mbrActionNotice && (
-            <div className="mx-4 mt-3 px-3.5 py-2.5 rounded-md bg-emerald-500/10 border border-emerald-500/30 text-emerald-300 text-xs flex items-center justify-between gap-3 animate-slide-down">
+            <div className="mx-3 mt-2.5 px-3.5 py-2 rounded-md bg-emerald-500/10 border border-emerald-500/30 text-emerald-300 text-xs flex items-center justify-between gap-3 animate-slide-down">
               <div className="flex items-center gap-2">
                 <CheckCircle2 className="w-4 h-4 shrink-0" />
                 <span>{mbrActionNotice}</span>
               </div>
               <div className="flex items-center gap-2 shrink-0">
-                <button
-                  type="button"
-                  onClick={handleDownloadRepairedImg}
-                  className="inline-flex items-center gap-1 px-2.5 py-1 rounded bg-emerald-500/20 hover:bg-emerald-500/30 text-emerald-100 font-medium"
-                >
-                  <Download className="w-3 h-3" />
-                  Export Repaired .img
-                </button>
+                {repairedDiskBytes && (
+                  <button
+                    type="button"
+                    onClick={handleDownloadRepairedImg}
+                    className="inline-flex items-center gap-1 px-2.5 py-1 rounded bg-emerald-500/20 hover:bg-emerald-500/30 text-emerald-100 font-medium"
+                  >
+                    <Download className="w-3 h-3" />
+                    Export Repaired .img
+                  </button>
+                )}
                 <button
                   type="button"
                   onClick={() => setMbrActionNotice(null)}
@@ -2012,120 +2261,26 @@ export const App: React.FC = () => {
             </div>
           )}
 
-          {/* Lost Partition Notification Banner */}
-          {lostPartitions.length > 0 && !lostBannerDismissed && (
-            <div className="mx-4 mt-3 px-4 py-2.5 rounded-md bg-[#181E29] border border-[#2A3446] flex flex-wrap items-center justify-between gap-3 text-xs animate-slide-down">
+          {bitlockerPartitions.length > 0 && (
+            <div className="mx-3 mt-2.5 px-3.5 py-2 rounded-md bg-amber-500/10 border border-amber-500/30 text-amber-200 text-xs flex flex-wrap items-center justify-between gap-3 animate-slide-down">
               <div className="flex items-center gap-2.5">
                 <ShieldAlert className="w-4 h-4 text-amber-400 shrink-0" />
-                <div>
-                  <span className="font-semibold text-slate-100">Lost partitions found</span>
-                  <span className="text-slate-400 ml-2">
-                    Detected {lostPartitions.length} unmapped Windows/disk filesystem
-                    {lostPartitions.length > 1 ? 's' : ''} (
-                    {lostPartitions
-                      .map((p) => p.detectedFs?.filesystem ?? p.typeName)
-                      .join(', ')}
-                    ) outside the active MBR table.
+                <span>
+                  <strong className="font-semibold text-amber-100">
+                    BitLocker Encrypted Volume Detected (-FVE-FS-)
+                  </strong>
+                  <span className="ml-2 text-amber-200/90">
+                    Unlock the volume with its Windows BitLocker recovery key before scanning
+                    unencrypted sectors.
                   </span>
-                </div>
-              </div>
-              <div className="flex items-center gap-2 shrink-0">
-                <button
-                  type="button"
-                  onClick={() => {
-                    navigateToNode({
-                      kind: 'partition',
-                      partitionId: lostPartitions[0].id,
-                    });
-                    setFocusedFileId(null);
-                  }}
-                  className="px-2.5 py-1 rounded bg-[#1F2735] border border-[#2A3446] text-slate-200 hover:bg-[#283244] transition-colors"
-                >
-                  Inspect Lost Partition
-                </button>
-                <button
-                  type="button"
-                  onClick={() => handleRestorePartitionToMbr(lostPartitions[0])}
-                  className="inline-flex items-center gap-1 px-2.5 py-1 rounded bg-[#2E7CF6] text-white hover:bg-[#2569D6] font-medium transition-colors"
-                >
-                  <Wrench className="w-3 h-3" />
-                  Restore to MBR
-                </button>
-                <button
-                  type="button"
-                  onClick={() => setLostBannerDismissed(true)}
-                  className="p-1 text-slate-400 hover:text-slate-200"
-                  aria-label="Dismiss lost partition banner"
-                >
-                  <X className="w-3.5 h-3.5" />
-                </button>
+                </span>
               </div>
             </div>
           )}
 
-          {/* Contextual Partition Geometry Strip in Path Mode */}
-          {treeMode === 'path' &&
-            (selectedNode.kind === 'disk-root' || selectedNode.kind === 'partition') && (
-              <div className="mx-4 mt-3 px-4 py-2.5 rounded-md bg-[#141922] border border-[#2A3446] flex flex-wrap items-center justify-between gap-3 text-xs animate-slide-down">
-                {focusedPartition ? (
-                  <>
-                    <div className="flex items-center gap-3 min-w-0">
-                      <span className="font-semibold text-slate-100">
-                        {focusedPartition.detectedFs?.filesystem ?? focusedPartition.typeName} ·{' '}
-                        {focusedPartition.name}
-                      </span>
-                      <span className="text-slate-400 font-mono tabular-nums">
-                        LBA {focusedPartition.startLba}–{focusedPartition.endLba} ·{' '}
-                        {formatBytes(focusedPartition.sizeBytes)}
-                      </span>
-                    </div>
-                    <div className="flex items-center gap-2">
-                      {focusedPartition.status === 'Deleted / Lost' && (
-                        <button
-                          type="button"
-                          onClick={() => handleRestorePartitionToMbr(focusedPartition)}
-                          className="inline-flex items-center gap-1 px-2.5 py-1 rounded bg-[#2E7CF6] text-white hover:bg-[#2569D6] font-medium"
-                        >
-                          <Wrench className="w-3 h-3" />
-                          Write to MBR
-                        </button>
-                      )}
-                      {repairedDiskBytes && (
-                        <button
-                          type="button"
-                          onClick={handleDownloadRepairedImg}
-                          className="inline-flex items-center gap-1 px-2.5 py-1 rounded bg-[#1F2735] border border-[#2A3446] text-slate-200 hover:bg-[#283244]"
-                        >
-                          <Download className="w-3 h-3" />
-                          Export Repaired .img
-                        </button>
-                      )}
-                    </div>
-                  </>
-                ) : (
-                  <>
-                    <div className="flex items-center gap-3">
-                      <span className="font-semibold text-slate-100">{analysis.diskName}</span>
-                      <span className="text-slate-400 font-mono tabular-nums">
-                        {analysis.arch} · {analysis.partitions.length} partitions ·{' '}
-                        {formatBytes(analysis.diskSizeBytes)}
-                      </span>
-                    </div>
-                    <button
-                      type="button"
-                      onClick={() => setDriveHubOpen(true)}
-                      className="px-2.5 py-1 rounded bg-[#1F2735] border border-[#2A3446] text-slate-200 hover:bg-[#283244]"
-                    >
-                      Partition Map &amp; Scan Scope
-                    </button>
-                  </>
-                )}
-              </div>
-            )}
-
           {/* Contextual fidentify Drop Strip */}
           {selectedNode.kind === 'fidentify' && (
-            <div className="mx-4 mt-3 px-4 py-3 rounded-md bg-[#181E29] border border-[#2A3446] flex flex-wrap items-center justify-between gap-3 text-xs animate-slide-down">
+            <div className="mx-3 mt-2.5 px-3.5 py-2.5 rounded-md bg-[#222630] border border-[#2E3340] flex flex-wrap items-center justify-between gap-3 text-xs animate-slide-down">
               <div>
                 <div className="font-semibold text-slate-100">
                   Unknown File Signature Inspector (fidentify)
@@ -2134,28 +2289,19 @@ export const App: React.FC = () => {
                   Drop or select extensionless / corrupted files to identify their true format by magic header.
                 </div>
               </div>
-              <div className="flex items-center gap-2">
-                <button
-                  type="button"
-                  onClick={handleLoadSampleUnknown}
-                  className="px-3 py-1.5 rounded bg-[#1F2735] border border-[#2A3446] text-slate-200 hover:bg-[#283244]"
-                >
-                  Load Sample Unknown Files
-                </button>
-                <button
-                  type="button"
-                  onClick={() => unknownInputRef.current?.click()}
-                  className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded bg-[#2E7CF6] text-white hover:bg-[#2569D6] font-medium"
-                >
-                  <Upload className="w-3.5 h-3.5" />
-                  Select Files
-                </button>
-              </div>
+              <button
+                type="button"
+                onClick={() => unknownInputRef.current?.click()}
+                className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded bg-[#3A7AFE] text-white hover:bg-[#2F6EEB] font-medium"
+              >
+                <Upload className="w-3.5 h-3.5" />
+                Select Files
+              </button>
             </div>
           )}
 
           {/* Center File Table or Grid */}
-          <div className="flex-1 min-h-0 overflow-y-auto mt-2">
+          <div className="flex-1 min-h-0 overflow-y-auto">
             {visibleItems.length === 0 ? (
               <div className="h-full flex flex-col items-center justify-center p-8 text-center text-xs text-slate-400 space-y-2 animate-row-fade">
                 <FileQuestion className="w-8 h-8 text-slate-600" />
@@ -2168,13 +2314,13 @@ export const App: React.FC = () => {
                 </div>
                 <div className="max-w-sm text-slate-500">
                   {selectedNode.kind === 'fidentify'
-                    ? 'Click "Select Files" or "Load Sample Unknown Files" above to inspect raw binary headers.'
+                    ? 'Click "Select Files" above or drop extensionless / corrupted files to inspect raw binary headers.'
                     : 'Try switching between Type and Path in the left sidebar, or adjust Filter options.'}
                 </div>
               </div>
             ) : viewMode === 'list' ? (
               <table className="w-full text-left border-collapse text-xs">
-                <thead className="sticky top-0 z-10 bg-[#141922] border-y border-[#2A3446] text-slate-400 select-none">
+                <thead className="sticky top-0 z-10 bg-[#1D2028] border-b border-[#2A2E39] text-slate-400 select-none">
                   <tr>
                     <th className="w-10 py-2.5 pl-4 pr-2">
                       <input
@@ -2182,7 +2328,7 @@ export const App: React.FC = () => {
                         checked={allVisibleChecked}
                         onChange={toggleAllVisible}
                         aria-label="Select all visible files"
-                        className="w-3.5 h-3.5 rounded border-[#3B4963] bg-[#11151C] text-[#2E7CF6] cursor-pointer"
+                        className="w-3.5 h-3.5 rounded-xs border-[#464E5E] bg-[#16181F] text-[#3A7AFE] cursor-pointer"
                       />
                     </th>
                     <th
@@ -2205,25 +2351,13 @@ export const App: React.FC = () => {
                     </th>
                     <th
                       onClick={() => toggleSort('size')}
-                      className="py-2.5 px-2 font-medium cursor-pointer hover:text-slate-200 text-right"
+                      className="py-2.5 pl-2 pr-4 font-medium cursor-pointer hover:text-slate-200 text-right"
                     >
                       Size {sortKey === 'size' ? (sortDir === 'asc' ? '↑' : '↓') : ''}
                     </th>
-                    <th
-                      onClick={() => toggleSort('likelihood')}
-                      className="py-2.5 px-2 font-medium cursor-pointer hover:text-slate-200 text-right"
-                    >
-                      Likelihood {sortKey === 'likelihood' ? (sortDir === 'asc' ? '↑' : '↓') : ''}
-                    </th>
-                    <th
-                      onClick={() => toggleSort('origin')}
-                      className="py-2.5 pl-2 pr-4 font-medium cursor-pointer hover:text-slate-200 text-right hidden xl:table-cell"
-                    >
-                      Origin {sortKey === 'origin' ? (sortDir === 'asc' ? '↑' : '↓') : ''}
-                    </th>
                   </tr>
                 </thead>
-                <tbody className="divide-y divide-[#1E2532]">
+                <tbody className="divide-y divide-[#232732]">
                   {groupedSections.map((section) => {
                     const isCollapsed = section.label !== '' && collapsedGroups.has(section.label);
                     return (
@@ -2238,9 +2372,9 @@ export const App: React.FC = () => {
                                 return next;
                               })
                             }
-                            className="bg-[#141922]/90 cursor-pointer hover:bg-[#1A212E] select-none"
+                            className="bg-[#1D2028] cursor-pointer hover:bg-[#242833] select-none"
                           >
-                            <td colSpan={7} className="px-4 py-2 font-semibold text-slate-200">
+                            <td colSpan={5} className="px-4 py-2 font-semibold text-slate-200">
                               <div className="flex items-center gap-2">
                                 {isCollapsed ? (
                                   <ChevronRight className="w-3.5 h-3.5 text-slate-400" />
@@ -2260,7 +2394,6 @@ export const App: React.FC = () => {
                           section.items.map((item) => {
                             const isFocused = focusedFileId === item.id;
                             const isChecked = checkedIds.has(item.id);
-                            const lbc = likelihoodBadgeClasses(item.recoveryTier);
                             return (
                               <tr
                                 key={item.id}
@@ -2276,8 +2409,8 @@ export const App: React.FC = () => {
                                 }}
                                 className={`group cursor-pointer transition-colors duration-100 animate-row-fade ${
                                   isFocused
-                                    ? 'bg-[#283244] text-white'
-                                    : 'hover:bg-[#1A212E] text-slate-200'
+                                    ? 'bg-[#2C3444] text-white'
+                                    : 'hover:bg-[#232732] text-slate-200'
                                 }`}
                               >
                                 <td
@@ -2292,41 +2425,23 @@ export const App: React.FC = () => {
                                     checked={isChecked}
                                     onChange={() => {}}
                                     aria-label={`Select ${item.filename}`}
-                                    className="w-3.5 h-3.5 rounded border-[#3B4963] bg-[#11151C] text-[#2E7CF6] cursor-pointer"
+                                    className="w-3.5 h-3.5 rounded-xs border-[#464E5E] bg-[#16181F] text-[#3A7AFE] cursor-pointer"
                                   />
                                 </td>
                                 <td className="py-2 px-2">
                                   <div className="flex items-center gap-2.5 min-w-0">
                                     <FileThumbnail item={item} size="sm" />
-                                    <span className="font-mono truncate">{item.filename}</span>
+                                    <span className="truncate">{item.filename}</span>
                                   </div>
                                 </td>
                                 <td className="py-2 px-2 font-mono text-slate-400 tabular-nums whitespace-nowrap hidden lg:table-cell">
                                   {formatShortDate(item.modifiedAt)}
                                 </td>
-                                <td className="py-2 px-2 text-slate-300 uppercase font-mono whitespace-nowrap">
+                                <td className="py-2 px-2 text-slate-300 uppercase whitespace-nowrap">
                                   {item.extension} File
                                 </td>
-                                <td className="py-2 px-2 text-right font-mono text-slate-300 tabular-nums whitespace-nowrap">
+                                <td className="py-2 pl-2 pr-4 text-right font-mono text-slate-300 tabular-nums whitespace-nowrap">
                                   {formatBytes(item.size)}
-                                </td>
-                                <td className="py-2 px-2 text-right whitespace-nowrap">
-                                  <div className="inline-flex items-center justify-end gap-2">
-                                    <div className="w-12 h-1.5 rounded-full bg-[#11151C] overflow-hidden hidden sm:block">
-                                      <div
-                                        className={`h-full rounded-full ${lbc.bar}`}
-                                        style={{ width: `${item.recoveryChance}%` }}
-                                      />
-                                    </div>
-                                    <span
-                                      className={`font-mono font-semibold tabular-nums ${lbc.text}`}
-                                    >
-                                      {item.recoveryChance}%
-                                    </span>
-                                  </div>
-                                </td>
-                                <td className="py-2 pl-2 pr-4 text-right text-slate-400 truncate max-w-[160px] hidden xl:table-cell">
-                                  {item.partitionName}
                                 </td>
                               </tr>
                             );
@@ -2353,7 +2468,7 @@ export const App: React.FC = () => {
                               return next;
                             })
                           }
-                          className="w-full flex items-center gap-2 px-2 py-1.5 rounded bg-[#141922] border border-[#2A3446] text-xs font-semibold text-slate-200 hover:bg-[#1A212E]"
+                          className="w-full flex items-center gap-2 px-2.5 py-1.5 rounded bg-[#1D2028] border border-[#2A2E39] text-xs font-semibold text-slate-200 hover:bg-[#242833]"
                         >
                           {isCollapsed ? (
                             <ChevronRight className="w-3.5 h-3.5 text-slate-400" />
@@ -2388,8 +2503,8 @@ export const App: React.FC = () => {
                                 }}
                                 className={`group rounded-md border p-3 cursor-pointer transition-all duration-150 relative animate-row-fade ${
                                   isFocused
-                                    ? 'bg-[#283244] border-[#2E7CF6]'
-                                    : 'bg-[#181E29] border-[#2A3446] hover:bg-[#1F2735] hover:-translate-y-0.5'
+                                    ? 'bg-[#2C3444] border-[#3A7AFE]'
+                                    : 'bg-[#20242D] border-[#2C313E] hover:bg-[#272C37] hover:-translate-y-0.5'
                                 }`}
                               >
                                 <input
@@ -2398,7 +2513,7 @@ export const App: React.FC = () => {
                                   onChange={() => toggleFileCheck(item.id)}
                                   onClick={(e) => e.stopPropagation()}
                                   aria-label={`Select ${item.filename}`}
-                                  className="absolute top-2.5 left-2.5 w-3.5 h-3.5 rounded border-[#3B4963] bg-[#11151C] text-[#2E7CF6] cursor-pointer"
+                                  className="absolute top-2.5 left-2.5 w-3.5 h-3.5 rounded-xs border-[#464E5E] bg-[#16181F] text-[#3A7AFE] cursor-pointer"
                                 />
                                 <span
                                   className={`absolute top-2 right-2.5 text-[11px] font-mono font-semibold tabular-nums ${lbc.text}`}
@@ -2416,7 +2531,7 @@ export const App: React.FC = () => {
                                         setFocusedFileId(item.id);
                                         setLightboxOpen(true);
                                       }}
-                                      className="absolute bottom-2 right-2 p-1 rounded bg-[#11151C]/90 border border-[#2A3446] text-slate-300 opacity-0 group-hover:opacity-100 transition-opacity"
+                                      className="absolute bottom-2 right-2 p-1 rounded bg-[#16181F]/90 border border-[#303542] text-slate-300 opacity-0 group-hover:opacity-100 transition-opacity"
                                       title="Zoom preview"
                                       aria-label={`Zoom ${item.filename}`}
                                     >
@@ -2424,7 +2539,7 @@ export const App: React.FC = () => {
                                     </button>
                                   )}
                                 </div>
-                                <div className="text-xs font-mono text-slate-100 truncate text-center">
+                                <div className="text-xs text-slate-100 truncate text-center">
                                   {item.filename}
                                 </div>
                                 <div className="text-[11px] text-slate-400 text-center tabular-nums mt-0.5">
@@ -2456,16 +2571,97 @@ export const App: React.FC = () => {
         />
       </div>
 
-      {/* Bottom Live Discovery Strip + Scan & Recovery Bar */}
-      <footer className="shrink-0 bg-[#181E29] border-t border-[#2A3446] relative overflow-hidden">
+      {/* Contextual Floating Blue Action / Status Strip (matches Screenshots 1 & 3) */}
+      {(isScanning ||
+        (lostPartitions.length > 0 && !lostBannerDismissed) ||
+        (truncatedVideoCount > 0 && !scanBannerDismissed)) && (
+        <div className="bg-[#1A1D24] px-3 pt-2 pb-1.5 shrink-0">
+          <div className="px-4 py-2 rounded-md bg-[#2D3958]/95 border border-[#445682] text-xs text-slate-100 flex items-center justify-between gap-3">
+            {isScanning ? (
+              <>
+                <div className="flex items-center gap-2.5 min-w-0">
+                  <HardDrive className="w-4 h-4 text-[#60A5FA] shrink-0" />
+                  <span className="truncate">
+                    Advanced Scan is trying to find more files for you.
+                  </span>
+                </div>
+                <span className="text-[11px] font-mono text-slate-300 shrink-0 tabular-nums">
+                  {scanProgress.percent}%
+                </span>
+              </>
+            ) : lostPartitions.length > 0 && !lostBannerDismissed ? (
+              <>
+                <div className="flex items-center gap-2.5 min-w-0">
+                  <ShieldAlert className="w-4 h-4 text-amber-400 shrink-0" />
+                  <span className="truncate">
+                    <strong className="font-semibold">Lost partitions found</strong> — Detected{' '}
+                    {lostPartitions.length} unmapped filesystem
+                    {lostPartitions.length > 1 ? 's' : ''} (
+                    {lostPartitions
+                      .map((p) => p.detectedFs?.filesystem ?? p.typeName)
+                      .join(', ')}
+                    ).
+                  </span>
+                </div>
+                <div className="flex items-center gap-2 shrink-0">
+                  <button
+                    type="button"
+                    onClick={() => setLostModalOpen(true)}
+                    className="px-2.5 py-1 rounded bg-[#1E2538] border border-[#4D6396] text-slate-100 hover:bg-[#252E46] transition-colors"
+                  >
+                    Details
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => handleRestorePartitionToMbr(lostPartitions[0])}
+                    className="inline-flex items-center gap-1 px-2.5 py-1 rounded bg-[#3A7AFE] hover:bg-[#2F6EEB] text-white font-medium transition-colors"
+                  >
+                    <Wrench className="w-3 h-3" />
+                    Restore to MBR
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setLostBannerDismissed(true)}
+                    className="p-0.5 text-slate-300 hover:text-white"
+                    aria-label="Dismiss lost partition banner"
+                  >
+                    <X className="w-3.5 h-3.5" />
+                  </button>
+                </div>
+              </>
+            ) : (
+              <>
+                <div className="flex items-center gap-2.5 min-w-0">
+                  <Film className="w-4 h-4 text-[#60A5FA] shrink-0" />
+                  <span className="truncate">
+                    Smart video reorganization ready — Enable file repair on save or click the
+                    repair wrench to fix {truncatedVideoCount} truncated video
+                    {truncatedVideoCount > 1 ? 's' : ''}.
+                  </span>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setScanBannerDismissed(true)}
+                  className="p-0.5 text-slate-300 hover:text-white shrink-0"
+                  aria-label="Dismiss video repair banner"
+                >
+                  <X className="w-3.5 h-3.5" />
+                </button>
+              </>
+            )}
+          </div>
+        </div>
+      )}
+
+      {/* Bottom Circular Progress & Recover Bar (matches Screenshots 1-3) */}
+      <footer className="shrink-0 bg-[#16181F] border-t border-[#262A34] relative overflow-hidden">
         {isScanning && !isPaused && (
-          <div className="h-0.5 w-full bg-[#11151C] overflow-hidden">
-            <div className="h-full w-1/3 bg-gradient-to-r from-transparent via-[#2E7CF6] to-transparent animate-scan-sweep" />
+          <div className="h-0.5 w-full bg-[#111318] overflow-hidden">
+            <div className="h-full w-1/3 bg-gradient-to-r from-transparent via-[#3A7AFE] to-transparent animate-scan-sweep" />
           </div>
         )}
         <div className="h-16 px-4 flex items-center justify-between gap-4">
           <div className="flex items-center gap-3.5 min-w-0">
-            {/* Circular SVG Progress Ring */}
             <div className="relative w-10 h-10 flex items-center justify-center shrink-0">
               <svg className="w-10 h-10 -rotate-90" viewBox="0 0 36 36">
                 <circle
@@ -2473,7 +2669,7 @@ export const App: React.FC = () => {
                   cy="18"
                   r={ringRadius}
                   fill="none"
-                  stroke="#2A3446"
+                  stroke="#2A2E39"
                   strokeWidth="3"
                 />
                 <circle
@@ -2481,7 +2677,7 @@ export const App: React.FC = () => {
                   cy="18"
                   r={ringRadius}
                   fill="none"
-                  stroke="#2E7CF6"
+                  stroke="#3A7AFE"
                   strokeWidth="3"
                   strokeLinecap="round"
                   strokeDasharray={ringCircumference}
@@ -2495,17 +2691,17 @@ export const App: React.FC = () => {
             </div>
 
             <div className="min-w-0">
-              <div className="text-xs font-medium text-slate-100 flex items-center gap-2 whitespace-nowrap">
+              <div className="text-xs font-medium text-slate-100 flex items-center gap-1.5 whitespace-nowrap">
                 <span>
                   {isScanning
                     ? isPaused
-                      ? 'Scan paused'
-                      : 'Advanced Scanning,'
-                    : 'Scan complete ·'}
+                      ? 'Scan Paused ,'
+                      : 'Advanced Scanning ,'
+                    : 'Scan Complete ,'}
                 </span>
-                <span className="text-slate-300 tabular-nums">
+                <span className="text-slate-200 tabular-nums">
                   Files Found:{' '}
-                  <span className="text-[#60A5FA] font-semibold">
+                  <span className="text-[#4C8DFF] font-semibold">
                     {isScanning ? scanProgress.foundCount : carvedItems.length}
                   </span>{' '}
                   <span className="text-slate-400">
@@ -2513,22 +2709,13 @@ export const App: React.FC = () => {
                   </span>
                 </span>
               </div>
-              <div className="flex items-center gap-2.5 text-[11px] text-slate-400 font-mono tabular-nums mt-0.5 truncate">
-                <span>
-                  Reading sector {scanProgress.currentSector.toLocaleString()}/
-                  {scanProgress.totalSectors.toLocaleString()}
-                </span>
-                {scanProgress.latestFilename && isScanning && (
-                  <span className="hidden md:inline text-slate-500 truncate">
-                    · Carving {scanProgress.latestFilename}
-                  </span>
-                )}
-                {isScanning ? (
-                  useNativeScan ? (
-                    <span className="inline-flex items-center gap-2.5 shrink-0">
-                      <button
-                        type="button"
-                        onClick={() => {
+              <div className="flex items-center gap-2 text-[11px] text-slate-400 font-mono tabular-nums mt-0.5 truncate">
+                {isScanning && (
+                  <span className="inline-flex items-center gap-1.5 shrink-0 mr-1">
+                    <button
+                      type="button"
+                      onClick={() => {
+                        if (useNativeScan) {
                           const bridge = getDesktopBridge();
                           const scanId = activeNativeScanIdRef.current;
                           if (!bridge || !scanId) return;
@@ -2536,19 +2723,19 @@ export const App: React.FC = () => {
                           setIsPaused(next);
                           if (next) void bridge.pauseDriveScan(scanId);
                           else void bridge.resumeDriveScan(scanId);
-                        }}
-                        className="inline-flex items-center gap-1 text-slate-300 hover:text-white font-sans shrink-0"
-                      >
-                        {isPaused ? (
-                          <>
-                            <Play className="w-3 h-3" /> Resume
-                          </>
-                        ) : (
-                          <>
-                            <Pause className="w-3 h-3" /> Pause
-                          </>
-                        )}
-                      </button>
+                        } else {
+                          const next = !isPaused;
+                          isPausedRef.current = next;
+                          setIsPaused(next);
+                        }
+                      }}
+                      className="p-0.5 text-slate-300 hover:text-white"
+                      title={isPaused ? 'Resume scan' : 'Pause scan'}
+                      aria-label={isPaused ? 'Resume scan' : 'Pause scan'}
+                    >
+                      {isPaused ? <Play className="w-3 h-3" /> : <Pause className="w-3 h-3" />}
+                    </button>
+                    {useNativeScan && (
                       <button
                         type="button"
                         onClick={() => {
@@ -2560,33 +2747,20 @@ export const App: React.FC = () => {
                           setIsPaused(false);
                           setIsScanning(false);
                         }}
-                        className="inline-flex items-center gap-1 text-amber-300 hover:text-white font-sans shrink-0"
+                        className="p-0.5 text-slate-300 hover:text-rose-400"
+                        title="Stop scan"
+                        aria-label="Stop scan"
                       >
-                        <X className="w-3 h-3" /> Stop Scan
+                        <Square className="w-3 h-3 fill-current" />
                       </button>
-                    </span>
-                  ) : (
-                    <button
-                      type="button"
-                      onClick={() => {
-                        const next = !isPaused;
-                        isPausedRef.current = next;
-                        setIsPaused(next);
-                      }}
-                      className="inline-flex items-center gap-1 text-slate-300 hover:text-white font-sans shrink-0"
-                    >
-                      {isPaused ? (
-                        <>
-                          <Play className="w-3 h-3" /> Resume
-                        </>
-                      ) : (
-                        <>
-                          <Pause className="w-3 h-3" /> Pause
-                        </>
-                      )}
-                    </button>
-                  )
-                ) : (
+                    )}
+                  </span>
+                )}
+                <span>
+                  Reading sector: {scanProgress.currentSector.toLocaleString()}/
+                  {scanProgress.totalSectors.toLocaleString()}
+                </span>
+                {!isScanning && (
                   <button
                     type="button"
                     onClick={() => {
@@ -2597,7 +2771,7 @@ export const App: React.FC = () => {
                         startFreshScanState(diskBytes);
                       }
                     }}
-                    className="inline-flex items-center gap-1 text-[#60A5FA] hover:underline font-sans shrink-0"
+                    className="inline-flex items-center gap-1 text-[#4C8DFF] hover:underline font-sans shrink-0 ml-1"
                   >
                     <RotateCcw className="w-3 h-3" /> Re-scan
                   </button>
@@ -2610,10 +2784,9 @@ export const App: React.FC = () => {
             {checkedItems.length > 0 && (
               <div className="text-xs text-slate-300 tabular-nums hidden sm:flex items-center gap-2">
                 <span>
-                  Selected:{' '}
-                  <span className="text-[#60A5FA] font-medium">
-                    {checkedItems.length} {checkedItems.length === 1 ? 'file' : 'files'} (
-                    {formatBytes(checkedBytes)})
+                  Selected: {checkedItems.length} {checkedItems.length === 1 ? 'file' : 'files'}{' '}
+                  <span className="text-[#4C8DFF] font-medium">
+                    ({formatBytes(checkedBytes)})
                   </span>
                 </span>
                 <button
@@ -2629,13 +2802,15 @@ export const App: React.FC = () => {
               type="button"
               onClick={() => setRecoveryOpen(true)}
               disabled={recoveryPayload.length === 0}
-              className="px-5 py-2 rounded-md text-xs font-medium bg-[#2E7CF6] hover:bg-[#2569D6] active:scale-[0.98] disabled:opacity-40 text-white transition-all whitespace-nowrap shrink-0"
+              className="px-6 py-2 rounded-md text-xs font-medium bg-[#3A7AFE] hover:bg-[#2F6EEB] active:scale-[0.98] disabled:opacity-40 text-white transition-all whitespace-nowrap shrink-0"
             >
-              {checkedItems.length > 0 ? 'Recover' : 'Recover All...'}
+              {checkedItems.length > 0 ? 'Recover' : 'Recover All ...'}
             </button>
           </div>
         </div>
       </footer>
+        </>
+      )}
 
       {/* Right-Click File Context Menu */}
       {contextMenu && (
@@ -2645,7 +2820,7 @@ export const App: React.FC = () => {
             top: Math.min(contextMenu.y, window.innerHeight - 170),
           }}
           onMouseDown={(e) => e.stopPropagation()}
-          className="fixed z-50 w-48 rounded-md bg-[#181E29] border border-[#2A3446] shadow-2xl py-1 text-xs animate-modal-in"
+          className="fixed z-50 w-48 rounded-md bg-[#222630] border border-[#343A48] shadow-2xl py-1 text-xs animate-modal-in"
         >
           <button
             type="button"
@@ -2654,9 +2829,9 @@ export const App: React.FC = () => {
               setLightboxOpen(true);
               setContextMenu(null);
             }}
-            className="w-full px-3 py-1.5 flex items-center gap-2 text-left text-slate-200 hover:bg-[#283244]"
+            className="w-full px-3 py-1.5 flex items-center gap-2 text-left text-slate-200 hover:bg-[#2C3444]"
           >
-            <Eye className="w-3.5 h-3.5 text-[#38BDF8]" />
+            <Eye className="w-3.5 h-3.5 text-[#60A5FA]" />
             Preview &amp; Zoom
           </button>
           <button
@@ -2665,7 +2840,7 @@ export const App: React.FC = () => {
               void handleDownloadSingleFile(contextMenu.item);
               setContextMenu(null);
             }}
-            className="w-full px-3 py-1.5 flex items-center gap-2 text-left text-slate-200 hover:bg-[#283244]"
+            className="w-full px-3 py-1.5 flex items-center gap-2 text-left text-slate-200 hover:bg-[#2C3444]"
           >
             <Download className="w-3.5 h-3.5 text-emerald-400" />
             Save File Directly
@@ -2677,20 +2852,20 @@ export const App: React.FC = () => {
                 handleRepairFile(contextMenu.item);
                 setContextMenu(null);
               }}
-              className="w-full px-3 py-1.5 flex items-center gap-2 text-left text-amber-300 hover:bg-[#283244]"
+              className="w-full px-3 py-1.5 flex items-center gap-2 text-left text-amber-300 hover:bg-[#2C3444]"
             >
               <Wrench className="w-3.5 h-3.5" />
               Repair File Structure
             </button>
           )}
-          <div className="my-1 border-t border-[#2A3446]" />
+          <div className="my-1 border-t border-[#2E3340]" />
           <button
             type="button"
             onClick={() => {
               toggleFileCheck(contextMenu.item.id);
               setContextMenu(null);
             }}
-            className="w-full px-3 py-1.5 flex items-center gap-2 text-left text-slate-200 hover:bg-[#283244]"
+            className="w-full px-3 py-1.5 flex items-center gap-2 text-left text-slate-200 hover:bg-[#2C3444]"
           >
             <Check className="w-3.5 h-3.5 text-slate-400" />
             {checkedIds.has(contextMenu.item.id) ? 'Uncheck for Recovery' : 'Check for Recovery'}
@@ -2708,6 +2883,9 @@ export const App: React.FC = () => {
           likelihoodFilter={likelihoodFilter}
           sizeFilter={sizeFilter}
           hideDuplicates={hideDuplicates}
+          sortKey={sortKey}
+          sortDir={sortDir}
+          groupBy={groupBy}
           onChangeBlockSize={setBlockSize}
           onChangeParanoid={setParanoid}
           onChangeKeepCorrupted={setKeepCorrupted}
@@ -2716,6 +2894,12 @@ export const App: React.FC = () => {
           onChangeLikelihoodFilter={setLikelihoodFilter}
           onChangeSizeFilter={setSizeFilter}
           onChangeHideDuplicates={setHideDuplicates}
+          onChangeSortKey={setSortKey}
+          onChangeSortDir={setSortDir}
+          onChangeGroupBy={(val) => {
+            setGroupBy(val);
+            setCollapsedGroups(new Set());
+          }}
           onApplyAndRescan={() => {
             if (nativeDriveTargetRef.current) {
               const t = nativeDriveTargetRef.current;
@@ -2749,8 +2933,21 @@ export const App: React.FC = () => {
           onClose={() => setDriveHubOpen(false)}
         />
       )}
+
+      {lostModalOpen && lostPartitions.length > 0 && (
+        <LostPartitionsModal
+          lostPartitions={lostPartitions}
+          onInspectLostPartition={(p) => {
+            navigateToNode({ kind: 'partition', partitionId: p.id });
+            setFocusedFileId(null);
+          }}
+          onRestoreToMbr={(p) => handleRestorePartitionToMbr(p)}
+          onClose={() => setLostModalOpen(false)}
+        />
+      )}
     </div>
   );
 };
 
 export default App;
+

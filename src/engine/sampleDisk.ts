@@ -245,15 +245,52 @@ export function buildSampleDiskImage(): { name: string; bytes: Uint8Array } {
   disk[fatOff + 2] = 0x90;
   writeAscii(disk, fatOff + 3, 'MSDOS5.0');
   dv.setUint16(fatOff + 11, 512, true); // bytes/sector
-  disk[fatOff + 13] = 8; // sectors/cluster
+  disk[fatOff + 13] = 8; // sectors/cluster (4096 B)
   dv.setUint16(fatOff + 14, 32, true); // reserved sectors
   disk[fatOff + 16] = 2; // FATs
   dv.setUint32(fatOff + 32, 1024, true); // total sectors 32
   dv.setUint32(fatOff + 36, 8, true); // FAT size 32
+  dv.setUint32(fatOff + 44, 20, true); // RootCluster = 20 (LBA 112 + 18*8 = 256)
   writeAscii(disk, fatOff + 71, 'RECOVERYCAM');
   writeAscii(disk, fatOff + 82, 'FAT32   ');
   disk[fatOff + 510] = 0x55;
   disk[fatOff + 511] = 0xaa;
+
+  // FAT32 Root Cluster (Cluster 20 -> LBA 256): deleted LFN file "Vacation_Beach_Deleted.jpg" -> Cluster 22 (LBA 272)
+  const fatRootOff = 256 * sectorSize;
+  const fatDeletedJpgOff = 272 * sectorSize;
+  const fatSampleJpg = new Uint8Array([
+    0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10, 0x4a, 0x46, 0x49, 0x46, 0x00, 0x01, 0x01, 0x00, 0x00, 0x01,
+    0x00, 0x01, 0x00, 0x00, 0xff, 0xdb, 0x00, 0x43, 0x00,
+    ...new Array(64).fill(8),
+    0xff, 0xc0, 0x00, 0x0b, 0x08, 0x00, 0x20, 0x00, 0x20, 0x01, 0x01, 0x11, 0x00,
+    0xff, 0xc4, 0x00, 0x14, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x08,
+    0xff, 0xda, 0x00, 0x08, 0x01, 0x01, 0x00, 0x00, 0x3f, 0x00, 0xd2, 0xcf, 0x20, 0xff, 0xd9,
+  ]);
+  disk.set(fatSampleJpg, fatDeletedJpgOff);
+
+  const lfnName = 'Vacation_Beach_Deleted.jpg';
+  const writeLfnSlot = (slotOff: number, chars: string, seqByte: number) => {
+    disk[slotOff] = seqByte;
+    disk[slotOff + 11] = 0x0f; // LFN attr
+    const chOffsets = [1, 3, 5, 7, 9, 14, 16, 18, 20, 22, 24, 28, 30];
+    for (let i = 0; i < 13; i++) {
+      const code = i < chars.length ? chars.charCodeAt(i) : i === chars.length ? 0x0000 : 0xffff;
+      disk[slotOff + chOffsets[i]] = code & 0xff;
+      disk[slotOff + chOffsets[i] + 1] = (code >> 8) & 0xff;
+    }
+  };
+  // LFN slot 2 (deleted 0xE5 marker) + slot 1 (deleted 0xE5 marker) + 8.3 entry (0xE5)
+  writeLfnSlot(fatRootOff, lfnName.slice(13), 0xe5);
+  writeLfnSlot(fatRootOff + 32, lfnName.slice(0, 13), 0xe5);
+  const dosEntryOff = fatRootOff + 64;
+  disk[dosEntryOff] = 0xe5; // deleted marker
+  writeAscii(disk, dosEntryOff + 1, 'ACATI~1JPG');
+  disk[dosEntryOff + 11] = 0x20; // archive attribute
+  dv.setUint16(dosEntryOff + 22, (14 << 11) | (35 << 5) | 10, true); // 14:35:20
+  dv.setUint16(dosEntryOff + 24, ((2026 - 1980) << 9) | (11 << 5) | 15, true); // 2026-11-15
+  dv.setUint16(dosEntryOff + 26, 22, true); // firstCluster = 22
+  dv.setUint32(dosEntryOff + 28, fatSampleJpg.length, true); // size
 
   // Embed carved artifacts inside Partition 1
   const samplePng = buildValidSamplePng();
@@ -307,6 +344,36 @@ export function buildSampleDiskImage(): { name: string; bytes: Uint8Array } {
   sqv.setUint32(28, 2, false); // 2 pages = 2048 bytes
   disk.set(sampleSqlite, (1088 + 64) * sectorSize);
 
+  // Embed NTFS Directory MFT Record #37 ("Finance_2025") at LBA 1180 so Record #38 reconstructs "\Finance_2025\Tax_Return_2025_Deleted.txt"
+  const dirRec = new Uint8Array(1024);
+  const dvDir = new DataView(dirRec.buffer);
+  writeAscii(dirRec, 0, 'FILE');
+  dvDir.setUint16(4, 48, true);
+  dvDir.setUint16(6, 3, true);
+  dvDir.setUint16(20, 56, true);
+  dvDir.setUint16(22, 0x0003, true); // in-use + directory
+  dvDir.setUint32(28, 1024, true);
+  dvDir.setUint32(44, 37, true);
+  dvDir.setUint16(48, 0x0041, true);
+  dvDir.setUint16(510, 0x0041, true);
+  dvDir.setUint16(1022, 0x0041, true);
+  const dirName = 'Finance_2025';
+  const dirFnValLen = 66 + dirName.length * 2;
+  const dirFnAttrLen = Math.ceil((24 + dirFnValLen) / 8) * 8;
+  dvDir.setUint32(56, 0x30, true);
+  dvDir.setUint32(60, dirFnAttrLen, true);
+  dvDir.setUint32(56 + 16, dirFnValLen, true);
+  dvDir.setUint16(56 + 20, 24, true);
+  dvDir.setUint32(56 + 24, 5, true); // parent = root #5
+  dirRec[56 + 24 + 64] = dirName.length;
+  dirRec[56 + 24 + 65] = 1;
+  for (let i = 0; i < dirName.length; i++) {
+    dvDir.setUint16(56 + 24 + 66 + i * 2, dirName.charCodeAt(i), true);
+  }
+  dvDir.setUint32(56 + dirFnAttrLen, 0xffffffff, true);
+  dvDir.setUint32(24, 56 + dirFnAttrLen + 8, true);
+  disk.set(dirRec, (1088 + 92) * sectorSize);
+
   // Embed a deleted NTFS MFT FILE record (Record #38, Tax_Return_2025_Deleted.txt) at LBA 1184
   const mftRec = new Uint8Array(1024);
   const mv = new DataView(mftRec.buffer);
@@ -344,7 +411,7 @@ export function buildSampleDiskImage(): { name: string; bytes: Uint8Array } {
   mftRec[attrPos + 8] = 0; // resident
   mv.setUint32(attrPos + 16, fnValueLen, true);
   mv.setUint16(attrPos + 20, 24, true);
-  mv.setUint32(attrPos + 24, 5, true); // parent = root record 5
+  mv.setUint32(attrPos + 24, 37, true); // parent = Finance_2025 (#37)
   mv.setUint32(attrPos + 24 + 16, Number(ticks & 0xffffffffn), true);
   mv.setUint32(attrPos + 24 + 20, Number((ticks >> 32n) & 0xffffffffn), true);
   mftRec[attrPos + 24 + 64] = mftFilename.length;
@@ -356,7 +423,7 @@ export function buildSampleDiskImage(): { name: string; bytes: Uint8Array } {
 
   // Attr 0x80 ($DATA) resident payload
   const mftPayload = enc.encode(
-    'Recovered from NTFS $MFT Record #38 ($DATA resident attribute)\r\nDocument: 2025 Tax Summary\r\nIntegrity: Intact UTF-8 text preserved after Shift+Delete.',
+    'Recovered from NTFS $MFT Record #38 ($DATA resident attribute)\r\nFolder: \\Finance_2025\\Tax_Return_2025_Deleted.txt\r\nIntegrity: Intact UTF-8 text preserved after Shift+Delete.',
   );
   const dataAttrLen = Math.ceil((24 + mftPayload.length) / 8) * 8;
   mv.setUint32(attrPos, 0x80, true);

@@ -10,8 +10,8 @@
 @layer base {
   body {
     font-family: var(--font-sans);
-    background-color: #11151c;
-    color: #f1f5f9;
+    background-color: #1a1d24;
+    color: #e5eaf2;
   }
 
   h1, h2, h3, h4, .font-display {
@@ -105,14 +105,14 @@
 }
 
 ::-webkit-scrollbar-track {
-  background: #11151c;
+  background: #1a1d24;
 }
 
 ::-webkit-scrollbar-thumb {
-  background: #2a3446;
+  background: #2f3542;
   border-radius: 4px;
 }
 
 ::-webkit-scrollbar-thumb:hover {
-  background: #3b4963;
+  background: #424a5c;
 }

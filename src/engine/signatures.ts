@@ -151,6 +151,28 @@ export const FILE_FORMATS: FileFormatDefinition[] = [
     maxFilesize: 100 * MB,
   },
   {
+    id: 'ico',
+    extension: 'ico',
+    description: 'Windows Icon Resource (.ico)',
+    family: 'Pictures',
+    mimeType: 'image/x-icon',
+    signatureHex: '00 00 01 00',
+    signatureOffset: 0,
+    enableByDefault: true,
+    maxFilesize: 4 * MB,
+  },
+  {
+    id: 'cur',
+    extension: 'cur',
+    description: 'Windows Cursor Resource (.cur)',
+    family: 'Pictures',
+    mimeType: 'image/x-icon',
+    signatureHex: '00 00 02 00',
+    signatureOffset: 0,
+    enableByDefault: true,
+    maxFilesize: 4 * MB,
+  },
+  {
     id: 'pdf',
     extension: 'pdf',
     description: 'Portable Document Format (PDF)',
@@ -729,35 +751,64 @@ function validateAndMeasureMp4(
   const firstSize = readUint32BE(buf, start);
   if (firstSize < 16 || firstSize > 1024) return null;
   const brand = readAscii(buf, start + 8, 4).trim();
-  const validBrands = ['isom', 'iso2', 'mp41', 'mp42', 'M4V ', 'M4A ', 'qt  ', 'avc1', '3gp4', '3gp5'];
-  if (!validBrands.some((b) => brand.startsWith(b.trim())) && !/^[a-zA-Z0-9]{3,4}$/.test(brand)) {
+  const validBrands = [
+    'isom',
+    'iso2',
+    'mp41',
+    'mp42',
+    'M4V',
+    'M4A',
+    'qt',
+    'avc1',
+    '3gp4',
+    '3gp5',
+    'heic',
+    'mif1',
+  ];
+  if (!validBrands.some((b) => brand.startsWith(b)) && !/^[a-zA-Z0-9]{3,4}$/.test(brand)) {
     return null;
   }
 
   let pos = start;
   const boxNames: string[] = [];
-  while (pos + 8 <= maxEnd) {
-    const boxSize = readUint32BE(buf, pos);
+  let hasMoov = false;
+  let hasMdat = false;
+
+  while (pos + 8 <= maxEnd && boxNames.length < 128) {
+    let boxSize = readUint32BE(buf, pos);
     const boxType = readAscii(buf, pos + 4, 4);
+    if (boxSize === 1 && pos + 16 <= maxEnd) {
+      boxSize = readUint32BE(buf, pos + 8) * 4294967296 + readUint32BE(buf, pos + 12);
+    } else if (boxSize === 0) {
+      boxSize = maxEnd - pos;
+    }
     if (boxSize < 8 || !/^[\x20-\x7e]{4}$/.test(boxType)) break;
     boxNames.push(boxType);
+    if (boxType === 'moov') hasMoov = true;
+    if (boxType === 'mdat') hasMdat = true;
     if (pos + boxSize > maxEnd) {
       return {
         size: maxEnd - start,
         truncated: true,
-        meta: { details: `Brand "${brand}" · boxes: ${boxNames.join(', ')}` },
+        meta: {
+          subExtension: brand === 'qt' ? 'mov' : brand === 'heic' ? 'heic' : 'mp4',
+          details: `ISO BMFF (${brand}) · boxes: ${boxNames.join(', ')}${!hasMoov && hasMdat ? ' (moov pending/at EOF)' : ''}`,
+        },
       };
     }
     pos += boxSize;
   }
 
   if (pos > start + firstSize || boxNames.length >= 1) {
+    const missingIndex = hasMdat && !hasMoov && boxNames.length >= 2;
     return {
       size: pos - start,
-      truncated: false,
+      truncated: missingIndex,
       meta: {
-        subExtension: brand === 'qt' ? 'mov' : 'mp4',
-        details: `ISO BMFF (${brand}) · ${boxNames.join(' → ')}`,
+        subExtension: brand === 'qt' ? 'mov' : brand === 'heic' ? 'heic' : 'mp4',
+        details: missingIndex
+          ? `ISO BMFF (${brand}) · ${boxNames.join(' → ')} (missing moov index atom)`
+          : `ISO BMFF (${brand}) · ${boxNames.join(' → ')}`,
       },
     };
   }
@@ -1060,17 +1111,64 @@ export function identifyBuffer(
     };
   }
 
-  // 13. MP4 / MOV
+  // 12b. Windows Icon (.ico) / Cursor (.cur)
+  if (
+    (isEnabled('ico') || isEnabled('cur')) &&
+    buf.length >= 22 &&
+    buf[0] === 0x00 &&
+    buf[1] === 0x00 &&
+    (buf[2] === 0x01 || buf[2] === 0x02) &&
+    buf[3] === 0x00
+  ) {
+    const count = readUint16LE(buf, 4);
+    if (count >= 1 && count <= 32 && buf.length >= 6 + count * 16) {
+      let maxEnd = 6 + count * 16;
+      let validDir = true;
+      for (let i = 0; i < count; i++) {
+        const entryOff = 6 + i * 16;
+        const dataSz = readUint32LE(buf, entryOff + 8);
+        const imgOff = readUint32LE(buf, entryOff + 12);
+        if (dataSz === 0 || imgOff < 6 + count * 16 || dataSz > 2 * MB) {
+          validDir = false;
+          break;
+        }
+        maxEnd = Math.max(maxEnd, imgOff + dataSz);
+      }
+      if (validDir && maxEnd > 22) {
+        const isCur = buf[2] === 0x02;
+        const id = isCur ? 'cur' : 'ico';
+        if (isEnabled(id)) {
+          const def = FORMAT_MAP.get(id)!;
+          return {
+            formatId: id,
+            extension: id,
+            description: def.description,
+            family: def.family,
+            mimeType: def.mimeType,
+            matchedOffset: 0,
+            matchedLength: 4,
+            calculatedSize: Math.min(maxEnd, buf.length),
+            status: maxEnd <= buf.length ? 'OK' : 'OK_TRUNCATED',
+            metadata: { details: `${count} embedded ${isCur ? 'cursor' : 'icon'} frame${count === 1 ? '' : 's'}` },
+          };
+        }
+      }
+    }
+  }
+
+  // 13. MP4 / MOV / HEIC
   if (isEnabled('mp4')) {
     const mp4 = validateAndMeasureMp4(buf, 0, buf.length);
     if (mp4) {
       const def = FORMAT_MAP.get('mp4')!;
+      const sub = mp4.meta.subExtension ?? 'mp4';
+      const isHeic = sub === 'heic';
       return {
         formatId: 'mp4',
-        extension: mp4.meta.subExtension ?? 'mp4',
-        description: def.description,
-        family: def.family,
-        mimeType: def.mimeType,
+        extension: sub,
+        description: isHeic ? 'High Efficiency Image Container (HEIC)' : def.description,
+        family: isHeic ? 'Pictures' : def.family,
+        mimeType: isHeic ? 'image/heic' : sub === 'mov' ? 'video/quicktime' : def.mimeType,
         matchedOffset: 4,
         matchedLength: 4,
         calculatedSize: mp4.size,
@@ -1190,6 +1288,14 @@ export function identifyBuffer(
         ext = head.startsWith('<svg') ? 'svg' : 'xml';
         desc = 'XML / SVG Markup Document';
         mime = ext === 'svg' ? 'image/svg+xml' : 'application/xml';
+      } else if (/^<!doctype\s+(html|netscape-bookmark)/i.test(head) || /^<html/i.test(head)) {
+        ext = 'html';
+        desc = /netscape-bookmark/i.test(head) ? 'Browser Bookmarks Export (HTML)' : 'HTML Web Document';
+        mime = 'text/html';
+      } else if (/^(From:|Return-Path:|MIME-Version:|Message-ID:)/m.test(head) && /^Subject:/m.test(head)) {
+        ext = 'eml';
+        desc = 'RFC 822 Email Message (.eml)';
+        mime = 'message/rfc822';
       } else if (head.startsWith('{') || head.startsWith('[')) {
         try {
           JSON.parse(new TextDecoder().decode(buf.subarray(0, Math.min(buf.length, 65536))));
@@ -1285,7 +1391,8 @@ export function carveDiskBuffer(
       (b0 === 0x66 && b1 === 0x4c && b2 === 0x61) ||
       (b0 === 0x4f && b1 === 0x67 && b2 === 0x67) ||
       (b0 === 0x7f && b1 === 0x45 && b2 === 0x4c) ||
-      (b0 === 0x4d && b1 === 0x5a);
+      (b0 === 0x4d && b1 === 0x5a) ||
+      (b0 === 0x00 && b1 === 0x00 && (b2 === 0x01 || b2 === 0x02) && diskBytes[cursor + 3] === 0x00);
 
     if (maybeMatch) {
       const slice = diskBytes.subarray(cursor, Math.min(end, cursor + 16 * MB));
@@ -1391,7 +1498,8 @@ export async function carveDiskBufferAsync(
       (b0 === 0x66 && b1 === 0x4c && b2 === 0x61) ||
       (b0 === 0x4f && b1 === 0x67 && b2 === 0x67) ||
       (b0 === 0x7f && b1 === 0x45 && b2 === 0x4c) ||
-      (b0 === 0x4d && b1 === 0x5a);
+      (b0 === 0x4d && b1 === 0x5a) ||
+      (b0 === 0x00 && b1 === 0x00 && (b2 === 0x01 || b2 === 0x02) && diskBytes[cursor + 3] === 0x00);
 
     if (maybeMatch) {
       const slice = diskBytes.subarray(cursor, Math.min(end, cursor + 16 * MB));

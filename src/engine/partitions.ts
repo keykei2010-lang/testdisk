@@ -11,6 +11,7 @@ export interface BootSectorProbe {
   sectorsPerCluster: number;
   totalSectors: number;
   details: string;
+  encrypted?: 'BitLocker';
 }
 
 export interface PartitionEntry {
@@ -171,6 +172,27 @@ function decodeUtf16Le(b: Uint8Array, o: number, maxBytes: number): string {
  */
 export function probeFilesystemAtOffset(disk: Uint8Array, offset: number): BootSectorProbe | null {
   if (offset + 512 > disk.length) return null;
+
+  // 0. BitLocker Encrypted Volume (-FVE-FS-)
+  if (
+    disk[offset + 510] === 0x55 &&
+    disk[offset + 511] === 0xaa &&
+    ascii(disk, offset + 3, 8) === '-FVE-FS-'
+  ) {
+    const bps = u16le(disk, offset + 11) || 512;
+    const spc = disk[offset + 13] || 8;
+    const totalSectors = u64le(disk, offset + 40);
+    return {
+      filesystem: 'BitLocker',
+      label: 'BitLocker Volume (Encrypted)',
+      oemOrVersion: '-FVE-FS-',
+      bytesPerSector: bps,
+      sectorsPerCluster: spc,
+      totalSectors: totalSectors > 0 ? totalSectors + 1 : 0,
+      details: 'Windows BitLocker FVE encrypted partition — unlock required before file carving',
+      encrypted: 'BitLocker',
+    };
+  }
 
   // 1. NTFS Boot Sector
   if (
@@ -493,6 +515,13 @@ export function analyzeDiskImage(diskName: string, disk: Uint8Array): DiskAnalys
   if (discoveredLost.length > 0) {
     warnings.push(
       `Found ${discoveredLost.length} unmapped filesystem${discoveredLost.length > 1 ? 's' : ''} outside the active partition table (eligible for recovery).`,
+    );
+  }
+
+  const bitlockerParts = allPartitions.filter((p) => p.detectedFs?.encrypted === 'BitLocker');
+  if (bitlockerParts.length > 0) {
+    warnings.push(
+      `Detected ${bitlockerParts.length} BitLocker-encrypted volume (-FVE-FS-). Unlock the drive in Windows before scanning sectors.`,
     );
   }
 

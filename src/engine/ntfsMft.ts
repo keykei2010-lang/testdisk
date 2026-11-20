@@ -15,6 +15,7 @@ export interface MftDeletedRecord {
   mftOffset: number;
   parentRecord: number;
   filename: string;
+  reconstructedPath: string;
   isDirectory: boolean;
   inUse: boolean;
   fileSize: number;
@@ -25,6 +26,10 @@ export interface MftDeletedRecord {
   partitionId: string;
   partitionName: string;
   usaValid: boolean;
+  bitmapChecked: boolean;
+  overwritten: boolean;
+  overwrittenClusters: number;
+  totalClusters: number;
   reconstructedBytes: Uint8Array;
 }
 
@@ -84,7 +89,6 @@ export function decodeNtfsRunlist(
     pos += lenBytes;
 
     if (offBytes === 0) {
-      // Sparse run
       runs.push({ lcn: -1, clusterCount: count });
     } else {
       let delta = 0;
@@ -108,8 +112,12 @@ export function decodeNtfsRunlist(
 
 /**
  * Validates and applies NTFS Update Sequence Array (USA) fixup to a 1024-byte FILE record.
+ * When includeSystemAndDirs is true, preserves directory records and $Bitmap (#6) for reconstruction.
  */
-export function parseSingleMftRecord(rawRecord: Uint8Array): {
+export function parseSingleMftRecord(
+  rawRecord: Uint8Array,
+  includeSystemAndDirs = false,
+): {
   inUse: boolean;
   isDirectory: boolean;
   usaValid: boolean;
@@ -214,7 +222,6 @@ export function parseSingleMftRecord(rawRecord: Uint8Array): {
         }
       }
     } else if (attrType === 0x80 && nameLen === 0) {
-      // Unnamed default $DATA stream
       if (form === 0 && pos + 24 <= pos + attrLen) {
         const valLen = dv.getUint32(pos + 16, true);
         const valOffset = dv.getUint16(pos + 20, true);
@@ -238,7 +245,8 @@ export function parseSingleMftRecord(rawRecord: Uint8Array): {
     pos += attrLen;
   }
 
-  if (!filename || filename.startsWith('$') || isDirectory) return null;
+  if (!filename) return null;
+  if (!includeSystemAndDirs && (filename.startsWith('$') || isDirectory)) return null;
 
   return {
     inUse,
@@ -269,17 +277,78 @@ function readNtfsBootClusterSize(diskBytes: Uint8Array, partStartOffset: number)
   return Math.max(512, bytesPerSec * secPerCluster);
 }
 
+function buildHierarchyPath(
+  partId: string,
+  parentRecord: number,
+  filename: string,
+  dirMap: Map<string, { parentRecord: number; name: string }>,
+): string {
+  const segments = [filename];
+  const visited = new Set<number>();
+  let cur = parentRecord;
+  let guard = 0;
+
+  while (cur > 5 && !visited.has(cur) && guard < 32) {
+    visited.add(cur);
+    const node = dirMap.get(`${partId}:${cur}`);
+    if (!node || !node.name || node.name === '.') break;
+    segments.unshift(node.name);
+    if (node.parentRecord === cur) break;
+    cur = node.parentRecord;
+    guard++;
+  }
+
+  return `\\${segments.join('\\')}`;
+}
+
+function checkClustersAgainstBitmap(
+  bitmap: Uint8Array,
+  runs: NtfsClusterRun[],
+): { overwrittenClusters: number; totalClusters: number } {
+  let overwrittenClusters = 0;
+  let totalClusters = 0;
+
+  for (const run of runs) {
+    if (run.lcn < 0) continue;
+    for (let i = 0; i < run.clusterCount; i++) {
+      const lcn = run.lcn + i;
+      const byteIdx = lcn >>> 3;
+      const bitMask = 1 << (lcn & 7);
+      totalClusters++;
+      if (byteIdx < bitmap.length && (bitmap[byteIdx] & bitMask) !== 0) {
+        overwrittenClusters++;
+      }
+    }
+  }
+
+  return { overwrittenClusters, totalClusters };
+}
+
 /**
- * Scans raw disk image bytes for deleted NTFS MFT FILE records, reconstructing resident
- * payloads and multi-extent fragmented cluster runs cleanly.
+ * Scans raw disk image bytes for NTFS MFT FILE records:
+ * - Builds directory hierarchy maps (active & deleted folders) to reconstruct real Windows paths
+ * - Extracts $Bitmap (#6) allocation bitmaps per NTFS partition to detect cluster overwriting
+ * - Reconstructs resident payloads and fragmented non-resident cluster runlists cleanly
  */
 export function scanNtfsMftRecordsInBuffer(
   diskBytes: Uint8Array,
   partitions: PartitionEntry[],
 ): MftDeletedRecord[] {
-  const results: MftDeletedRecord[] = [];
+  const dirMap = new Map<string, { parentRecord: number; name: string }>();
+  const bitmapByPartition = new Map<string, Uint8Array>();
+
+  type ParsedCandidate = {
+    off: number;
+    partId: string;
+    partName: string;
+    volOffset: number;
+    clusterBytes: number;
+    parsed: NonNullable<ReturnType<typeof parseSingleMftRecord>>;
+  };
+  const candidates: ParsedCandidate[] = [];
   const seenOffsets = new Set<number>();
 
+  // Pass 1: Read MFT records -> collect directories, $Bitmap (#6), and deleted files
   for (let off = 0; off + 1024 <= diskBytes.length; off += 512) {
     if (
       diskBytes[off] !== 0x46 ||
@@ -290,10 +359,8 @@ export function scanNtfsMftRecordsInBuffer(
       continue;
     }
 
-    const parsed = parseSingleMftRecord(diskBytes.subarray(off, off + 1024));
-    if (!parsed || parsed.inUse || !parsed.usaValid) continue;
-    if (seenOffsets.has(off)) continue;
-    seenOffsets.add(off);
+    const parsed = parseSingleMftRecord(diskBytes.subarray(off, off + 1024), true);
+    if (!parsed || !parsed.usaValid) continue;
 
     const lba = Math.floor(off / 512);
     const part = partitions.find((p) => lba >= p.startLba && lba <= p.endLba);
@@ -304,6 +371,47 @@ export function scanNtfsMftRecordsInBuffer(
       ? `NTFS MFT (${part.detectedFs?.filesystem ?? part.name})`
       : 'Reconstructed NTFS MFT';
 
+    if (parsed.isDirectory && parsed.recordNumber >= 5 && parsed.filename) {
+      dirMap.set(`${partId}:${parsed.recordNumber}`, {
+        parentRecord: parsed.parentRecord,
+        name: parsed.filename,
+      });
+      continue;
+    }
+
+    // Extract $Bitmap (record #6) allocation map
+    if (parsed.recordNumber === 6 && parsed.filename === '$Bitmap') {
+      if (parsed.residentData && parsed.residentData.length > 0) {
+        bitmapByPartition.set(partId, parsed.residentData);
+      } else if (parsed.runs.length > 0 && parsed.fileSize > 0) {
+        const bmSize = Math.min(parsed.fileSize, 4 * 1024 * 1024);
+        const bm = new Uint8Array(bmSize);
+        let cursor = 0;
+        for (const r of parsed.runs) {
+          if (cursor >= bm.length) break;
+          const take = Math.min(r.clusterCount * clusterBytes, bm.length - cursor);
+          if (r.lcn >= 0) {
+            const byteStart = volOffset + r.lcn * clusterBytes;
+            if (byteStart + take <= diskBytes.length) {
+              bm.set(diskBytes.subarray(byteStart, byteStart + take), cursor);
+            }
+          }
+          cursor += take;
+        }
+        bitmapByPartition.set(partId, bm);
+      }
+      continue;
+    }
+
+    if (parsed.inUse || parsed.filename.startsWith('$') || seenOffsets.has(off)) continue;
+    seenOffsets.add(off);
+    candidates.push({ off, partId, partName, volOffset, clusterBytes, parsed });
+  }
+
+  // Pass 2: Assemble reconstructed paths, extents, payloads, and $Bitmap overwrite checks
+  const results: MftDeletedRecord[] = [];
+  for (const item of candidates) {
+    const { off, partId, partName, volOffset, clusterBytes, parsed } = item;
     let reconstructedBytes: Uint8Array = new Uint8Array(0);
     const extents: NtfsByteExtent[] = [];
 
@@ -330,12 +438,29 @@ export function scanNtfsMftRecordsInBuffer(
 
     if (reconstructedBytes.length === 0 && extents.length === 0) continue;
 
+    const bitmap = bitmapByPartition.get(partId);
+    let bitmapChecked = false;
+    let overwritten = false;
+    let overwrittenClusters = 0;
+    let totalClusters = 0;
+
+    if (bitmap && parsed.runs.length > 0) {
+      bitmapChecked = true;
+      const check = checkClustersAgainstBitmap(bitmap, parsed.runs);
+      overwrittenClusters = check.overwrittenClusters;
+      totalClusters = check.totalClusters;
+      overwritten = overwrittenClusters > 0;
+    }
+
+    const reconstructedPath = buildHierarchyPath(partId, parsed.parentRecord, parsed.filename, dirMap);
+
     results.push({
       recordNumber: parsed.recordNumber,
       mftOffset: off,
       parentRecord: parsed.parentRecord,
       filename: parsed.filename,
-      isDirectory: parsed.isDirectory,
+      reconstructedPath,
+      isDirectory: false,
       inUse: parsed.inUse,
       fileSize: parsed.fileSize || reconstructedBytes.length,
       modifiedAtMs: parsed.modifiedAtMs,
@@ -345,6 +470,10 @@ export function scanNtfsMftRecordsInBuffer(
       partitionId: partId,
       partitionName: partName,
       usaValid: parsed.usaValid,
+      bitmapChecked,
+      overwritten,
+      overwrittenClusters,
+      totalClusters,
       reconstructedBytes,
     });
   }

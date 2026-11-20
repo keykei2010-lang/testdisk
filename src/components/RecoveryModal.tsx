@@ -1,7 +1,7 @@
-import React, { useState } from 'react';
-import { Archive, CheckCircle2, FolderOutput, HardDriveDownload, Wrench, X } from 'lucide-react';
+import React, { useEffect, useState } from 'react';
+import { Archive, CheckCircle2, Folder, HardDrive, X } from 'lucide-react';
 import { createZipArchive, formatBytes } from '../engine/crc32';
-import { getDesktopBridge } from '../engine/desktopBridge';
+import { getDesktopBridge, WindowsVolumeInfo } from '../engine/desktopBridge';
 import { FileSourceRef } from '../engine/explorerTypes';
 import { repairFileBuffer } from '../engine/recoveryHealth';
 import { identifyBuffer } from '../engine/signatures';
@@ -39,16 +39,43 @@ export const RecoveryModal: React.FC<RecoveryModalProps> = ({
   const totalBytes = items.reduce((sum, i) => sum + i.size, 0);
   const exceedsZipRamLimit = totalBytes > MAX_IN_MEMORY_ZIP_BYTES;
 
-  const [destinationMode, setDestinationMode] = useState<'zip' | 'folder'>(
+  const [destinationMode, setDestinationMode] = useState<'folder' | 'zip'>(
     desktop || exceedsZipRamLimit ? 'folder' : 'zip',
   );
+  const [volumes, setVolumes] = useState<WindowsVolumeInfo[]>([]);
+  const [selectedRootDir, setSelectedRootDir] = useState<string | null>(null);
   const [folderLayout, setFolderLayout] = useState<'type' | 'path'>('type');
   const [enableFileRepair, setEnableFileRepair] = useState<boolean>(true);
-  const [verifyHeaders, setVerifyHeaders] = useState<boolean>(true);
   const [includeRepairedImg, setIncludeRepairedImg] = useState<boolean>(!!repairedDiskBytes);
   const [saving, setSaving] = useState<boolean>(false);
   const [resultMessage, setResultMessage] = useState<string | null>(null);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
+
+  useEffect(() => {
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape' && !saving) onClose();
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [onClose, saving]);
+
+  useEffect(() => {
+    if (!desktop) return;
+    let active = true;
+    desktop
+      .listWindowsVolumes()
+      .then((list) => {
+        if (!active) return;
+        setVolumes(list);
+        if (list.length > 0 && selectedRootDir === null) {
+          setSelectedRootDir(`${list[0].rootPath}Recovered_Files`);
+        }
+      })
+      .catch(() => {});
+    return () => {
+      active = false;
+    };
+  }, [desktop, selectedRootDir]);
 
   const truncatedCount = items.filter((i) => i.status === 'OK_TRUNCATED').length;
   const supportsDirectoryPicker =
@@ -63,6 +90,7 @@ export const RecoveryModal: React.FC<RecoveryModalProps> = ({
     }
     if (item.originalPath && item.originalPath.includes('\\')) {
       const stripped = item.originalPath
+        .replace(/^(FAT32|exFAT|NTFS)\s+/i, '')
         .replace(/^[A-Za-z]:\\/, '')
         .split(/[\\/]/)
         .slice(0, -1)
@@ -79,21 +107,19 @@ export const RecoveryModal: React.FC<RecoveryModalProps> = ({
     setSaving(true);
 
     try {
-      const filteredItems = verifyHeaders
-        ? items.filter((item) => {
-            if (item.status === 'UNKNOWN') return !enableFileRepair;
-            if (item.sourceRef && item.sourceRef.kind !== 'memory') return true;
-            return identifyBuffer(item.data) !== null;
-          })
-        : items;
+      const filteredItems = items.filter((item) => {
+        if (item.status === 'UNKNOWN') return !enableFileRepair;
+        if (item.sourceRef && item.sourceRef.kind !== 'memory') return true;
+        return identifyBuffer(item.data) !== null;
+      });
 
       if (filteredItems.length === 0) {
-        setErrorMessage('No files passed header verification.');
+        setErrorMessage('No valid recoverable files found in selection.');
         setSaving(false);
         return;
       }
 
-      // 1. Native Windows Desktop streaming copy (4 MiB chunks + atomic .partial + timestamps)
+      // 1. Native Windows Desktop streaming copy
       if (desktop && destinationMode === 'folder') {
         const reqItems = filteredItems.map((item) => {
           const folder = resolveOutputFolder(item);
@@ -145,24 +171,28 @@ export const RecoveryModal: React.FC<RecoveryModalProps> = ({
         }
 
         const res = await desktop.recoverFilesToFolder({
-          destinationDir: null,
+          destinationDir: selectedRootDir,
           items: reqItems,
         });
         if (res.error) {
           setErrorMessage(res.error);
         } else if (!res.canceled) {
           const repNote =
-            res.repairedCount > 0 ? ` (${res.repairedCount} truncated file repaired)` : '';
+            res.repairedCount > 0 ? ` (${res.repairedCount} repaired)` : '';
           setResultMessage(
-            `Streamed ${res.savedCount} file(s) to "${res.destinationDir}"${repNote}.`,
+            `Saved ${res.savedCount} file(s) to "${res.destinationDir}"${repNote}.`,
           );
         }
         setSaving(false);
         return;
       }
 
-      // 2. Browser File System Access API (Direct folder write, streams File blobs cleanly)
-      if (destinationMode === 'folder' && typeof window !== 'undefined' && 'showDirectoryPicker' in window) {
+      // 2. Browser File System Access API
+      if (
+        destinationMode === 'folder' &&
+        typeof window !== 'undefined' &&
+        'showDirectoryPicker' in window
+      ) {
         const dirPicker = (
           window as unknown as {
             showDirectoryPicker: (opts?: { mode?: string }) => Promise<FileSystemDirectoryHandle>;
@@ -172,10 +202,7 @@ export const RecoveryModal: React.FC<RecoveryModalProps> = ({
 
         let repairedCount = 0;
         for (const item of filteredItems) {
-          const folder =
-            folderLayout === 'type'
-              ? `${item.family}/${item.extension}`
-              : item.partitionName.replace(/[^a-zA-Z0-9._-]/g, '_');
+          const folder = resolveOutputFolder(item);
           const parts = folder.split('/').filter(Boolean);
           let curDir = rootHandle;
           for (const part of parts) {
@@ -206,10 +233,10 @@ export const RecoveryModal: React.FC<RecoveryModalProps> = ({
         return;
       }
 
-      // 3. In-memory Portable ZIP Archive
+      // 3. Portable ZIP Archive
       if (exceedsZipRamLimit) {
         setErrorMessage(
-          `Selection totals ${formatBytes(totalBytes)}, which exceeds the 512 MiB in-memory ZIP buffer. Switch to "Local Folder" to stream large videos safely.`,
+          `Selection totals ${formatBytes(totalBytes)}, exceeding 512 MiB in-memory ZIP limit. Choose a Local Folder instead.`,
         );
         setSaving(false);
         return;
@@ -223,7 +250,11 @@ export const RecoveryModal: React.FC<RecoveryModalProps> = ({
           payload = new Uint8Array(await item.sourceRef.browserFile.arrayBuffer());
         } else if (desktop && item.sourceRef?.kind === 'native-file' && item.sourceRef.devicePath) {
           payload = await desktop.readDiskBytes(item.sourceRef.devicePath, 0, item.size);
-        } else if (desktop && item.sourceRef?.kind === 'native-device' && item.sourceRef.devicePath) {
+        } else if (
+          desktop &&
+          item.sourceRef?.kind === 'native-device' &&
+          item.sourceRef.devicePath
+        ) {
           payload = await desktop.readDiskBytes(
             item.sourceRef.devicePath,
             item.sourceRef.offset,
@@ -239,10 +270,7 @@ export const RecoveryModal: React.FC<RecoveryModalProps> = ({
           }
         }
 
-        const folder =
-          folderLayout === 'type'
-            ? `${item.family}/${item.extension}`
-            : item.partitionName.replace(/[^a-zA-Z0-9._-]/g, '_');
+        const folder = resolveOutputFolder(item);
         archiveFiles.push({ name: `${folder}/${item.filename}`, data: payload });
       }
 
@@ -262,7 +290,7 @@ export const RecoveryModal: React.FC<RecoveryModalProps> = ({
       a.click();
       URL.revokeObjectURL(url);
       setResultMessage(
-        `Packaged ${archiveFiles.length} file(s) into recovery_${archiveFiles.length}_files.zip${repairedCount > 0 ? ` (${repairedCount} repaired)` : ''}.`,
+        `Saved ${archiveFiles.length} file(s) into recovery_${archiveFiles.length}_files.zip${repairedCount > 0 ? ` (${repairedCount} repaired)` : ''}.`,
       );
     } catch (err) {
       if ((err as { name?: string })?.name !== 'AbortError') {
@@ -274,137 +302,199 @@ export const RecoveryModal: React.FC<RecoveryModalProps> = ({
   };
 
   return (
-    <div className="fixed inset-0 z-50 bg-black/65 flex items-center justify-center p-4 animate-backdrop-in">
-      <div className="w-full max-w-lg rounded-lg bg-[#181E29] border border-[#2A3446] shadow-2xl overflow-hidden animate-modal-in">
-        <div className="flex items-center justify-between px-5 py-3.5 border-b border-[#2A3446]">
-          <h3 className="text-sm font-semibold text-slate-100">
-            Choose Recovery Destination
-          </h3>
-          <button
-            type="button"
-            onClick={onClose}
-            className="text-slate-400 hover:text-slate-100 p-1 rounded"
-            aria-label="Close modal"
-          >
-            <X className="w-4 h-4" />
-          </button>
-        </div>
+    <div
+      className="fixed inset-0 z-50 bg-black/65 flex items-center justify-center p-4 animate-backdrop-in"
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="recovery-modal-title"
+    >
+      <div className="w-full max-w-[490px] rounded-lg bg-[#222630] border border-[#343A48] shadow-2xl overflow-hidden animate-modal-in relative">
+        <button
+          type="button"
+          onClick={onClose}
+          className="absolute top-3.5 right-3.5 text-slate-400 hover:text-white p-1 rounded transition-colors"
+          aria-label="Close modal"
+        >
+          <X className="w-4 h-4" />
+        </button>
 
-        <div className="p-6 space-y-5">
-          <div className="text-center space-y-1">
-            <div className="w-11 h-11 rounded-lg bg-[#2E7CF6]/15 border border-[#2E7CF6]/30 flex items-center justify-center mx-auto mb-3">
-              <HardDriveDownload className="w-5 h-5 text-[#38BDF8]" />
+        <div className="px-6 pt-6 pb-5 space-y-4">
+          {/* Centered Save Icon & Summary (matches Screenshot 3) */}
+          <div className="text-center space-y-1.5">
+            <div className="mx-auto w-12 h-12 flex items-center justify-center mb-1">
+              <svg viewBox="0 0 48 48" className="w-11 h-11" aria-hidden="true">
+                <path
+                  d="M8 6h26l8 8v26a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2z"
+                  fill="#3A7AFE"
+                />
+                <rect x="13" y="6" width="18" height="12" rx="1.5" fill="#DCE8FF" />
+                <rect x="24" y="8.5" width="4" height="7" rx="1" fill="#3A7AFE" />
+                <rect x="12" y="25" width="24" height="13" rx="2" fill="#1847B8" />
+                <rect x="16" y="29" width="16" height="2" rx="1" fill="#93C5FD" />
+              </svg>
             </div>
-            <p className="text-sm font-semibold text-slate-100">
-              Export {items.length} recovered {items.length === 1 ? 'file' : 'files'}
-            </p>
+            <h3 id="recovery-modal-title" className="text-sm font-semibold text-slate-100">
+              Choose a destination path to save the file:
+            </h3>
             <p className="text-xs text-slate-400 tabular-nums">
-              Total payload: <span className="text-[#60A5FA] font-mono">{formatBytes(totalBytes)}</span> ·{' '}
-              {desktop ? '4 MiB streaming disk copy' : 'Packaged offline'}
+              You have{' '}
+              <span className="text-[#4C8DFF] font-medium">
+                {items.length} file(s) ({formatBytes(totalBytes)})
+              </span>{' '}
+              to recover.
             </p>
           </div>
 
-          <div className="grid grid-cols-2 bg-[#11151C] p-1 rounded-md border border-[#2A3446]">
+          {/* Destination Mode Tabs (Local Folder | Portable ZIP) */}
+          <div className="grid grid-cols-2 border-b border-[#2F3544] text-xs">
             <button
               type="button"
               onClick={() => setDestinationMode('folder')}
-              className={`py-2 text-xs font-medium rounded transition-colors flex items-center justify-center gap-1.5 ${
+              className={`py-2 font-medium border-b-2 transition-colors ${
                 destinationMode === 'folder'
-                  ? 'bg-[#283244] text-white'
-                  : 'text-slate-400 hover:text-slate-200'
+                  ? 'border-[#3A7AFE] text-slate-100 bg-[#282D39]'
+                  : 'border-transparent text-slate-400 hover:text-slate-200'
               }`}
             >
-              <FolderOutput className="w-3.5 h-3.5" />
-              Local Folder
+              Local
             </button>
             <button
               type="button"
               onClick={() => setDestinationMode('zip')}
-              className={`py-2 text-xs font-medium rounded transition-colors flex items-center justify-center gap-1.5 ${
+              className={`py-2 font-medium border-b-2 transition-colors ${
                 destinationMode === 'zip'
-                  ? 'bg-[#283244] text-white'
-                  : 'text-slate-400 hover:text-slate-200'
+                  ? 'border-[#3A7AFE] text-slate-100 bg-[#282D39]'
+                  : 'border-transparent text-slate-400 hover:text-slate-200'
               }`}
             >
-              <Archive className="w-3.5 h-3.5" />
-              Portable ZIP Archive
+              Portable ZIP
             </button>
           </div>
 
-          <div className="bg-[#1F2735] border border-[#2A3446] rounded-md p-4 space-y-3 text-xs">
-            <div className="space-y-2">
-              <div className="font-medium text-slate-200">Output Folder Organization</div>
-              <div className="grid grid-cols-2 gap-2">
-                <label className="flex items-center gap-2 p-2 rounded bg-[#181E29] border border-[#2A3446] cursor-pointer">
+          {/* Destination Selector List Box */}
+          <div className="bg-[#181B22] border border-[#2D3342] rounded-md p-2.5 space-y-2 min-h-[156px]">
+            {destinationMode === 'folder' ? (
+              <div className="space-y-1.5">
+                {volumes.map((vol) => {
+                  const target = `${vol.rootPath}Recovered_Files`;
+                  const isSel = selectedRootDir === target;
+                  return (
+                    <button
+                      key={vol.driveLetter}
+                      type="button"
+                      onClick={() => setSelectedRootDir(target)}
+                      className={`w-full flex items-center justify-between px-3 py-2.5 rounded text-left text-xs transition-colors ${
+                        isSel
+                          ? 'bg-[#2B3344] border border-[#3E4C66] text-white'
+                          : 'hover:bg-[#222630] border border-transparent text-slate-200'
+                      }`}
+                    >
+                      <div className="flex items-center gap-3 min-w-0">
+                        <span
+                          className={`w-3.5 h-3.5 rounded-full border flex items-center justify-center shrink-0 ${
+                            isSel ? 'border-[#3A7AFE] bg-[#3A7AFE]' : 'border-slate-500'
+                          }`}
+                        >
+                          {isSel && <span className="w-1.5 h-1.5 rounded-full bg-white" />}
+                        </span>
+                        <HardDrive className="w-5 h-5 text-[#4C8DFF] shrink-0" />
+                        <div className="min-w-0">
+                          <div className="font-medium truncate">
+                            {vol.label} ({vol.driveLetter})
+                          </div>
+                          <div className="text-[11px] text-slate-400 font-mono tabular-nums">
+                            {formatBytes(vol.freeBytes)} / {formatBytes(vol.totalBytes)} free
+                          </div>
+                        </div>
+                      </div>
+                      <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0" />
+                    </button>
+                  );
+                })}
+
+                <button
+                  type="button"
+                  onClick={() => setSelectedRootDir(null)}
+                  className={`w-full flex items-center gap-3 px-3 py-2.5 rounded text-left text-xs transition-colors ${
+                    selectedRootDir === null
+                      ? 'bg-[#2B3344] border border-[#3E4C66] text-white'
+                      : 'hover:bg-[#222630] border border-transparent text-slate-200'
+                  }`}
+                >
+                  <span
+                    className={`w-3.5 h-3.5 rounded-full border flex items-center justify-center shrink-0 ${
+                      selectedRootDir === null
+                        ? 'border-[#3A7AFE] bg-[#3A7AFE]'
+                        : 'border-slate-500'
+                    }`}
+                  >
+                    {selectedRootDir === null && (
+                      <span className="w-1.5 h-1.5 rounded-full bg-white" />
+                    )}
+                  </span>
+                  <Folder className="w-5 h-5 text-[#4C8DFF] fill-[#4C8DFF]/30 shrink-0" />
+                  <div className="min-w-0">
+                    <div className="font-medium">Choose folder...</div>
+                    <div className="text-[11px] text-slate-400 truncate">
+                      {supportsDirectoryPicker
+                        ? 'Stream directly to a selected folder on another drive'
+                        : 'Browser iframe sandbox — switch to Portable ZIP or Windows .exe'}
+                    </div>
+                  </div>
+                </button>
+              </div>
+            ) : (
+              <div className="p-2.5 flex items-start gap-3 text-xs text-slate-300">
+                <Archive className="w-5 h-5 text-[#4C8DFF] shrink-0 mt-0.5" />
+                <div className="space-y-1">
+                  <div className="font-medium text-slate-100">
+                    Portable ZIP Package (recovery_{items.length}_files.zip)
+                  </div>
+                  <div className="text-[11px] text-slate-400 leading-relaxed">
+                    Bundles recovered files cleanly offline with CRC32 verification. Recommended up
+                    to 512 MiB; use Local Folder for multi-GB video streams.
+                  </div>
+                </div>
+              </div>
+            )}
+
+            <div className="pt-2 mt-1 border-t border-[#262B36] flex items-center justify-between px-2 text-[11px] text-slate-400">
+              <span>Folder layout:</span>
+              <div className="flex items-center gap-3">
+                <label className="inline-flex items-center gap-1.5 cursor-pointer">
                   <input
                     type="radio"
                     name="folderLayout"
                     checked={folderLayout === 'type'}
                     onChange={() => setFolderLayout('type')}
-                    className="text-[#2E7CF6]"
+                    className="accent-[#3A7AFE]"
                   />
-                  <span className="text-slate-200">By File Type</span>
+                  <span className="text-slate-200">By Type</span>
                 </label>
-                <label className="flex items-center gap-2 p-2 rounded bg-[#181E29] border border-[#2A3446] cursor-pointer">
+                <label className="inline-flex items-center gap-1.5 cursor-pointer">
                   <input
                     type="radio"
                     name="folderLayout"
                     checked={folderLayout === 'path'}
                     onChange={() => setFolderLayout('path')}
-                    className="text-[#2E7CF6]"
+                    className="accent-[#3A7AFE]"
                   />
-                  <span className="text-slate-200">By Origin / Path</span>
+                  <span className="text-slate-200">By Origin Path</span>
                 </label>
               </div>
             </div>
 
-            {destinationMode === 'folder' && (
-              <div className="text-slate-300 leading-relaxed">
-                {supportsDirectoryPicker
-                  ? 'Select a destination folder (on a different drive than the source) to stream recovered photos and large videos directly without high RAM usage.'
-                  : 'Direct folder write requires the Windows desktop app or a top-level Chromium window. Switch to Portable ZIP Archive or run the Windows .exe.'}
-              </div>
+            {repairedDiskBytes && (
+              <label className="flex items-center justify-between px-2 pt-1 text-[11px] text-slate-300 cursor-pointer">
+                <span>Include repaired partition table (.img)</span>
+                <input
+                  type="checkbox"
+                  checked={includeRepairedImg}
+                  onChange={(e) => setIncludeRepairedImg(e.target.checked)}
+                  className="accent-[#3A7AFE]"
+                />
+              </label>
             )}
-
-            <div className="pt-2 border-t border-[#2A3446] space-y-2">
-              <label className="flex items-center justify-between gap-3 cursor-pointer">
-                <span className="text-slate-200 inline-flex items-center gap-1.5">
-                  <Wrench className="w-3.5 h-3.5 text-[#38BDF8]" />
-                  Enable file repair
-                  {truncatedCount > 0 && (
-                    <span className="text-[11px] text-amber-300">({truncatedCount} fixable)</span>
-                  )}
-                </span>
-                <input
-                  type="checkbox"
-                  checked={enableFileRepair}
-                  onChange={(e) => setEnableFileRepair(e.target.checked)}
-                  className="rounded border-slate-600 bg-[#11151C] text-[#2E7CF6]"
-                />
-              </label>
-
-              <label className="flex items-center justify-between gap-3 cursor-pointer">
-                <span className="text-slate-300">Verify file headers before export (Paranoid check)</span>
-                <input
-                  type="checkbox"
-                  checked={verifyHeaders}
-                  onChange={(e) => setVerifyHeaders(e.target.checked)}
-                  className="rounded border-slate-600 bg-[#11151C] text-[#2E7CF6]"
-                />
-              </label>
-
-              {repairedDiskBytes && (
-                <label className="flex items-center justify-between gap-3 cursor-pointer">
-                  <span className="text-slate-300">Include repaired partition table image (.img)</span>
-                  <input
-                    type="checkbox"
-                    checked={includeRepairedImg}
-                    onChange={(e) => setIncludeRepairedImg(e.target.checked)}
-                    className="rounded border-slate-600 bg-[#11151C] text-[#2E7CF6]"
-                  />
-                </label>
-              )}
-            </div>
           </div>
 
           {resultMessage && (
@@ -419,24 +509,42 @@ export const RecoveryModal: React.FC<RecoveryModalProps> = ({
               {errorMessage}
             </div>
           )}
-        </div>
 
-        <div className="px-6 py-3.5 bg-[#141922] border-t border-[#2A3446] flex items-center justify-end gap-2.5">
-          <button
-            type="button"
-            onClick={onClose}
-            className="px-4 py-1.5 text-xs font-medium text-slate-300 hover:text-white bg-[#1F2735] hover:bg-[#283244] rounded-md transition-colors"
-          >
-            Close
-          </button>
-          <button
-            type="button"
-            onClick={() => void handleSave()}
-            disabled={saving || items.length === 0}
-            className="px-5 py-1.5 text-xs font-medium text-white bg-[#2E7CF6] hover:bg-[#2569D6] disabled:opacity-40 rounded-md transition-colors"
-          >
-            {saving ? 'Recovering...' : 'Save'}
-          </button>
+          {/* Bottom Bar: Enable file repair toggle + Save button (matches Screenshot 3) */}
+          <div className="flex items-center justify-between pt-1">
+            <label className="inline-flex items-center gap-2.5 text-xs text-slate-200 cursor-pointer select-none">
+              <button
+                type="button"
+                role="switch"
+                aria-checked={enableFileRepair}
+                onClick={() => setEnableFileRepair((v) => !v)}
+                className={`relative w-8 h-4.5 rounded-full transition-colors ${
+                  enableFileRepair ? 'bg-[#3A7AFE]' : 'bg-[#363D4E]'
+                }`}
+              >
+                <span
+                  className={`block w-3.5 h-3.5 rounded-full bg-white transition-transform translate-y-[2px] ${
+                    enableFileRepair ? 'translate-x-[16px]' : 'translate-x-[2px]'
+                  }`}
+                />
+              </button>
+              <span>
+                Enable file repair
+                {truncatedCount > 0 && (
+                  <span className="text-slate-400 ml-1">({truncatedCount} fixable)</span>
+                )}
+              </span>
+            </label>
+
+            <button
+              type="button"
+              onClick={() => void handleSave()}
+              disabled={saving || items.length === 0}
+              className="px-7 py-1.5 text-xs font-medium text-white bg-[#3A7AFE] hover:bg-[#2F6EEB] disabled:opacity-40 rounded-md transition-colors"
+            >
+              {saving ? 'Saving...' : 'Save'}
+            </button>
+          </div>
         </div>
       </div>
     </div>

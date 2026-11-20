@@ -1,10 +1,10 @@
-import React, { useEffect, useMemo, useRef, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import {
   CheckCircle2,
   Download,
-  Eye,
   FileText,
   HardDrive,
+  Image as ImageIcon,
   Maximize2,
   Music,
   RotateCcw,
@@ -19,6 +19,7 @@ import { ExplorerFileItem } from '../engine/explorerTypes';
 import { formatBytes } from '../engine/crc32';
 import { getDesktopBridge } from '../engine/desktopBridge';
 import { formatShortDate } from '../engine/recoveryHealth';
+import { useMediaUrl } from '../utils/useMediaUrl';
 import { HexViewer } from './HexViewer';
 
 interface ExplorerInspectorProps {
@@ -34,27 +35,12 @@ interface ExplorerInspectorProps {
 
 function likelihoodColors(tier: ExplorerFileItem['recoveryTier']) {
   if (tier === 'high') {
-    return {
-      text: 'text-emerald-400',
-      bar: 'bg-emerald-500',
-      badge: 'bg-emerald-500/15 border-emerald-500/35 text-emerald-300',
-      dot: 'bg-emerald-400',
-    };
+    return { text: 'text-emerald-400', bar: 'bg-emerald-500', label: 'Excellent' };
   }
   if (tier === 'medium') {
-    return {
-      text: 'text-amber-400',
-      bar: 'bg-amber-500',
-      badge: 'bg-amber-500/15 border-amber-500/35 text-amber-300',
-      dot: 'bg-amber-400',
-    };
+    return { text: 'text-amber-400', bar: 'bg-amber-500', label: 'Fair' };
   }
-  return {
-    text: 'text-rose-400',
-    bar: 'bg-rose-500',
-    badge: 'bg-rose-500/15 border-rose-500/35 text-rose-300',
-    dot: 'bg-rose-400',
-  };
+  return { text: 'text-rose-400', bar: 'bg-rose-500', label: 'Poor' };
 }
 
 export const ExplorerInspector: React.FC<ExplorerInspectorProps> = ({
@@ -77,9 +63,8 @@ export const ExplorerInspector: React.FC<ExplorerInspectorProps> = ({
       ? sectorOverride.lba
       : (focusedPartition?.startLba ?? 0);
 
-  const [showHex, setShowHex] = useState<boolean>(true);
+  const [showHex, setShowHex] = useState<boolean>(false);
 
-  // Scoped zoom & pan state keyed by file ID so switching files resets cleanly without useEffect setState
   const fileKey = focusedFile?.id ?? 'none';
   const [zoomState, setZoomState] = useState<{
     fileKey: string;
@@ -109,7 +94,9 @@ export const ExplorerInspector: React.FC<ExplorerInspectorProps> = ({
   }>({ active: false, startX: 0, startY: 0, origPanX: 0, origPanY: 0 });
   const [isDragging, setIsDragging] = useState<boolean>(false);
 
-  const updateZoom = (patch: Partial<{ inlineZoom: number; modalZoom: number; panX: number; panY: number }>) => {
+  const updateZoom = (
+    patch: Partial<{ inlineZoom: number; modalZoom: number; panX: number; panY: number }>,
+  ) => {
     setZoomState((prev) => {
       const base =
         prev.fileKey === fileKey
@@ -121,24 +108,23 @@ export const ExplorerInspector: React.FC<ExplorerInspectorProps> = ({
 
   const clampZoom = (val: number) => Math.min(5, Math.max(0.5, Math.round(val * 100) / 100));
 
-  const previewUrl = useMemo(() => {
-    if (!focusedFile) return null;
-    if (focusedFile.sourceRef?.browserFile) {
-      return URL.createObjectURL(focusedFile.sourceRef.browserFile);
-    }
-    if (focusedFile.sourceRef?.kind === 'native-file' && focusedFile.sourceRef.devicePath) {
-      const normalized = focusedFile.sourceRef.devicePath.replace(/\\/g, '/');
-      return `file:///${normalized.replace(/^\/+/, '')}`;
-    }
-    const blob = new Blob([focusedFile.data.slice().buffer], { type: focusedFile.mimeType });
-    return URL.createObjectURL(blob);
-  }, [focusedFile]);
-
-  useEffect(() => {
-    return () => {
-      if (previewUrl && previewUrl.startsWith('blob:')) URL.revokeObjectURL(previewUrl);
-    };
-  }, [previewUrl]);
+  const isPreviewMedia =
+    focusedFile?.family === 'Pictures' ||
+    focusedFile?.family === 'Audio' ||
+    focusedFile?.family === 'Videos';
+  const previewCacheKey = focusedFile
+    ? `${focusedFile.id}:${focusedFile.repaired ? '1' : '0'}:${focusedFile.data.byteLength}`
+    : 'none';
+  const previewUrl = useMediaUrl({
+    enabled: Boolean(focusedFile && isPreviewMedia),
+    cacheKey: previewCacheKey,
+    browserFile: focusedFile?.sourceRef?.browserFile,
+    nativeKind: focusedFile?.sourceRef?.kind,
+    devicePath: focusedFile?.sourceRef?.devicePath,
+    data: focusedFile?.data,
+    mimeType: focusedFile?.mimeType,
+  });
+  const [failedPreviewUrl, setFailedPreviewUrl] = useState<string | null>(null);
 
   useEffect(() => {
     if (!lightboxOpen) return;
@@ -194,7 +180,7 @@ export const ExplorerInspector: React.FC<ExplorerInspectorProps> = ({
     URL.revokeObjectURL(url);
   };
 
-  // --- Mode A: Focused File Inspector ---
+  // --- Mode A: Focused File Inspector (Matches Screenshot 1 right pane) ---
   if (focusedFile) {
     const isImage = focusedFile.family === 'Pictures';
     const isAudio = focusedFile.family === 'Audio';
@@ -205,35 +191,61 @@ export const ExplorerInspector: React.FC<ExplorerInspectorProps> = ({
       focusedFile.extension === 'txt' ||
       focusedFile.extension === 'json' ||
       focusedFile.extension === 'xml' ||
-      focusedFile.extension === 'svg';
+      focusedFile.extension === 'svg' ||
+      focusedFile.extension === 'html' ||
+      focusedFile.extension === 'eml';
 
     const lc = likelihoodColors(focusedFile.recoveryTier);
 
     return (
       <>
-        <aside className="w-80 xl:w-96 shrink-0 bg-[#181E29] border-l border-[#2A3446] flex flex-col overflow-y-auto">
-          <div key={focusedFile.id} className="p-4 space-y-4 animate-row-fade">
-            {/* Inline Preview Card with Quick Windows-style Thumbnail Zoom */}
-            <div className="bg-[#11151C] rounded-md border border-[#2A3446] overflow-hidden flex flex-col items-center justify-center min-h-[164px] p-3 relative group">
-              {previewUrl && isImage ? (
+        <aside className="w-72 xl:w-[304px] shrink-0 bg-[#1E2129] border-l border-[#2A2E39] flex flex-col relative">
+          <div key={focusedFile.id} className="flex-1 overflow-y-auto p-4 pb-16 space-y-4 animate-row-fade">
+            {/* Centered Media Preview Box */}
+            <div className="bg-[#14171D] rounded-md border border-[#2A2E39] overflow-hidden flex flex-col items-center justify-center min-h-[156px] p-2.5 relative group">
+              {previewUrl && isImage && failedPreviewUrl !== previewUrl ? (
                 <div
-                  className="w-full h-40 flex items-center justify-center overflow-hidden cursor-zoom-in"
+                  className="w-full h-36 flex items-center justify-center overflow-hidden cursor-zoom-in"
                   onDoubleClick={() => onSetLightboxOpen(true)}
                   onWheel={(e) => {
                     e.preventDefault();
-                    updateZoom({ inlineZoom: clampZoom(inlineZoom + (e.deltaY < 0 ? 0.25 : -0.25)) });
+                    updateZoom({
+                      inlineZoom: clampZoom(inlineZoom + (e.deltaY < 0 ? 0.25 : -0.25)),
+                    });
                   }}
                 >
                   <img
+                    key={previewUrl}
                     src={previewUrl}
                     alt={focusedFile.filename}
                     referrerPolicy="no-referrer"
+                    onError={() => setFailedPreviewUrl(previewUrl)}
                     style={{ transform: `scale(${inlineZoom})` }}
                     className="max-h-36 object-contain rounded transition-transform duration-150 ease-out"
                   />
                 </div>
+              ) : isImage ? (
+                <div className="text-center space-y-1.5 py-4 px-2">
+                  <ImageIcon
+                    className={`w-7 h-7 mx-auto ${
+                      focusedFile.status === 'OK_TRUNCATED' && !focusedFile.repaired
+                        ? 'text-amber-400'
+                        : 'text-slate-400'
+                    }`}
+                  />
+                  <div className="text-xs text-slate-300 font-medium">
+                    {focusedFile.status === 'OK_TRUNCATED' && !focusedFile.repaired
+                      ? 'Truncated image header/footer'
+                      : 'Raw carved image bitstream'}
+                  </div>
+                  <div className="text-[11px] text-slate-500">
+                    {focusedFile.status === 'OK_TRUNCATED' && !focusedFile.repaired
+                      ? 'Use Repair Corrupted Structure below'
+                      : 'Inspect hex or save file to open externally'}
+                  </div>
+                </div>
               ) : previewUrl && isAudio ? (
-                <div className="w-full space-y-2.5 py-2">
+                <div className="w-full space-y-2 py-2">
                   <div className="flex items-center justify-center gap-2 text-xs text-slate-300">
                     <Music className="w-4 h-4 text-rose-400" />
                     <span>Audio Stream Ready</span>
@@ -242,11 +254,13 @@ export const ExplorerInspector: React.FC<ExplorerInspectorProps> = ({
                 </div>
               ) : previewUrl && isVideo ? (
                 <div
-                  className="w-full h-40 flex items-center justify-center overflow-hidden"
+                  className="w-full h-36 flex items-center justify-center overflow-hidden"
                   onDoubleClick={() => onSetLightboxOpen(true)}
                   onWheel={(e) => {
                     e.preventDefault();
-                    updateZoom({ inlineZoom: clampZoom(inlineZoom + (e.deltaY < 0 ? 0.25 : -0.25)) });
+                    updateZoom({
+                      inlineZoom: clampZoom(inlineZoom + (e.deltaY < 0 ? 0.25 : -0.25)),
+                    });
                   }}
                 >
                   <video
@@ -258,9 +272,9 @@ export const ExplorerInspector: React.FC<ExplorerInspectorProps> = ({
                 </div>
               ) : isTextLike ? (
                 <div className="w-full space-y-1.5">
-                  <div className="flex items-center gap-1.5 text-[11px] text-sky-400 font-medium">
+                  <div className="flex items-center gap-1.5 text-[11px] text-[#4C8DFF] font-medium">
                     <FileText className="w-3.5 h-3.5" />
-                    <span>Structure Extract</span>
+                    <span>Document Preview</span>
                   </div>
                   <pre className="text-[11px] font-mono text-slate-300 max-h-28 overflow-hidden whitespace-pre-wrap break-all">
                     {new TextDecoder().decode(focusedFile.data.subarray(0, 320))}
@@ -268,22 +282,20 @@ export const ExplorerInspector: React.FC<ExplorerInspectorProps> = ({
                 </div>
               ) : (
                 <div className="text-center space-y-1.5 py-4">
-                  <div className="text-base font-mono font-bold uppercase text-[#38BDF8]">
+                  <div className="text-base font-mono font-bold uppercase text-[#4C8DFF]">
                     .{focusedFile.extension}
                   </div>
                   <div className="text-xs text-slate-400">{focusedFile.description}</div>
                 </div>
               )}
 
-              {/* Quick inline zoom controls for images & videos */}
               {isZoomableMedia && (
                 <div className="absolute bottom-2 left-2 right-2 flex items-center justify-between opacity-0 group-hover:opacity-100 transition-opacity duration-150 pointer-events-none">
-                  <div className="flex items-center gap-1 bg-[#181E29]/95 border border-[#2A3446] rounded px-1.5 py-0.5 pointer-events-auto shadow-lg">
+                  <div className="flex items-center gap-1 bg-[#1E2129]/95 border border-[#2A2E39] rounded px-1.5 py-0.5 pointer-events-auto shadow-lg">
                     <button
                       type="button"
                       onClick={() => updateZoom({ inlineZoom: clampZoom(inlineZoom - 0.25) })}
                       className="p-0.5 text-slate-300 hover:text-white"
-                      title="Zoom out thumbnail"
                       aria-label="Zoom out thumbnail"
                     >
                       <ZoomOut className="w-3 h-3" />
@@ -295,7 +307,6 @@ export const ExplorerInspector: React.FC<ExplorerInspectorProps> = ({
                       type="button"
                       onClick={() => updateZoom({ inlineZoom: clampZoom(inlineZoom + 0.25) })}
                       className="p-0.5 text-slate-300 hover:text-white"
-                      title="Zoom in thumbnail"
                       aria-label="Zoom in thumbnail"
                     >
                       <ZoomIn className="w-3 h-3" />
@@ -305,19 +316,16 @@ export const ExplorerInspector: React.FC<ExplorerInspectorProps> = ({
                         type="button"
                         onClick={() => updateZoom({ inlineZoom: 1 })}
                         className="p-0.5 text-slate-400 hover:text-white"
-                        title="Reset zoom"
                         aria-label="Reset thumbnail zoom"
                       >
                         <RotateCcw className="w-2.5 h-2.5" />
                       </button>
                     )}
                   </div>
-
                   <button
                     type="button"
                     onClick={() => onSetLightboxOpen(true)}
-                    className="p-1.5 rounded bg-[#181E29]/95 border border-[#2A3446] text-slate-200 hover:text-white pointer-events-auto shadow-lg"
-                    title="Open Windows-style zoom viewer"
+                    className="p-1 rounded bg-[#1E2129]/95 border border-[#2A2E39] text-slate-200 hover:text-white pointer-events-auto shadow-lg"
                     aria-label="Enlarge preview"
                   >
                     <Maximize2 className="w-3.5 h-3.5" />
@@ -326,158 +334,131 @@ export const ExplorerInspector: React.FC<ExplorerInspectorProps> = ({
               )}
             </div>
 
-            {/* Action Buttons */}
-            <div className="grid grid-cols-2 gap-2">
-              <button
-                type="button"
-                onClick={() => {
-                  updateZoom({ modalZoom: 1, panX: 0, panY: 0 });
-                  onSetLightboxOpen(true);
-                }}
-                className="inline-flex items-center justify-center gap-1.5 py-2 px-3 rounded-md text-xs font-medium bg-[#1F2735] border border-[#2A3446] text-slate-200 hover:bg-[#283244] active:scale-[0.98] transition-all whitespace-nowrap"
-              >
-                <Eye className="w-3.5 h-3.5" />
-                {isZoomableMedia ? 'Preview & Zoom' : 'Preview'}
-              </button>
-              <button
-                type="button"
-                onClick={() => void handleDownloadFile(focusedFile)}
-                className="inline-flex items-center justify-center gap-1.5 py-2 px-3 rounded-md text-xs font-medium bg-[#2E7CF6] text-white hover:bg-[#2569D6] active:scale-[0.98] transition-all whitespace-nowrap"
-              >
-                <Download className="w-3.5 h-3.5" />
-                Save File
-              </button>
-            </div>
+            {/* Full-width Preview button (exact Screenshot 1 layout) */}
+            <button
+              type="button"
+              onClick={() => {
+                updateZoom({ modalZoom: 1, panX: 0, panY: 0 });
+                onSetLightboxOpen(true);
+              }}
+              className="w-full py-2 px-4 rounded-md text-xs font-medium bg-[#2B303C] hover:bg-[#343B49] text-slate-100 transition-colors"
+            >
+              Preview
+            </button>
 
-            {/* Recovery Likelihood Meter */}
-            <div className="bg-[#11151C] rounded-md border border-[#2A3446] p-3 space-y-2">
-              <div className="flex items-center justify-between text-xs">
-                <span className="text-slate-400 font-medium">Recovery Likelihood</span>
-                <span
-                  className={`inline-flex items-center gap-1.5 px-2 py-0.5 rounded border text-[11px] font-mono font-semibold tabular-nums ${lc.badge}`}
-                >
-                  <span className={`w-1.5 h-1.5 rounded-full ${lc.dot}`} />
-                  {focusedFile.recoveryChance}% · {focusedFile.repaired ? 'Repaired' : lc.text.includes('emerald') ? 'Excellent' : lc.text.includes('amber') ? 'Fair' : 'Poor'}
-                </span>
+            {/* Clean Vertical Metadata Stack matching Screenshot 1 */}
+            <div className="space-y-3 text-xs pt-1">
+              <div>
+                <div className="text-slate-400 text-[11px]">Name</div>
+                <div className="text-slate-100 mt-0.5 break-all font-medium">
+                  {focusedFile.filename}
+                </div>
               </div>
-              <div className="w-full h-1.5 rounded-full bg-[#1F2735] overflow-hidden">
+
+              <div>
+                <div className="text-slate-400 text-[11px]">Size</div>
+                <div className="text-slate-200 mt-0.5 tabular-nums font-mono">
+                  {formatBytes(focusedFile.size)}
+                </div>
+              </div>
+
+              <div>
+                <div className="text-slate-400 text-[11px]">Type</div>
+                <div className="text-slate-200 mt-0.5 uppercase">
+                  {focusedFile.extension} File
+                </div>
+              </div>
+
+              <div>
+                <div className="text-slate-400 text-[11px]">Date Modified</div>
+                <div className="text-slate-200 mt-0.5 font-mono tabular-nums">
+                  {formatShortDate(focusedFile.modifiedAt)}
+                </div>
+              </div>
+
+              <div>
+                <div className="text-slate-400 text-[11px]">Path</div>
                 <div
-                  className={`h-full rounded-full transition-all duration-300 ease-out ${lc.bar}`}
-                  style={{ width: `${focusedFile.recoveryChance}%` }}
-                />
+                  className="text-slate-200 mt-0.5 truncate"
+                  title={focusedFile.originalPath || focusedFile.partitionName}
+                >
+                  {focusedFile.originalPath || focusedFile.partitionName}
+                </div>
               </div>
-              <div className="text-[11px] text-slate-400 leading-snug">
-                {focusedFile.recoveryReason}
+
+              <div>
+                <div className="flex items-center justify-between text-[11px]">
+                  <span className="text-slate-400">Recovery Health</span>
+                  <span className={`font-mono font-semibold tabular-nums ${lc.text}`}>
+                    {focusedFile.recoveryChance}% ·{' '}
+                    {focusedFile.repaired ? 'Repaired' : lc.label}
+                  </span>
+                </div>
+                <div className="w-full h-1 rounded-full bg-[#2A2E39] overflow-hidden mt-1.5">
+                  <div
+                    className={`h-full rounded-full transition-all duration-300 ${lc.bar}`}
+                    style={{ width: `${focusedFile.recoveryChance}%` }}
+                  />
+                </div>
+                <div className="text-[11px] text-slate-400 mt-1 leading-snug">
+                  {focusedFile.recoveryReason}
+                </div>
               </div>
 
               {focusedFile.status === 'OK_TRUNCATED' && !focusedFile.repaired && (
                 <button
                   type="button"
                   onClick={() => onRepairFile(focusedFile)}
-                  className="w-full mt-1 inline-flex items-center justify-center gap-1.5 py-1.5 px-3 rounded text-xs font-medium bg-amber-500/15 border border-amber-500/35 text-amber-200 hover:bg-amber-500/25 transition-colors"
+                  className="w-full inline-flex items-center justify-center gap-1.5 py-1.5 px-3 rounded-md text-xs font-medium bg-amber-500/15 border border-amber-500/35 text-amber-200 hover:bg-amber-500/25 transition-colors"
                 >
                   <Wrench className="w-3.5 h-3.5" />
-                  Repair Truncated Structure
+                  Repair Corrupted Structure
                 </button>
               )}
-            </div>
-
-            {/* Metadata Breakdown */}
-            <div className="space-y-2.5 text-xs pt-1">
-              <div>
-                <div className="text-slate-400">Name</div>
-                <div className="font-mono text-slate-100 mt-0.5 break-all">
-                  {focusedFile.filename}
-                </div>
-              </div>
-
-              <div className="grid grid-cols-2 gap-3">
-                <div>
-                  <div className="text-slate-400">Size</div>
-                  <div className="font-mono text-slate-100 mt-0.5 tabular-nums">
-                    {formatBytes(focusedFile.size)}
-                  </div>
-                </div>
-                <div>
-                  <div className="text-slate-400">Date Modified</div>
-                  <div className="font-mono text-slate-100 mt-0.5 tabular-nums">
-                    {formatShortDate(focusedFile.modifiedAt)}
-                  </div>
-                </div>
-              </div>
-
-              <div className="grid grid-cols-2 gap-3">
-                <div>
-                  <div className="text-slate-400">Type</div>
-                  <div className="text-slate-100 mt-0.5 uppercase font-mono">
-                    {focusedFile.extension} File
-                  </div>
-                </div>
-                <div>
-                  <div className="text-slate-400">Integrity</div>
-                  <div className="mt-0.5 flex items-center gap-1">
-                    {focusedFile.status === 'OK' || focusedFile.repaired ? (
-                      <>
-                        <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
-                        <span className="text-emerald-300">
-                          {focusedFile.repaired ? 'Repaired' : 'Intact'}
-                        </span>
-                      </>
-                    ) : (
-                      <>
-                        <ShieldAlert className="w-3.5 h-3.5 text-amber-400 shrink-0" />
-                        <span className="text-amber-300">{focusedFile.status}</span>
-                      </>
-                    )}
-                  </div>
-                </div>
-              </div>
-
-              <div>
-                <div className="text-slate-400">Origin Path</div>
-                <div
-                  className="text-slate-200 mt-0.5 truncate"
-                  title={focusedFile.originalPath || focusedFile.partitionName}
-                >
-                  {focusedFile.originalPath || focusedFile.partitionName}
-                  {focusedFile.sourceKind === 'carved' &&
-                    ` · Sector ${focusedFile.sector.toLocaleString()}`}
-                </div>
-              </div>
 
               {focusedFile.metadata.camera && (
                 <div>
-                  <div className="text-slate-400">Camera / EXIF</div>
+                  <div className="text-slate-400 text-[11px]">Camera / EXIF</div>
                   <div className="text-slate-200 mt-0.5">{focusedFile.metadata.camera}</div>
                 </div>
               )}
 
               {focusedFile.sourceRef?.runs && focusedFile.sourceRef.runs.length > 1 && (
                 <div>
-                  <div className="text-slate-400">Fragmented NTFS Extents</div>
+                  <div className="text-slate-400 text-[11px]">Cluster Extents</div>
                   <div className="text-emerald-300 font-mono mt-0.5">
-                    {focusedFile.sourceRef.runs.length} cluster runs linked via $MFT
+                    {focusedFile.sourceRef.runs.length} runs linked via filesystem metadata
                   </div>
                 </div>
               )}
 
               {focusedFile.metadata.details && (
                 <div>
-                  <div className="text-slate-400">Signature Details</div>
-                  <div className="text-slate-200 mt-0.5">{focusedFile.metadata.details}</div>
+                  <div className="text-slate-400 text-[11px]">Details</div>
+                  <div className="text-slate-300 mt-0.5">{focusedFile.metadata.details}</div>
                 </div>
               )}
             </div>
 
-            {/* Collapsible Hex Signature Inspector */}
-            <div className="pt-2 border-t border-[#2A3446] space-y-2">
+            {/* Save File + Hex Toggle */}
+            <div className="pt-2 border-t border-[#2A2E39] space-y-2.5">
+              <button
+                type="button"
+                onClick={() => void handleDownloadFile(focusedFile)}
+                className="w-full inline-flex items-center justify-center gap-1.5 py-2 px-3 rounded-md text-xs font-medium bg-[#3A7AFE] hover:bg-[#2F6EEB] text-white transition-colors"
+              >
+                <Download className="w-3.5 h-3.5" />
+                Save File
+              </button>
+
               <button
                 type="button"
                 onClick={() => setShowHex((v) => !v)}
-                className="text-xs font-medium text-[#60A5FA] hover:underline"
+                className="text-[11px] font-medium text-[#60A5FA] hover:underline"
               >
                 {showHex ? 'Hide Header Hex' : 'Inspect Header Hex'}
               </button>
+
               {showHex && (
                 <HexViewer
                   bytes={focusedFile.data}
@@ -490,22 +471,41 @@ export const ExplorerInspector: React.FC<ExplorerInspectorProps> = ({
               )}
             </div>
           </div>
+
+          {/* Floating circular diagnostic/repair tool button matching Screenshots 1-3 */}
+          <button
+            type="button"
+            onClick={() => {
+              if (focusedFile.status === 'OK_TRUNCATED' && !focusedFile.repaired) {
+                onRepairFile(focusedFile);
+              } else {
+                setShowHex((v) => !v);
+              }
+            }}
+            title={
+              focusedFile.status === 'OK_TRUNCATED' && !focusedFile.repaired
+                ? 'Repair truncated file structure'
+                : 'Toggle binary hex signature inspector'
+            }
+            aria-label="Quick repair and hex inspector"
+            className="absolute bottom-4 right-4 w-9 h-9 rounded-full bg-[#2B303C] hover:bg-[#3A7AFE] border border-[#3B4252] text-[#60A5FA] hover:text-white shadow-lg flex items-center justify-center transition-colors"
+          >
+            <Wrench className="w-4 h-4" />
+          </button>
         </aside>
 
-        {/* Fullscreen Windows-style Preview & Zoom Lightbox */}
+        {/* Fullscreen Preview & Zoom Lightbox */}
         {lightboxOpen && (
           <div className="fixed inset-0 z-50 bg-black/80 flex items-center justify-center p-4 animate-backdrop-in">
-            <div className="w-full max-w-4xl rounded-lg bg-[#181E29] border border-[#2A3446] overflow-hidden shadow-2xl animate-modal-in flex flex-col max-h-[90vh]">
-              {/* Lightbox Header */}
-              <div className="flex items-center justify-between px-4 py-3 border-b border-[#2A3446] gap-3">
-                <div className="flex items-center gap-3 min-w-0">
-                  <span className="text-xs font-mono text-slate-100 truncate">
+            <div className="w-full max-w-4xl rounded-lg bg-[#1E2129] border border-[#2F3544] overflow-hidden shadow-2xl animate-modal-in flex flex-col max-h-[90vh]">
+              <div className="flex items-center justify-between px-4 py-3 border-b border-[#2A2E39] gap-3">
+                <div className="flex items-center gap-3 min-w-0 text-xs">
+                  <span className="font-mono text-slate-100 truncate">
                     {focusedFile.filename} · {formatBytes(focusedFile.size)}
                   </span>
-                  <span
-                    className={`inline-flex items-center gap-1 px-2 py-0.5 rounded border text-[11px] font-mono tabular-nums shrink-0 ${lc.badge}`}
-                  >
-                    {focusedFile.recoveryChance}% Recovery Likelihood
+                  <span className="text-slate-500">·</span>
+                  <span className={`font-mono font-semibold tabular-nums ${lc.text}`}>
+                    {focusedFile.recoveryChance}% {lc.label}
                   </span>
                 </div>
                 <button
@@ -518,17 +518,19 @@ export const ExplorerInspector: React.FC<ExplorerInspectorProps> = ({
                 </button>
               </div>
 
-              {/* Windows Photos / Media Zoom Toolbar for Images & Videos */}
               {isZoomableMedia && (
-                <div className="px-4 py-2 bg-[#141922] border-b border-[#2A3446] flex flex-wrap items-center justify-between gap-3 text-xs">
+                <div className="px-4 py-2 bg-[#16181F] border-b border-[#2A2E39] flex flex-wrap items-center justify-between gap-3 text-xs">
                   <div className="flex items-center gap-2">
                     <button
                       type="button"
                       onClick={() =>
-                        updateZoom({ modalZoom: clampZoom(modalZoom - 0.25), panX: modalZoom - 0.25 <= 1 ? 0 : panX, panY: modalZoom - 0.25 <= 1 ? 0 : panY })
+                        updateZoom({
+                          modalZoom: clampZoom(modalZoom - 0.25),
+                          panX: modalZoom - 0.25 <= 1 ? 0 : panX,
+                          panY: modalZoom - 0.25 <= 1 ? 0 : panY,
+                        })
                       }
-                      className="p-1.5 rounded bg-[#1F2735] border border-[#2A3446] text-slate-200 hover:bg-[#283244]"
-                      title="Zoom out"
+                      className="p-1.5 rounded bg-[#262B36] border border-[#343A48] text-slate-200 hover:bg-[#2F3644]"
                       aria-label="Zoom out"
                     >
                       <ZoomOut className="w-3.5 h-3.5" />
@@ -548,13 +550,12 @@ export const ExplorerInspector: React.FC<ExplorerInspectorProps> = ({
                         });
                       }}
                       aria-label="Zoom magnification"
-                      className="w-32 accent-[#2E7CF6] cursor-pointer"
+                      className="w-32 accent-[#3A7AFE] cursor-pointer"
                     />
                     <button
                       type="button"
                       onClick={() => updateZoom({ modalZoom: clampZoom(modalZoom + 0.25) })}
-                      className="p-1.5 rounded bg-[#1F2735] border border-[#2A3446] text-slate-200 hover:bg-[#283244]"
-                      title="Zoom in"
+                      className="p-1.5 rounded bg-[#262B36] border border-[#343A48] text-slate-200 hover:bg-[#2F3644]"
                       aria-label="Zoom in"
                     >
                       <ZoomIn className="w-3.5 h-3.5" />
@@ -577,23 +578,19 @@ export const ExplorerInspector: React.FC<ExplorerInspectorProps> = ({
                         onClick={() => updateZoom({ modalZoom: preset.z, panX: 0, panY: 0 })}
                         className={`px-2 py-1 rounded text-[11px] font-mono border transition-colors ${
                           Math.abs(modalZoom - preset.z) < 0.05
-                            ? 'bg-[#2E7CF6] border-[#2E7CF6] text-white'
-                            : 'bg-[#1F2735] border-[#2A3446] text-slate-300 hover:bg-[#283244]'
+                            ? 'bg-[#3A7AFE] border-[#3A7AFE] text-white'
+                            : 'bg-[#262B36] border-[#343A48] text-slate-300 hover:bg-[#2F3644]'
                         }`}
                       >
                         {preset.label}
                       </button>
                     ))}
-                    <span className="text-[11px] text-slate-500 ml-2 hidden sm:inline">
-                      Scroll wheel to zoom · Drag to pan · Double-click to toggle
-                    </span>
                   </div>
                 </div>
               )}
 
-              {/* Interactive Viewport */}
               <div
-                className={`p-6 bg-[#11151C] flex-1 flex flex-col items-center justify-center min-h-[340px] max-h-[65vh] overflow-hidden select-none ${
+                className={`p-6 bg-[#14171D] flex-1 flex flex-col items-center justify-center min-h-[340px] max-h-[65vh] overflow-hidden select-none ${
                   isZoomableMedia && modalZoom > 1
                     ? isDragging
                       ? 'cursor-grabbing'
@@ -647,28 +644,45 @@ export const ExplorerInspector: React.FC<ExplorerInspectorProps> = ({
                   }
                 }}
               >
-                {previewUrl && isImage ? (
+                {previewUrl && isImage && failedPreviewUrl !== previewUrl ? (
                   <img
+                    key={previewUrl}
                     src={previewUrl}
                     alt={focusedFile.filename}
                     referrerPolicy="no-referrer"
+                    onError={() => setFailedPreviewUrl(previewUrl)}
                     draggable={false}
-                    style={{
-                      transform: `translate(${panX}px, ${panY}px) scale(${modalZoom})`,
-                    }}
+                    style={{ transform: `translate(${panX}px, ${panY}px) scale(${modalZoom})` }}
                     className={`max-h-[54vh] object-contain rounded ${
                       isDragging ? '' : 'transition-transform duration-150 ease-out'
                     }`}
                   />
+                ) : isImage ? (
+                  <div className="w-full max-w-xl space-y-3 text-center">
+                    <div className="inline-flex items-center gap-2 px-3 py-1.5 rounded-md bg-amber-500/10 border border-amber-500/30 text-amber-200 text-xs">
+                      <ImageIcon className="w-4 h-4" />
+                      <span>
+                        Browser cannot decode partial bitstream — displaying carved hex header
+                      </span>
+                    </div>
+                    <div className="max-h-[44vh] overflow-auto text-left">
+                      <HexViewer
+                        bytes={focusedFile.data}
+                        baseOffset={focusedFile.offset}
+                        maxBytes={512}
+                        title="Image Payload Hex"
+                        highlightStart={focusedFile.matchedOffset}
+                        highlightEnd={focusedFile.matchedOffset + focusedFile.matchedLength}
+                      />
+                    </div>
+                  </div>
                 ) : previewUrl && isAudio ? (
                   <audio controls src={previewUrl} className="w-full max-w-md" />
                 ) : previewUrl && isVideo ? (
                   <video
                     controls
                     src={previewUrl}
-                    style={{
-                      transform: `translate(${panX}px, ${panY}px) scale(${modalZoom})`,
-                    }}
+                    style={{ transform: `translate(${panX}px, ${panY}px) scale(${modalZoom})` }}
                     className={`max-h-[54vh] rounded ${
                       isDragging ? '' : 'transition-transform duration-150 ease-out'
                     }`}
@@ -691,10 +705,14 @@ export const ExplorerInspector: React.FC<ExplorerInspectorProps> = ({
                 )}
               </div>
 
-              {/* Lightbox Footer */}
-              <div className="px-4 py-3 border-t border-[#2A3446] bg-[#141922] flex items-center justify-between gap-2">
-                <div className="text-xs text-slate-400">
-                  {focusedFile.recoveryReason}
+              <div className="px-4 py-3 border-t border-[#2A2E39] bg-[#16181F] flex items-center justify-between gap-2">
+                <div className="text-xs text-slate-400 flex items-center gap-2">
+                  {focusedFile.status === 'OK' || focusedFile.repaired ? (
+                    <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
+                  ) : (
+                    <ShieldAlert className="w-3.5 h-3.5 text-amber-400 shrink-0" />
+                  )}
+                  <span>{focusedFile.recoveryReason}</span>
                 </div>
                 <div className="flex items-center gap-2 shrink-0">
                   {focusedFile.status === 'OK_TRUNCATED' && !focusedFile.repaired && (
@@ -709,8 +727,8 @@ export const ExplorerInspector: React.FC<ExplorerInspectorProps> = ({
                   )}
                   <button
                     type="button"
-                    onClick={() => handleDownloadFile(focusedFile)}
-                    className="inline-flex items-center gap-1.5 px-4 py-1.5 text-xs font-medium bg-[#2E7CF6] text-white rounded-md hover:bg-[#2569D6]"
+                    onClick={() => void handleDownloadFile(focusedFile)}
+                    className="inline-flex items-center gap-1.5 px-4 py-1.5 text-xs font-medium bg-[#3A7AFE] text-white rounded-md hover:bg-[#2F6EEB]"
                   >
                     <Download className="w-3.5 h-3.5" />
                     Save File
@@ -724,92 +742,117 @@ export const ExplorerInspector: React.FC<ExplorerInspectorProps> = ({
     );
   }
 
-  // --- Mode B: Partition / Disk Inspector ---
+  // --- Mode B: Partition / Disk Inspector (Matches Screenshot 2 right pane) ---
   const sectorOffset = inspectLba * analysis.sectorSize;
   const sectorSlice = diskBytes.subarray(sectorOffset, sectorOffset + analysis.sectorSize);
   const isLost = focusedPartition?.status === 'Deleted / Lost';
 
   return (
-    <aside className="w-80 xl:w-96 shrink-0 bg-[#181E29] border-l border-[#2A3446] flex flex-col overflow-y-auto">
-      <div className="p-4 space-y-4 animate-row-fade">
-        <div className="bg-[#11151C] rounded-md border border-[#2A3446] p-4 flex items-center gap-3">
-          <div className="w-10 h-10 rounded-md bg-[#2E7CF6]/15 border border-[#2E7CF6]/30 flex items-center justify-center shrink-0">
-            <HardDrive className="w-5 h-5 text-[#38BDF8]" />
-          </div>
-          <div className="min-w-0">
-            <div className="text-xs font-semibold text-slate-100 truncate">
-              {focusedPartition ? focusedPartition.name : analysis.diskName}
-            </div>
-            <div className="text-[11px] text-slate-400 tabular-nums mt-0.5">
-              {focusedPartition
-                ? `${focusedPartition.detectedFs?.filesystem ?? focusedPartition.typeName} · ${formatBytes(focusedPartition.sizeBytes)}`
-                : `${analysis.arch} · ${formatBytes(analysis.diskSizeBytes)}`}
-            </div>
+    <aside className="w-72 xl:w-[304px] shrink-0 bg-[#1E2129] border-l border-[#2A2E39] flex flex-col relative">
+      <div className="flex-1 overflow-y-auto p-4 pb-16 space-y-4 animate-row-fade">
+        <div className="bg-[#14171D] rounded-md border border-[#2A2E39] p-6 flex items-center justify-center">
+          <div className="w-16 h-16 rounded-lg bg-[#3A7AFE]/20 border border-[#3A7AFE]/40 flex items-center justify-center">
+            <HardDrive className="w-8 h-8 text-[#4C8DFF]" />
           </div>
         </div>
 
-        {isLost && focusedPartition && (
-          <button
-            type="button"
-            onClick={() => onRestorePartitionToMbr(focusedPartition)}
-            className="w-full inline-flex items-center justify-center gap-1.5 py-2 px-3 rounded-md text-xs font-medium bg-[#2E7CF6] text-white hover:bg-[#2569D6] transition-colors"
-          >
-            <Wrench className="w-3.5 h-3.5" />
-            Restore Lost Partition to MBR
-          </button>
+        <button
+          type="button"
+          onClick={() => {
+            if (isLost && focusedPartition) {
+              onRestorePartitionToMbr(focusedPartition);
+            } else {
+              setShowHex((v) => !v);
+            }
+          }}
+          className="w-full py-2 px-4 rounded-md text-xs font-medium bg-[#2B303C] hover:bg-[#343B49] text-slate-100 transition-colors"
+        >
+          {isLost && focusedPartition
+            ? 'Restore Partition'
+            : showHex
+              ? 'Hide Sector Hex'
+              : 'Inspect Sector Hex'}
+        </button>
+
+        {focusedPartition?.detectedFs?.encrypted === 'BitLocker' && (
+          <div className="p-3 rounded-md bg-amber-500/10 border border-amber-500/30 text-amber-200 text-xs space-y-1">
+            <div className="font-semibold text-amber-100">BitLocker Volume (-FVE-FS-)</div>
+            <p className="text-amber-200/90 leading-relaxed">
+              This partition is encrypted with Windows BitLocker. Raw sector carving cannot decode
+              encrypted clusters until the volume is unlocked in Windows.
+            </p>
+          </div>
         )}
 
-        <div className="space-y-2 text-xs">
-          <div className="flex justify-between py-1 border-b border-[#2A3446]">
-            <span className="text-slate-400">Scheme / Signature</span>
-            <span className="font-mono text-slate-200">
-              {analysis.arch} ({analysis.mbrSignatureValid ? '0x55AA' : 'No sig'})
-            </span>
-          </div>
-          {focusedPartition ? (
-            <>
-              <div className="flex justify-between py-1 border-b border-[#2A3446]">
-                <span className="text-slate-400">LBA Range</span>
-                <span className="font-mono text-slate-200 tabular-nums">
-                  {focusedPartition.startLba} – {focusedPartition.endLba}
-                </span>
-              </div>
-              {focusedPartition.detectedFs && (
-                <div className="flex justify-between py-1 border-b border-[#2A3446]">
-                  <span className="text-slate-400">Boot / Superblock</span>
-                  <span className="text-slate-200 text-right">
-                    {focusedPartition.detectedFs.details}
-                  </span>
-                </div>
-              )}
-            </>
-          ) : (
-            <div className="flex justify-between py-1 border-b border-[#2A3446]">
-              <span className="text-slate-400">Total Sectors</span>
-              <span className="font-mono text-slate-200 tabular-nums">
-                {analysis.totalSectors.toLocaleString()} × {analysis.sectorSize} B
-              </span>
+        <div className="space-y-3 text-xs pt-1">
+          <div>
+            <div className="text-slate-400 text-[11px]">Name</div>
+            <div className="text-slate-100 mt-0.5 font-medium truncate">
+              {focusedPartition ? focusedPartition.name : analysis.diskName}
             </div>
-          )}
+          </div>
+
+          <div>
+            <div className="text-slate-400 text-[11px]">Size</div>
+            <div className="text-slate-200 mt-0.5 font-mono tabular-nums">
+              {formatBytes(focusedPartition ? focusedPartition.sizeBytes : analysis.diskSizeBytes)}
+            </div>
+          </div>
+
+          <div>
+            <div className="text-slate-400 text-[11px]">Type</div>
+            <div className="text-slate-200 mt-0.5">
+              {focusedPartition
+                ? `${focusedPartition.detectedFs?.filesystem ?? focusedPartition.typeName} Volume`
+                : `${analysis.arch} Disk`}
+            </div>
+          </div>
+
+          <div>
+            <div className="text-slate-400 text-[11px]">Path</div>
+            <div className="text-slate-200 mt-0.5 font-mono tabular-nums">
+              {focusedPartition
+                ? `LBA ${focusedPartition.startLba} – ${focusedPartition.endLba}`
+                : `${analysis.totalSectors.toLocaleString()} × ${analysis.sectorSize} B`}
+            </div>
+          </div>
         </div>
 
-        <HexViewer
-          bytes={sectorSlice}
-          baseOffset={sectorOffset}
-          maxBytes={512}
-          title={inspectLba === 0 ? 'Sector 0 — MBR Table' : `Sector ${inspectLba}`}
-          highlightStart={inspectLba === 0 ? 0x1be : undefined}
-          highlightEnd={inspectLba === 0 ? 0x200 : undefined}
-          currentLba={inspectLba}
-          maxLba={Math.max(0, analysis.totalSectors - 1)}
-          onStepSector={(delta) =>
-            setSectorOverride({
-              partitionKey,
-              lba: Math.max(0, Math.min(analysis.totalSectors - 1, inspectLba + delta)),
-            })
-          }
-        />
+        {showHex && sectorSlice.length > 0 && (
+          <HexViewer
+            bytes={sectorSlice}
+            baseOffset={sectorOffset}
+            maxBytes={256}
+            title={inspectLba === 0 ? 'Sector 0 — MBR Table' : `Sector ${inspectLba}`}
+            highlightStart={inspectLba === 0 ? 0x1be : undefined}
+            highlightEnd={inspectLba === 0 ? 0x200 : undefined}
+            currentLba={inspectLba}
+            maxLba={Math.max(0, analysis.totalSectors - 1)}
+            onStepSector={(delta) =>
+              setSectorOverride({
+                partitionKey,
+                lba: Math.max(0, Math.min(analysis.totalSectors - 1, inspectLba + delta)),
+              })
+            }
+          />
+        )}
       </div>
+
+      <button
+        type="button"
+        onClick={() => {
+          if (isLost && focusedPartition) {
+            onRestorePartitionToMbr(focusedPartition);
+          } else {
+            setShowHex((v) => !v);
+          }
+        }}
+        title="Partition and sector tools"
+        aria-label="Partition tools"
+        className="absolute bottom-4 right-4 w-9 h-9 rounded-full bg-[#2B303C] hover:bg-[#3A7AFE] border border-[#3B4252] text-[#60A5FA] hover:text-white shadow-lg flex items-center justify-center transition-colors"
+      >
+        <Wrench className="w-4 h-4" />
+      </button>
     </aside>
   );
 };

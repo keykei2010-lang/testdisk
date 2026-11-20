@@ -42,6 +42,14 @@ export const DriveHubModal: React.FC<DriveHubModalProps> = ({
   const [scanningBin, setScanningBin] = useState<boolean>(false);
 
   useEffect(() => {
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') onClose();
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [onClose]);
+
+  useEffect(() => {
     if (!desktop) return;
     let active = true;
     desktop
@@ -70,7 +78,7 @@ export const DriveHubModal: React.FC<DriveHubModalProps> = ({
 
   return (
     <div className="fixed inset-0 z-50 bg-black/65 flex items-center justify-center p-4 animate-backdrop-in">
-      <div className="w-full max-w-2xl max-h-[86vh] flex flex-col rounded-lg bg-[#181E29] border border-[#2A3446] shadow-2xl overflow-hidden animate-modal-in">
+      <div className="w-full max-w-2xl max-h-[86vh] flex flex-col rounded-lg bg-[#222630] border border-[#343A48] shadow-2xl overflow-hidden animate-modal-in">
         <div className="flex items-center justify-between px-5 py-3.5 border-b border-[#2A3446]">
           <div className="flex items-center gap-2">
             <HardDrive className="w-4 h-4 text-[#38BDF8]" />
@@ -105,7 +113,7 @@ export const DriveHubModal: React.FC<DriveHubModalProps> = ({
                     setScanningBin(false);
                   }
                 }}
-                className="flex items-center gap-3 p-3.5 rounded-md bg-[#11151C] border border-[#2A3446] hover:border-[#2E7CF6] hover:bg-[#1A212E] text-left transition-colors"
+                className="flex items-center gap-3 p-3.5 rounded-md bg-[#181B22] border border-[#2D3342] hover:border-[#2E7CF6] hover:bg-[#1A212E] text-left transition-colors"
               >
                 <div className="w-9 h-9 rounded-md bg-amber-500/15 border border-amber-500/35 flex items-center justify-center shrink-0">
                   <Trash2 className="w-4 h-4 text-amber-400" />
@@ -128,7 +136,7 @@ export const DriveHubModal: React.FC<DriveHubModalProps> = ({
                   onClose();
                   onScanFolder();
                 }}
-                className="flex items-center gap-3 p-3.5 rounded-md bg-[#11151C] border border-[#2A3446] hover:border-[#2E7CF6] hover:bg-[#1A212E] text-left transition-colors"
+                className="flex items-center gap-3 p-3.5 rounded-md bg-[#181B22] border border-[#2D3342] hover:border-[#2E7CF6] hover:bg-[#1A212E] text-left transition-colors"
               >
                 <div className="w-9 h-9 rounded-md bg-[#2E7CF6]/15 border border-[#2E7CF6]/35 flex items-center justify-center shrink-0">
                   <FolderSearch className="w-4 h-4 text-[#38BDF8]" />
@@ -160,7 +168,7 @@ export const DriveHubModal: React.FC<DriveHubModalProps> = ({
                 </button>
               </div>
               {winDrives.length === 0 ? (
-                <div className="p-3 rounded-md bg-[#11151C] border border-[#2A3446] text-slate-400">
+                <div className="p-3 rounded-md bg-[#181B22] border border-[#2D3342] text-slate-400">
                   Querying Windows physical drives... Ensure app is running as Administrator.
                 </div>
               ) : (
@@ -168,7 +176,7 @@ export const DriveHubModal: React.FC<DriveHubModalProps> = ({
                   {winDrives.map((drv) => (
                     <div
                       key={drv.devicePath}
-                      className="flex items-center justify-between p-3 rounded-md bg-[#11151C] border border-[#2A3446] hover:border-[#3B4963]"
+                      className="flex items-center justify-between p-3 rounded-md bg-[#181B22] border border-[#2D3342] hover:border-[#3B4963]"
                     >
                       <div className="flex items-center gap-2.5 min-w-0">
                         {drv.busType === 'USB' ? (
@@ -203,7 +211,7 @@ export const DriveHubModal: React.FC<DriveHubModalProps> = ({
                             setOpeningDrive(null);
                           }
                         }}
-                        className="inline-flex items-center gap-1 px-3 py-1.5 rounded bg-[#2E7CF6] hover:bg-[#2569D6] disabled:opacity-40 text-white font-medium shrink-0"
+                        className="inline-flex items-center gap-1 px-3 py-1.5 rounded bg-[#3A7AFE] hover:bg-[#2F6EEB] disabled:opacity-40 text-white font-medium shrink-0"
                       >
                         <Play className="w-3 h-3" />
                         {openingDrive === drv.devicePath ? 'Scanning...' : 'Scan Drive'}
@@ -216,12 +224,15 @@ export const DriveHubModal: React.FC<DriveHubModalProps> = ({
           )}
 
           {/* Disk Summary Header */}
-          <div className="bg-[#11151C] border border-[#2A3446] rounded-md p-4 flex flex-wrap items-center justify-between gap-4">
+          <div className="bg-[#181B22] border border-[#2D3342] rounded-md p-4 flex flex-wrap items-center justify-between gap-4">
             <div className="space-y-1">
-              <div className="text-sm font-semibold text-slate-100">{analysis.diskName}</div>
+              <div className="text-sm font-semibold text-slate-100">
+                {analysis.diskSizeBytes > 0 ? analysis.diskName : 'No Raw Disk Image Loaded'}
+              </div>
               <div className="text-slate-400 font-mono tabular-nums">
-                {analysis.arch} · {formatBytes(analysis.diskSizeBytes)} ·{' '}
-                {analysis.totalSectors.toLocaleString()} sectors ({analysis.sectorSize} B/sector)
+                {analysis.diskSizeBytes > 0
+                  ? `${analysis.arch} · ${formatBytes(analysis.diskSizeBytes)} · ${analysis.totalSectors.toLocaleString()} sectors (${analysis.sectorSize} B/sector)`
+                  : 'Open a .img, .dd, .raw, or .iso file to inspect its partition map'}
               </div>
             </div>
             <button
@@ -237,104 +248,108 @@ export const DriveHubModal: React.FC<DriveHubModalProps> = ({
             </button>
           </div>
 
-          {/* Visual Partition Map Bar */}
-          <div className="space-y-2">
-            <div className="flex items-center justify-between text-slate-300 font-medium">
-              <span>Loaded Image Partition Map</span>
-              <span className="text-slate-400 font-mono tabular-nums">
-                MBR Sig: {analysis.mbrSignatureValid ? '0x55AA Valid' : 'Missing'}
-              </span>
-            </div>
-            <div className="h-7 rounded-md bg-[#11151C] border border-[#2A3446] overflow-hidden flex p-0.5 gap-0.5">
-              {analysis.partitions.map((part) => {
-                const widthPct = Math.max(8, (part.sectors / totalSectors) * 100);
-                const isLost = part.status === 'Deleted / Lost';
-                return (
-                  <button
-                    key={part.id}
-                    type="button"
-                    onClick={() => {
-                      onStartTargetedScan(part);
-                      onClose();
-                    }}
-                    style={{ width: `${widthPct}%` }}
-                    className={`h-full rounded-xs px-2 text-[11px] font-mono truncate flex items-center justify-center transition-opacity hover:opacity-90 ${
-                      isLost
-                        ? 'bg-amber-500/25 border border-amber-500/50 text-amber-200'
-                        : 'bg-[#2E7CF6]/25 border border-[#2E7CF6]/45 text-sky-200'
-                    }`}
-                    title={`Click to scan ${part.name} (LBA ${part.startLba}–${part.endLba})`}
-                  >
-                    {part.detectedFs?.filesystem ?? part.typeName}
-                  </button>
-                );
-              })}
-            </div>
-          </div>
-
-          {/* Target Selection List */}
-          <div className="space-y-2">
-            <div
-              onClick={() => {
-                onStartTargetedScan(null);
-                onClose();
-              }}
-              className={`flex items-center justify-between p-3 rounded-md border cursor-pointer transition-colors ${
-                activePartitionScope === null
-                  ? 'bg-[#283244] border-[#2E7CF6]'
-                  : 'bg-[#1F2735] border-[#2A3446] hover:bg-[#242D3D]'
-              }`}
-            >
-              <div>
-                <div className="font-semibold text-slate-100">
-                  Full Loaded Image Scan (All Partitions + Unallocated Space)
+          {analysis.diskSizeBytes > 0 && (
+            <>
+              {/* Visual Partition Map Bar */}
+              <div className="space-y-2">
+                <div className="flex items-center justify-between text-slate-300 font-medium">
+                  <span>Loaded Image Partition Map</span>
+                  <span className="text-slate-400 font-mono tabular-nums">
+                    MBR Sig: {analysis.mbrSignatureValid ? '0x55AA Valid' : 'Missing'}
+                  </span>
                 </div>
-                <div className="text-slate-400 font-mono tabular-nums mt-0.5">
-                  LBA 0 – {analysis.totalSectors - 1} · {formatBytes(analysis.diskSizeBytes)}
+                <div className="h-7 rounded-md bg-[#181B22] border border-[#2D3342] overflow-hidden flex p-0.5 gap-0.5">
+                  {analysis.partitions.map((part) => {
+                    const widthPct = Math.max(8, (part.sectors / totalSectors) * 100);
+                    const isLost = part.status === 'Deleted / Lost';
+                    return (
+                      <button
+                        key={part.id}
+                        type="button"
+                        onClick={() => {
+                          onStartTargetedScan(part);
+                          onClose();
+                        }}
+                        style={{ width: `${widthPct}%` }}
+                        className={`h-full rounded-xs px-2 text-[11px] font-mono truncate flex items-center justify-center transition-opacity hover:opacity-90 ${
+                          isLost
+                            ? 'bg-amber-500/25 border border-amber-500/50 text-amber-200'
+                            : 'bg-[#2E7CF6]/25 border border-[#2E7CF6]/45 text-sky-200'
+                        }`}
+                        title={`Click to scan ${part.name} (LBA ${part.startLba}–${part.endLba})`}
+                      >
+                        {part.detectedFs?.filesystem ?? part.typeName}
+                      </button>
+                    );
+                  })}
                 </div>
               </div>
-              <span className="inline-flex items-center gap-1 px-2.5 py-1 rounded bg-[#2E7CF6] text-white font-medium">
-                <Play className="w-3 h-3" /> Scan All
-              </span>
-            </div>
 
-            {analysis.partitions.map((part) => {
-              const isLost = part.status === 'Deleted / Lost';
-              const isSelected = activePartitionScope === part.id;
-              return (
+              {/* Target Selection List */}
+              <div className="space-y-2">
                 <div
-                  key={part.id}
                   onClick={() => {
-                    onStartTargetedScan(part);
+                    onStartTargetedScan(null);
                     onClose();
                   }}
                   className={`flex items-center justify-between p-3 rounded-md border cursor-pointer transition-colors ${
-                    isSelected
+                    activePartitionScope === null
                       ? 'bg-[#283244] border-[#2E7CF6]'
                       : 'bg-[#1F2735] border-[#2A3446] hover:bg-[#242D3D]'
                   }`}
                 >
-                  <div className="min-w-0">
-                    <div className="flex items-center gap-2">
-                      {isLost && <ShieldAlert className="w-3.5 h-3.5 text-amber-400 shrink-0" />}
-                      <span className="font-semibold text-slate-100 truncate">
-                        {isLost
-                          ? `Lost Partition (${part.detectedFs?.filesystem ?? part.typeName})`
-                          : `${part.detectedFs?.filesystem ?? part.typeName} · ${part.name}`}
-                      </span>
+                  <div>
+                    <div className="font-semibold text-slate-100">
+                      Full Loaded Image Scan (All Partitions + Unallocated Space)
                     </div>
                     <div className="text-slate-400 font-mono tabular-nums mt-0.5">
-                      LBA {part.startLba} – {part.endLba} · {formatBytes(part.sizeBytes)} ·{' '}
-                      {part.detectedFs?.details ?? part.typeName}
+                      LBA 0 – {analysis.totalSectors - 1} · {formatBytes(analysis.diskSizeBytes)}
                     </div>
                   </div>
-                  <span className="inline-flex items-center gap-1 px-2.5 py-1 rounded bg-[#141922] border border-[#2A3446] text-slate-200 hover:text-white shrink-0">
-                    <Play className="w-3 h-3 text-[#38BDF8]" /> Scan Range
+                  <span className="inline-flex items-center gap-1 px-2.5 py-1 rounded bg-[#2E7CF6] text-white font-medium">
+                    <Play className="w-3 h-3" /> Scan All
                   </span>
                 </div>
-              );
-            })}
-          </div>
+
+                {analysis.partitions.map((part) => {
+                  const isLost = part.status === 'Deleted / Lost';
+                  const isSelected = activePartitionScope === part.id;
+                  return (
+                    <div
+                      key={part.id}
+                      onClick={() => {
+                        onStartTargetedScan(part);
+                        onClose();
+                      }}
+                      className={`flex items-center justify-between p-3 rounded-md border cursor-pointer transition-colors ${
+                        isSelected
+                          ? 'bg-[#283244] border-[#2E7CF6]'
+                          : 'bg-[#1F2735] border-[#2A3446] hover:bg-[#242D3D]'
+                      }`}
+                    >
+                      <div className="min-w-0">
+                        <div className="flex items-center gap-2">
+                          {isLost && <ShieldAlert className="w-3.5 h-3.5 text-amber-400 shrink-0" />}
+                          <span className="font-semibold text-slate-100 truncate">
+                            {isLost
+                              ? `Lost Partition (${part.detectedFs?.filesystem ?? part.typeName})`
+                              : `${part.detectedFs?.filesystem ?? part.typeName} · ${part.name}`}
+                          </span>
+                        </div>
+                        <div className="text-slate-400 font-mono tabular-nums mt-0.5">
+                          LBA {part.startLba} – {part.endLba} · {formatBytes(part.sizeBytes)} ·{' '}
+                          {part.detectedFs?.details ?? part.typeName}
+                        </div>
+                      </div>
+                      <span className="inline-flex items-center gap-1 px-2.5 py-1 rounded bg-[#141922] border border-[#2A3446] text-slate-200 hover:text-white shrink-0">
+                        <Play className="w-3 h-3 text-[#38BDF8]" /> Scan Range
+                      </span>
+                    </div>
+                  );
+                })}
+              </div>
+            </>
+          )}
         </div>
       </div>
     </div>

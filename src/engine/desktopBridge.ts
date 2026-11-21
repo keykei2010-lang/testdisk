@@ -26,6 +26,8 @@ export interface NativeScannedEntry {
   size: number;
   modifiedAt: number;
   sourceKind: 'recycle-bin' | 'folder' | 'carved' | 'ntfs-mft';
+  isDeleted?: boolean;
+  scanPhase?: 'quick' | 'deep' | 'vss' | 'usn';
   offset: number;
   sector: number;
   devicePath: string;
@@ -40,6 +42,7 @@ export interface NativeScannedEntry {
 
 export interface NativeScanProgressEvent {
   scanId: string;
+  phase?: 'quick' | 'deep';
   currentBytes: number;
   totalBytes: number;
   percent: number;
@@ -51,6 +54,26 @@ export interface NativeScanProgressEvent {
 export interface NativeScanBatchEvent {
   scanId: string;
   entries: NativeScannedEntry[];
+}
+
+export interface LocationScanResponse {
+  entries: NativeScannedEntry[];
+  path?: string;
+  deletedLookupStatus?: 'scanned' | 'needs-admin' | 'unsupported';
+  backingDrive?: {
+    devicePath: string;
+    totalBytes: number;
+    label: string;
+    relPrefix?: string;
+  };
+}
+
+export interface BitLockerVolumeInfo {
+  mountPoint: string;
+  encryptionMethod: string;
+  volumeStatus: string;
+  protectionStatus: string;
+  lockStatus: string;
 }
 
 export interface NativeRecoverRequestItem {
@@ -72,6 +95,12 @@ export interface DesktopBridge {
   platform: string;
   listWindowsDrives: () => Promise<WindowsDriveInfo[]>;
   listWindowsVolumes: () => Promise<WindowsVolumeInfo[]>;
+  listBitLockerVolumes: () => Promise<BitLockerVolumeInfo[]>;
+  unlockBitLocker: (params: {
+    driveLetter: string;
+    recoveryKey?: string;
+    password?: string;
+  }) => Promise<{ ok: boolean; message?: string; error?: string }>;
   readDiskBytes: (
     devicePath: string,
     startByte?: number,
@@ -79,14 +108,18 @@ export interface DesktopBridge {
   ) => Promise<Uint8Array>;
   pickDiskImage: () => Promise<{ path: string; name: string; sizeBytes: number } | null>;
   pickFolder: () => Promise<string | null>;
-  scanFolder: (folderPath: string) => Promise<NativeScannedEntry[]>;
-  scanRecycleBin: () => Promise<NativeScannedEntry[]>;
-  scanDesktop: () => Promise<{ path: string; entries: NativeScannedEntry[] }>;
+  scanFolder: (folderPath: string) => Promise<LocationScanResponse>;
+  scanRecycleBin: () => Promise<LocationScanResponse>;
+  scanDesktop: () => Promise<LocationScanResponse>;
   startDriveScan: (params: {
     scanId: string;
     devicePath: string;
     totalBytes: number;
     blockSize: number;
+    scanMode?: 'quick' | 'full';
+    startPhase?: 'quick' | 'deep';
+    includeExisting?: boolean;
+    pathFilter?: string;
     resumeOffset?: number;
   }) => Promise<NativeScannedEntry[]>;
   pauseDriveScan: (scanId: string) => Promise<void>;

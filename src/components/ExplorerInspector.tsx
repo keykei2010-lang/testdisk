@@ -28,7 +28,8 @@ interface ExplorerInspectorProps {
   analysis: DiskAnalysisResult;
   diskBytes: Uint8Array;
   onRestorePartitionToMbr: (partition: PartitionEntry) => void;
-  onRepairFile: (item: ExplorerFileItem) => void;
+  onRepairFile: (item: ExplorerFileItem, referenceBytes?: Uint8Array) => void;
+  onBitLockerUnlocked?: () => void;
   lightboxOpen: boolean;
   onSetLightboxOpen: (open: boolean) => void;
 }
@@ -50,9 +51,16 @@ export const ExplorerInspector: React.FC<ExplorerInspectorProps> = ({
   diskBytes,
   onRestorePartitionToMbr,
   onRepairFile,
+  onBitLockerUnlocked,
   lightboxOpen,
   onSetLightboxOpen,
 }) => {
+  const desktop = getDesktopBridge();
+  const [blLetter, setBlLetter] = useState<string>('C:');
+  const [blSecret, setBlSecret] = useState<string>('');
+  const [blSecretType, setBlSecretType] = useState<'key' | 'password'>('key');
+  const [blNotice, setBlNotice] = useState<string | null>(null);
+  const [blBusy, setBlBusy] = useState<boolean>(false);
   const partitionKey = focusedPartition?.id ?? 'disk-root';
   const [sectorOverride, setSectorOverride] = useState<{
     partitionKey: string;
@@ -377,6 +385,23 @@ export const ExplorerInspector: React.FC<ExplorerInspectorProps> = ({
               </div>
 
               <div>
+                <div className="text-slate-400 text-[11px]">State</div>
+                <div
+                  className={`mt-0.5 font-medium ${
+                    focusedFile.isDeleted === false ? 'text-slate-200' : 'text-amber-300'
+                  }`}
+                >
+                  {focusedFile.isDeleted === false
+                    ? 'Existing Active File'
+                    : focusedFile.scanPhase === 'vss'
+                      ? 'Deleted (Recovered via Shadow Copy)'
+                      : focusedFile.scanPhase === 'usn'
+                        ? 'Deleted (NTFS Journal History)'
+                        : 'Deleted · Recoverable'}
+                </div>
+              </div>
+
+              <div>
                 <div className="text-slate-400 text-[11px]">Path</div>
                 <div
                   className="text-slate-200 mt-0.5 truncate"
@@ -406,14 +431,35 @@ export const ExplorerInspector: React.FC<ExplorerInspectorProps> = ({
               </div>
 
               {focusedFile.status === 'OK_TRUNCATED' && !focusedFile.repaired && (
-                <button
-                  type="button"
-                  onClick={() => onRepairFile(focusedFile)}
-                  className="w-full inline-flex items-center justify-center gap-1.5 py-1.5 px-3 rounded-md text-xs font-medium bg-amber-500/15 border border-amber-500/35 text-amber-200 hover:bg-amber-500/25 transition-colors"
-                >
-                  <Wrench className="w-3.5 h-3.5" />
-                  Repair Corrupted Structure
-                </button>
+                <div className="space-y-1.5">
+                  <button
+                    type="button"
+                    onClick={() => onRepairFile(focusedFile)}
+                    className="w-full inline-flex items-center justify-center gap-1.5 py-1.5 px-3 rounded-md text-xs font-medium bg-amber-500/15 border border-amber-500/35 text-amber-200 hover:bg-amber-500/25 transition-colors"
+                  >
+                    <Wrench className="w-3.5 h-3.5" />
+                    Repair Corrupted Structure
+                  </button>
+                  {['mp4', 'mov', 'm4v'].includes(focusedFile.extension.toLowerCase()) && (
+                    <label className="block w-full text-center py-1 px-2.5 rounded border border-[#343A48] bg-[#242934] hover:bg-[#2C3342] text-[11px] text-slate-200 cursor-pointer transition-colors">
+                      Repair with Healthy Reference Video (.mp4/.mov)
+                      <input
+                        type="file"
+                        accept=".mp4,.mov,.m4v"
+                        className="hidden"
+                        onChange={async (e) => {
+                          const f = e.target.files?.[0];
+                          if (!f) return;
+                          const refBytes = new Uint8Array(
+                            await f.slice(0, 8 * 1024 * 1024).arrayBuffer(),
+                          );
+                          onRepairFile(focusedFile, refBytes);
+                          e.target.value = '';
+                        }}
+                      />
+                    </label>
+                  )}
+                </div>
               )}
 
               {focusedFile.metadata.camera && (
@@ -775,12 +821,64 @@ export const ExplorerInspector: React.FC<ExplorerInspectorProps> = ({
         </button>
 
         {focusedPartition?.detectedFs?.encrypted === 'BitLocker' && (
-          <div className="p-3 rounded-md bg-amber-500/10 border border-amber-500/30 text-amber-200 text-xs space-y-1">
+          <div className="p-3 rounded-md bg-amber-500/10 border border-amber-500/30 text-amber-200 text-xs space-y-2">
             <div className="font-semibold text-amber-100">BitLocker Volume (-FVE-FS-)</div>
             <p className="text-amber-200/90 leading-relaxed">
               This partition is encrypted with Windows BitLocker. Raw sector carving cannot decode
-              encrypted clusters until the volume is unlocked in Windows.
+              encrypted clusters until the volume is unlocked.
             </p>
+            {desktop && (
+              <div className="space-y-1.5 pt-1 border-t border-amber-500/25">
+                <div className="flex gap-1.5">
+                  <input
+                    type="text"
+                    value={blLetter}
+                    onChange={(e) => setBlLetter(e.target.value)}
+                    placeholder="D:"
+                    className="w-12 px-2 py-1 rounded bg-[#14171D] border border-amber-500/30 text-slate-100 text-[11px] font-mono"
+                    aria-label="BitLocker drive letter"
+                  />
+                  <select
+                    value={blSecretType}
+                    onChange={(e) => setBlSecretType(e.target.value as 'key' | 'password')}
+                    className="flex-1 px-2 py-1 rounded bg-[#14171D] border border-amber-500/30 text-slate-100 text-[11px]"
+                  >
+                    <option value="key">48-Digit Recovery Key</option>
+                    <option value="password">Password</option>
+                  </select>
+                </div>
+                <input
+                  type="password"
+                  value={blSecret}
+                  onChange={(e) => setBlSecret(e.target.value)}
+                  placeholder={blSecretType === 'key' ? 'XXXXXX-XXXXXX-...' : 'BitLocker password'}
+                  className="w-full px-2 py-1 rounded bg-[#14171D] border border-amber-500/30 text-slate-100 text-[11px] font-mono"
+                />
+                <button
+                  type="button"
+                  disabled={blBusy || !blSecret.trim()}
+                  onClick={async () => {
+                    setBlBusy(true);
+                    setBlNotice(null);
+                    try {
+                      const res = await desktop.unlockBitLocker({
+                        driveLetter: blLetter,
+                        recoveryKey: blSecretType === 'key' ? blSecret.trim() : undefined,
+                        password: blSecretType === 'password' ? blSecret.trim() : undefined,
+                      });
+                      setBlNotice(res.ok ? res.message || 'Unlocked successfully.' : res.error || 'Unlock failed.');
+                      if (res.ok && onBitLockerUnlocked) onBitLockerUnlocked();
+                    } finally {
+                      setBlBusy(false);
+                    }
+                  }}
+                  className="w-full py-1 px-2.5 rounded bg-amber-500/25 hover:bg-amber-500/35 text-amber-100 font-medium text-[11px] disabled:opacity-40"
+                >
+                  {blBusy ? 'Unlocking...' : 'Unlock BitLocker Volume'}
+                </button>
+                {blNotice && <div className="text-[11px] text-amber-100">{blNotice}</div>}
+              </div>
+            )}
           </div>
         )}
 

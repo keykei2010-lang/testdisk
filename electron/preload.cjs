@@ -5,6 +5,8 @@ contextBridge.exposeInMainWorld('desktopBridge', {
   platform: process.platform,
   listWindowsDrives: () => ipcRenderer.invoke('win:list-drives'),
   listWindowsVolumes: () => ipcRenderer.invoke('win:list-volumes'),
+  listBitLockerVolumes: () => ipcRenderer.invoke('win:list-bitlocker'),
+  unlockBitLocker: (params) => ipcRenderer.invoke('win:unlock-bitlocker', params),
   readDiskBytes: (devicePath, startByte, maxBytes) =>
     ipcRenderer.invoke('win:read-disk-bytes', { devicePath, startByte, maxBytes }),
   pickDiskImage: () => ipcRenderer.invoke('win:pick-disk-image'),

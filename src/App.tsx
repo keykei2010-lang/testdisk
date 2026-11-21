@@ -41,17 +41,20 @@ import {
   writeMbrPartitionTable,
 } from './engine/partitions';
 import {
+  CarvedFile,
   carveDiskBufferAsync,
   FILE_FORMATS,
   FileFamily,
   identifyBuffer,
 } from './engine/signatures';
 import {
+  DeletedFilter,
   ExplorerFileItem,
   GroupByKey,
   itemMatchesNode,
   RecoveryLikelihoodTier,
   SavedScanSession,
+  ScanMode,
   SelectedTreeNode,
   SerializedScanSessionItem,
   SortDir,
@@ -100,7 +103,28 @@ function inferFallbackFromExt(ext: string): {
   description: string;
 } {
   const e = ext.toLowerCase();
-  if (['jpg', 'jpeg', 'png', 'gif', 'bmp', 'webp', 'tif', 'tiff', 'svg', 'heic'].includes(e)) {
+  if (
+    [
+      'jpg',
+      'jpeg',
+      'png',
+      'gif',
+      'bmp',
+      'webp',
+      'tif',
+      'tiff',
+      'svg',
+      'heic',
+      'cr2',
+      'cr3',
+      'nef',
+      'arw',
+      'dng',
+      'raf',
+      'orf',
+      'rw2',
+    ].includes(e)
+  ) {
     return {
       family: 'Pictures',
       mimeType: e === 'jpg' || e === 'jpeg' ? 'image/jpeg' : e === 'svg' ? 'image/svg+xml' : `image/${e}`,
@@ -291,6 +315,7 @@ export const App: React.FC = () => {
   const [paranoid, setParanoid] = useState<boolean>(true);
   const [keepCorrupted, setKeepCorrupted] = useState<boolean>(true);
   const [statusFilter, setStatusFilter] = useState<'all' | 'ok' | 'truncated'>('all');
+  const [deletedFilter, setDeletedFilter] = useState<DeletedFilter>('all');
   const [likelihoodFilter, setLikelihoodFilter] = useState<'all' | RecoveryLikelihoodTier>('all');
   const [sizeFilter, setSizeFilter] = useState<'all' | 'small' | 'medium' | 'large'>('all');
   const [hideDuplicates, setHideDuplicates] = useState<boolean>(false);
@@ -300,7 +325,11 @@ export const App: React.FC = () => {
   const [scanPartitionScope, setScanPartitionScope] = useState<string | null>(null);
   const [scanNonce, setScanNonce] = useState<number>(0);
 
-  // Scan execution state
+  // Two-stage & execution state
+  const [scanMode, setScanMode] = useState<ScanMode>('full');
+  const [scanPhase, setScanPhase] = useState<'quick' | 'deep'>('quick');
+  const [completedQuickOnly, setCompletedQuickOnly] = useState<boolean>(false);
+  const [forceDeepRun, setForceDeepRun] = useState<boolean>(false);
   const [useNativeScan, setUseNativeScan] = useState<boolean>(false);
   const [isScanning, setIsScanning] = useState<boolean>(false);
   const [isPaused, setIsPaused] = useState<boolean>(false);
@@ -381,7 +410,7 @@ export const App: React.FC = () => {
     return () => window.removeEventListener('mousedown', onDown);
   }, []);
 
-  // Async sector carver effect for in-memory disk images (skipped during native streaming scans or before target loaded)
+  // Two-Stage Async Scan for in-memory disk images (Quick metadata first, then live-streaming Deep Sector Carving)
   useEffect(() => {
     if (useNativeScan || diskBytes.length === 0) return;
     let cancelled = false;
@@ -395,82 +424,60 @@ export const App: React.FC = () => {
       ? Math.min(diskBytes.length, (scopedPartition.endLba + 1) * analysis.sectorSize)
       : diskBytes.length;
 
-    const run = async () => {
-      const results = await carveDiskBufferAsync(
-        diskBytes,
-        {
-          startByte,
-          endByte,
-          blockSize,
-          paranoid,
-          keepCorrupted,
-          enabledFormats,
-        },
-        (prog) => {
-          if (cancelled) return;
-          setScanProgress({
-            currentSector: prog.currentSector,
-            totalSectors: prog.totalSectors,
-            percent: prog.percent,
-            foundCount: prog.foundCount,
-            foundBytes: prog.foundBytes,
-            latestFilename: prog.latestFile?.filename,
-          });
-        },
-        {
-          isCancelled: () => cancelled,
-          isPaused: () => isPausedRef.current,
-        },
-      );
-
-      if (cancelled) return;
-
-      const mapped: ExplorerFileItem[] = results.map((c) => {
-        const origin = mapOffsetToPartition(c.offset);
-        const assessment = computeRecoveryLikelihood({
-          status: c.status,
-          size: c.size,
-          calculatedSize: c.calculatedSize,
-          partitionId: origin.partitionId,
-          metadata: c.metadata,
-          extension: c.extension,
-          data: c.data,
-        });
-        return {
-          id: c.id,
-          filename: c.filename,
-          extension: c.extension,
-          family: c.family,
-          mimeType: c.mimeType,
-          size: c.size,
-          calculatedSize: c.calculatedSize,
-          status: c.status,
-          sourceKind: 'carved',
-          partitionId: origin.partitionId,
-          partitionName: origin.partitionName,
-          offset: c.offset,
-          sector: c.sector,
-          matchedOffset: 0,
-          matchedLength: 4,
-          metadata: c.metadata,
-          description: c.description,
-          data: c.data,
-          sourceRef: {
-            kind: 'memory',
-            offset: c.offset,
-            size: c.size,
-          },
-          modifiedAt: c.metadata.takenAtMs ?? deriveCarvedTimestamp(c.sector, origin.partitionId),
-          recoveryChance: assessment.chance,
-          recoveryTier: assessment.tier,
-          recoveryReason: assessment.reason,
-          contentFingerprint: computeContentFingerprint(c.size, c.data),
-        };
+    const mapCarved = (c: CarvedFile): ExplorerFileItem => {
+      const origin = mapOffsetToPartition(c.offset);
+      const assessment = computeRecoveryLikelihood({
+        status: c.status,
+        size: c.size,
+        calculatedSize: c.calculatedSize,
+        partitionId: origin.partitionId,
+        metadata: c.metadata,
+        extension: c.extension,
+        data: c.data,
       });
+      return {
+        id: c.id,
+        filename: c.filename,
+        extension: c.extension,
+        family: c.family,
+        mimeType: c.mimeType,
+        size: c.size,
+        calculatedSize: c.calculatedSize,
+        status: c.status,
+        sourceKind: 'carved',
+        isDeleted: true,
+        scanPhase: 'deep',
+        partitionId: origin.partitionId,
+        partitionName: origin.partitionName,
+        offset: c.offset,
+        sector: c.sector,
+        matchedOffset: 0,
+        matchedLength: 4,
+        metadata: c.metadata,
+        description: c.description,
+        data: c.data,
+        sourceRef: {
+          kind: 'memory',
+          offset: c.offset,
+          size: c.size,
+        },
+        modifiedAt: c.metadata.takenAtMs ?? deriveCarvedTimestamp(c.sector, origin.partitionId),
+        recoveryChance: assessment.chance,
+        recoveryTier: assessment.tier,
+        recoveryReason: assessment.reason,
+        contentFingerprint: computeContentFingerprint(c.size, c.data),
+      };
+    };
 
-      const rawMftRecords = scanNtfsMftRecordsInBuffer(diskBytes, analysis.partitions).filter(
-        (m) => !scopedPartition || m.partitionId === scopedPartition.id,
-      );
+    const run = async () => {
+      const runFullDepth = scanMode === 'full' || forceDeepRun;
+      setScanPhase('quick');
+      setCompletedQuickOnly(false);
+
+      // Stage 1: Fast Filesystem Metadata (NTFS $MFT + FAT32 + exFAT deleted + active records)
+      const rawMftRecords = scanNtfsMftRecordsInBuffer(diskBytes, analysis.partitions, {
+        includeExisting: true,
+      }).filter((m) => !scopedPartition || m.partitionId === scopedPartition.id);
       const mftMapped: ExplorerFileItem[] = rawMftRecords.map((m) => {
         const res = m.reconstructedBytes.length > 0 ? identifyBuffer(m.reconstructedBytes) : null;
         const extHint = (m.filename.split('.').pop() || '').toLowerCase();
@@ -514,6 +521,8 @@ export const App: React.FC = () => {
           calculatedSize: m.fileSize,
           status,
           sourceKind: 'ntfs-mft',
+          isDeleted: !m.inUse,
+          scanPhase: 'quick',
           partitionId: m.partitionId,
           partitionName: m.partitionName,
           originalPath: m.reconstructedPath,
@@ -543,9 +552,9 @@ export const App: React.FC = () => {
         };
       });
 
-      const rawFatExfat = scanFatAndExfatDeletedInBuffer(diskBytes, analysis.partitions).filter(
-        (f) => !scopedPartition || f.partitionId === scopedPartition.id,
-      );
+      const rawFatExfat = scanFatAndExfatDeletedInBuffer(diskBytes, analysis.partitions, {
+        includeExisting: true,
+      }).filter((f) => !scopedPartition || f.partitionId === scopedPartition.id);
       const fatExfatMapped: ExplorerFileItem[] = rawFatExfat.map((f) => {
         const res = f.reconstructedBytes.length > 0 ? identifyBuffer(f.reconstructedBytes) : null;
         const extHint = (f.filename.split('.').pop() || '').toLowerCase();
@@ -582,6 +591,8 @@ export const App: React.FC = () => {
           calculatedSize: f.fileSize,
           status,
           sourceKind: 'ntfs-mft',
+          isDeleted: f.isDeleted,
+          scanPhase: 'quick',
           partitionId: f.partitionId,
           partitionName: f.partitionName,
           originalPath: f.reconstructedPath,
@@ -591,7 +602,7 @@ export const App: React.FC = () => {
           matchedLength: res?.matchedLength ?? 0,
           metadata: {
             ...(res?.metadata ?? {}),
-            details: `${f.fsType} deleted entry (${f.extents.length} cluster run${f.extents.length === 1 ? '' : 's'}${
+            details: `${f.fsType} ${f.isDeleted ? 'deleted' : 'existing'} entry (${f.extents.length} cluster run${f.extents.length === 1 ? '' : 's'}${
               f.bitmapChecked ? (f.overwritten ? ' · cluster reallocated' : ' · bitmap intact') : ''
             })`,
           },
@@ -611,11 +622,85 @@ export const App: React.FC = () => {
         };
       });
 
-      const combined = [...mapped, ...mftMapped, ...fatExfatMapped];
+      const stage1Items = [...mftMapped, ...fatExfatMapped];
+      if (cancelled) return;
+
+      setCarvedItems(stage1Items);
+      setFocusedFileId((cur) =>
+        cur && stage1Items.some((x) => x.id === cur) ? cur : stage1Items[0]?.id ?? null,
+      );
+
+      if (!runFullDepth) {
+        const totalSectors = Math.max(1, Math.floor(endByte / 512));
+        setScanProgress({
+          currentSector: totalSectors,
+          totalSectors,
+          percent: 100,
+          foundCount: stage1Items.length,
+          foundBytes: stage1Items.reduce((s, x) => s + x.size, 0),
+        });
+        setIsScanning(false);
+        setIsPaused(false);
+        setCompletedQuickOnly(true);
+        return;
+      }
+
+      // Stage 2: Deep Sector Carving streaming batches smoothly while user browses & previews
+      setScanPhase('deep');
+      const stage1Offsets = new Set(stage1Items.map((i) => i.offset).filter((o) => o > 0));
+      const stage1Bytes = stage1Items.reduce((s, x) => s + x.size, 0);
+
+      const results = await carveDiskBufferAsync(
+        diskBytes,
+        {
+          startByte,
+          endByte,
+          blockSize,
+          paranoid,
+          keepCorrupted,
+          enabledFormats,
+        },
+        (prog) => {
+          if (cancelled) return;
+          setScanProgress({
+            currentSector: prog.currentSector,
+            totalSectors: prog.totalSectors,
+            percent: prog.percent,
+            foundCount: stage1Items.length + prog.foundCount,
+            foundBytes: stage1Bytes + prog.foundBytes,
+            latestFilename: prog.latestFile?.filename,
+          });
+        },
+        {
+          isCancelled: () => cancelled,
+          isPaused: () => isPausedRef.current,
+          onBatch: (batch) => {
+            if (cancelled) return;
+            const freshMapped = batch
+              .filter((b) => !stage1Offsets.has(b.offset))
+              .map(mapCarved);
+            if (freshMapped.length === 0) return;
+            setCarvedItems((prev) => {
+              const seen = new Set(prev.map((x) => x.id));
+              const add = freshMapped.filter((x) => !seen.has(x.id));
+              return add.length > 0 ? [...prev, ...add] : prev;
+            });
+            setFocusedFileId((cur) => cur ?? freshMapped[0]?.id ?? null);
+          },
+        },
+      );
+
+      if (cancelled) return;
+
+      const mapped = results.filter((b) => !stage1Offsets.has(b.offset)).map(mapCarved);
+      const combined = [...stage1Items, ...mapped];
       setCarvedItems(combined);
       setIsScanning(false);
       setIsPaused(false);
-      setFocusedFileId((cur) => cur ?? combined[0]?.id ?? null);
+      setCompletedQuickOnly(false);
+      setFocusedFileId((cur) =>
+        cur && combined.some((x) => x.id === cur) ? cur : combined[0]?.id ?? null,
+      );
     };
 
     void run();
@@ -631,6 +716,8 @@ export const App: React.FC = () => {
     keepCorrupted,
     enabledFormats,
     scanNonce,
+    scanMode,
+    forceDeepRun,
     scanPartitionScope,
     analysis.partitions,
     analysis.sectorSize,
@@ -720,6 +807,9 @@ export const App: React.FC = () => {
     isPausedRef.current = false;
     setIsPaused(false);
     setIsScanning(true);
+    setForceDeepRun(false);
+    setCompletedQuickOnly(false);
+    setScanPhase('quick');
     setCarvedItems([]);
     setCheckedIds(new Set());
     setFocusedFileId(null);
@@ -812,6 +902,8 @@ export const App: React.FC = () => {
         calculatedSize,
         status,
         sourceKind: entry.sourceKind,
+        isDeleted: entry.isDeleted,
+        scanPhase: entry.scanPhase,
         partitionId: origin.partitionId,
         partitionName: origin.partitionName,
         originalPath: entry.originalPath,
@@ -823,7 +915,7 @@ export const App: React.FC = () => {
           details: isLocationItem
             ? `Streamed handle (${formatBytes(entry.size)})`
             : isMftItem
-              ? `Deleted filesystem record (${entry.runs?.length ?? 0} extent${entry.runs?.length === 1 ? '' : 's'})`
+              ? `${entry.isDeleted === false ? 'Existing' : 'Deleted'} filesystem record (${entry.runs?.length ?? 0} extent${entry.runs?.length === 1 ? '' : 's'})`
               : 'Streamed disk signature',
         },
         description,
@@ -857,6 +949,8 @@ export const App: React.FC = () => {
     devicePath: string,
     totalBytes: number,
     label: string,
+    overrideScanMode?: ScanMode,
+    overrideStartPhase?: 'quick' | 'deep',
   ) => {
     const bridge = getDesktopBridge();
     if (!bridge) return;
@@ -866,6 +960,9 @@ export const App: React.FC = () => {
     if (activeNativeScanIdRef.current) {
       await bridge.cancelDriveScan(activeNativeScanIdRef.current).catch(() => {});
     }
+
+    const effectiveMode = overrideScanMode ?? scanMode;
+    const effectiveStartPhase = overrideStartPhase ?? 'quick';
 
     const headLimit = Math.min(totalBytes || 1024 * 1024, 1024 * 1024);
     const headBytes = await bridge.readDiskBytes(devicePath, 0, headLimit);
@@ -896,9 +993,13 @@ export const App: React.FC = () => {
     setLostBannerDismissed(false);
     setIsScanning(true);
     setIsPaused(false);
-    setCarvedItems([]);
-    setCheckedIds(new Set());
-    setFocusedFileId(null);
+    setCompletedQuickOnly(false);
+    setScanPhase(effectiveStartPhase);
+    if (effectiveStartPhase !== 'deep') {
+      setCarvedItems([]);
+      setCheckedIds(new Set());
+      setFocusedFileId(null);
+    }
     setScanProgress({
       currentSector: 0,
       totalSectors: Math.max(1, Math.floor(totalBytes / 512)),
@@ -909,6 +1010,7 @@ export const App: React.FC = () => {
 
     const unsubProgress = bridge.onDriveScanProgress((ev) => {
       if (ev.scanId !== scanId) return;
+      if (ev.phase) setScanPhase(ev.phase);
       setScanProgress({
         currentSector: Math.floor(ev.currentBytes / 512),
         totalSectors: Math.max(1, Math.floor(ev.totalBytes / 512)),
@@ -929,6 +1031,7 @@ export const App: React.FC = () => {
         const fresh = incoming.filter((x) => !existingIds.has(x.id));
         return fresh.length > 0 ? [...prev, ...fresh] : prev;
       });
+      setFocusedFileId((cur) => cur ?? incoming[0]?.id ?? null);
     });
 
     const hasLostOnTarget = localAnalysis.partitions.some(
@@ -944,12 +1047,23 @@ export const App: React.FC = () => {
         devicePath,
         totalBytes,
         blockSize,
+        scanMode: effectiveMode,
+        startPhase: effectiveStartPhase,
+        includeExisting: true,
       });
       if (activeNativeScanIdRef.current !== scanId) return;
       const mapped = entries.map((e) => mapNativeEntryToExplorerItem(e, resolveLocalPart));
-      setCarvedItems(mapped);
+      setCarvedItems((prev) => {
+        if (effectiveStartPhase === 'deep' && prev.length > 0) {
+          const seen = new Set(prev.map((x) => x.id));
+          const fresh = mapped.filter((x) => !seen.has(x.id));
+          return [...prev, ...fresh];
+        }
+        return mapped;
+      });
       setIsScanning(false);
-      setFocusedFileId(mapped[0]?.id ?? null);
+      setCompletedQuickOnly(effectiveMode === 'quick');
+      setFocusedFileId((cur) => (cur && mapped.some((x) => x.id === cur) ? cur : cur ?? mapped[0]?.id ?? null));
     } finally {
       unsubProgress();
       unsubBatch();
@@ -1038,8 +1152,8 @@ export const App: React.FC = () => {
     try {
       const folderPath = await bridge.pickFolder();
       if (!folderPath) return;
-      const entries = await bridge.scanFolder(folderPath);
-      const mapped = entries.map((e) => mapNativeEntryToExplorerItem(e));
+      const res = await bridge.scanFolder(folderPath);
+      const mapped = res.entries.map((e) => mapNativeEntryToExplorerItem(e));
       if (!diskName) setDiskName(folderPath);
       setLocationItems((prev) => [
         ...mapped,
@@ -1048,7 +1162,11 @@ export const App: React.FC = () => {
       setFocusedFileId(mapped[0]?.id ?? null);
       setActiveScreen('explorer');
       navigateToNode({ kind: 'folder-scan' });
-      if (mapped.length === 0) {
+      if (res.deletedLookupStatus === 'needs-admin') {
+        setMbrActionNotice(
+          `Indexed ${mapped.length} live/Shadow Copy files in "${folderPath}". Run as Administrator to also inspect deleted $MFT / $UsnJrnl records on ${res.backingDrive || 'the backing drive'}.`,
+        );
+      } else if (mapped.length === 0) {
         setMbrActionNotice(`No files found inside "${folderPath}".`);
       }
     } catch {
@@ -1076,7 +1194,11 @@ export const App: React.FC = () => {
       setFocusedFileId(mapped[0]?.id ?? null);
       setActiveScreen('explorer');
       navigateToNode({ kind: 'folder-scan' });
-      if (mapped.length === 0) {
+      if (res.deletedLookupStatus === 'needs-admin') {
+        setMbrActionNotice(
+          `Indexed ${mapped.length} Desktop / Shadow Copy files. Run as Administrator to also search emptied deleted files on ${res.backingDrive || 'the backing drive'}.`,
+        );
+      } else if (mapped.length === 0) {
         setMbrActionNotice('No files found inside Windows Desktop.');
       }
     } catch {
@@ -1094,8 +1216,8 @@ export const App: React.FC = () => {
       return;
     }
     try {
-      const entries = await bridge.scanRecycleBin();
-      const mapped = entries.map((e) => mapNativeEntryToExplorerItem(e));
+      const res = await bridge.scanRecycleBin();
+      const mapped = res.entries.map((e) => mapNativeEntryToExplorerItem(e));
       if (!diskName) setDiskName('Recycle Bin ($Recycle.Bin)');
       setLocationItems((prev) => [
         ...mapped,
@@ -1104,9 +1226,13 @@ export const App: React.FC = () => {
       setFocusedFileId(mapped[0]?.id ?? null);
       setActiveScreen('explorer');
       navigateToNode({ kind: 'recycle-bin' });
-      if (mapped.length === 0) {
+      if (res.deletedLookupStatus === 'needs-admin') {
         setMbrActionNotice(
-          'No deleted items found in Windows $Recycle.Bin (or Administrator permission required).',
+          `Found ${mapped.length} items currently in $Recycle.Bin. Run as Administrator to scan emptied Recycle Bin entries via $MFT / $UsnJrnl on ${res.backingDrive || 'the physical drive'}.`,
+        );
+      } else if (mapped.length === 0) {
+        setMbrActionNotice(
+          'No deleted items found in Windows $Recycle.Bin.',
         );
       }
     } catch {
@@ -1222,6 +1348,8 @@ export const App: React.FC = () => {
         calculatedSize,
         status,
         sourceKind,
+        isDeleted: isRecycle,
+        scanPhase: 'quick',
         partitionId,
         partitionName,
         originalPath: restoredOriginalPath || file.webkitRelativePath || displayName,
@@ -1344,8 +1472,8 @@ export const App: React.FC = () => {
     );
   };
 
-  const handleRepairFile = (target: ExplorerFileItem) => {
-    const res = repairFileBuffer(target.extension, target.data);
+  const handleRepairFile = (target: ExplorerFileItem, referenceBytes?: Uint8Array) => {
+    const res = repairFileBuffer(target.extension, target.data, referenceBytes);
     if (!res.repaired) return;
     const assessment = computeRecoveryLikelihood({
       status: 'OK',
@@ -1434,6 +1562,8 @@ export const App: React.FC = () => {
     const q = searchQuery.trim().toLowerCase();
     const filtered = allItems.filter((item) => {
       if (!itemMatchesNode(item, selectedNode)) return false;
+      if (deletedFilter === 'deleted' && item.isDeleted === false) return false;
+      if (deletedFilter === 'existing' && item.isDeleted !== false) return false;
       if (statusFilter === 'ok' && item.status !== 'OK') return false;
       if (statusFilter === 'truncated' && item.status === 'OK') return false;
       if (likelihoodFilter !== 'all' && item.recoveryTier !== likelihoodFilter) return false;
@@ -1488,6 +1618,7 @@ export const App: React.FC = () => {
   }, [
     allItems,
     selectedNode,
+    deletedFilter,
     statusFilter,
     likelihoodFilter,
     sizeFilter,
@@ -1541,6 +1672,8 @@ export const App: React.FC = () => {
       calculatedSize: item.calculatedSize,
       status: item.status,
       sourceKind: item.sourceKind,
+      isDeleted: item.isDeleted,
+      scanPhase: item.scanPhase,
       partitionId: item.partitionId,
       partitionName: item.partitionName,
       originalPath: item.originalPath,
@@ -1625,6 +1758,8 @@ export const App: React.FC = () => {
         calculatedSize: s.calculatedSize,
         status: s.status,
         sourceKind: s.sourceKind,
+        isDeleted: s.isDeleted,
+        scanPhase: s.scanPhase,
         partitionId: s.partitionId,
         partitionName: s.partitionName,
         originalPath: s.originalPath,
@@ -1852,6 +1987,7 @@ export const App: React.FC = () => {
     !keepCorrupted ||
     hideDuplicates ||
     groupBy !== 'none' ||
+    deletedFilter !== 'all' ||
     statusFilter !== 'all' ||
     likelihoodFilter !== 'all' ||
     sizeFilter !== 'all' ||
@@ -2043,6 +2179,8 @@ export const App: React.FC = () => {
             </div>
           )}
           <HomeView
+            scanMode={scanMode}
+            onChangeScanMode={setScanMode}
             onScanPhysicalDrive={handleOpenPhysicalDrive}
             onOpenDiskPicker={() => void handleOpenDiskPicker()}
             onScanFolder={() => void handleScanFolder()}
@@ -2130,8 +2268,33 @@ export const App: React.FC = () => {
               </nav>
             </div>
 
-            {/* Clean 3-Control Right Toolbar matching Screenshot 1 */}
+            {/* Right Toolbar: Deleted Toggle, View Toggle, Filter & Search */}
             <div className="flex items-center gap-2 shrink-0">
+              <div
+                className="flex items-center bg-[#262B36] rounded border border-[#343A48] p-0.5 text-[11px]"
+                role="group"
+                aria-label="Deletion visibility"
+              >
+                {([
+                  { id: 'all', label: 'All' },
+                  { id: 'deleted', label: 'Deleted' },
+                  { id: 'existing', label: 'Existing' },
+                ] as const).map((opt) => (
+                  <button
+                    key={opt.id}
+                    type="button"
+                    onClick={() => setDeletedFilter(opt.id)}
+                    className={`px-2 py-0.5 rounded-xs font-medium transition-colors whitespace-nowrap ${
+                      deletedFilter === opt.id
+                        ? 'bg-[#3A7AFE] text-white'
+                        : 'text-slate-400 hover:text-slate-200'
+                    }`}
+                  >
+                    {opt.label}
+                  </button>
+                ))}
+              </div>
+
               <div className="flex items-center bg-[#262B36] rounded border border-[#343A48] p-0.5">
                 <button
                   type="button"
@@ -2275,6 +2438,16 @@ export const App: React.FC = () => {
                   </span>
                 </span>
               </div>
+              <button
+                type="button"
+                onClick={() => {
+                  setFocusedFileId(null);
+                  navigateToNode({ kind: 'partition', partitionId: bitlockerPartitions[0].id });
+                }}
+                className="px-2.5 py-1 rounded bg-amber-500/20 hover:bg-amber-500/30 border border-amber-400/40 text-amber-100 font-medium whitespace-nowrap"
+              >
+                Unlock Volume
+              </button>
             </div>
           )}
 
@@ -2432,6 +2605,21 @@ export const App: React.FC = () => {
                                   <div className="flex items-center gap-2.5 min-w-0">
                                     <FileThumbnail item={item} size="sm" />
                                     <span className="truncate">{item.filename}</span>
+                                    {item.scanPhase === 'vss' && (
+                                      <span className="px-1 py-0.5 rounded-xs bg-indigo-500/15 border border-indigo-400/30 text-[9px] font-mono text-indigo-300 shrink-0">
+                                        VSS
+                                      </span>
+                                    )}
+                                    {item.scanPhase === 'usn' && (
+                                      <span className="px-1 py-0.5 rounded-xs bg-amber-500/15 border border-amber-400/30 text-[9px] font-mono text-amber-300 shrink-0">
+                                        USN
+                                      </span>
+                                    )}
+                                    {item.isDeleted && item.scanPhase !== 'vss' && item.scanPhase !== 'usn' && (
+                                      <span className="px-1 py-0.5 rounded-xs bg-rose-500/15 border border-rose-400/25 text-[9px] font-mono text-rose-300 shrink-0">
+                                        DEL
+                                      </span>
+                                    )}
                                   </div>
                                 </td>
                                 <td className="py-2 px-2 font-mono text-slate-400 tabular-nums whitespace-nowrap hidden lg:table-cell">
@@ -2566,6 +2754,12 @@ export const App: React.FC = () => {
           diskBytes={diskBytes}
           onRestorePartitionToMbr={(p) => handleRestorePartitionToMbr(p)}
           onRepairFile={handleRepairFile}
+          onBitLockerUnlocked={() => {
+            if (nativeDriveTargetRef.current) {
+              const t = nativeDriveTargetRef.current;
+              void runNativeStreamingScan(t.devicePath, t.totalBytes, t.label);
+            }
+          }}
           lightboxOpen={lightboxOpen}
           onSetLightboxOpen={setLightboxOpen}
         />
@@ -2582,7 +2776,9 @@ export const App: React.FC = () => {
                 <div className="flex items-center gap-2.5 min-w-0">
                   <HardDrive className="w-4 h-4 text-[#60A5FA] shrink-0" />
                   <span className="truncate">
-                    Advanced Scan is trying to find more files for you.
+                    {scanPhase === 'quick'
+                      ? 'Quick Scan is indexing filesystem metadata ($MFT / FAT / $UsnJrnl) — browse or preview results anytime.'
+                      : 'Deep Scan is carving raw disk sectors across CPU threads — browse and preview live as files appear.'}
                   </span>
                 </div>
                 <span className="text-[11px] font-mono text-slate-300 shrink-0 tabular-nums">
@@ -2696,16 +2892,28 @@ export const App: React.FC = () => {
                   {isScanning
                     ? isPaused
                       ? 'Scan Paused ,'
-                      : 'Advanced Scanning ,'
-                    : 'Scan Complete ,'}
+                      : scanPhase === 'quick'
+                        ? 'Quick Scanning ,'
+                        : 'Deep Scanning ,'
+                    : completedQuickOnly
+                      ? 'Quick Scan Complete ,'
+                      : 'Scan Complete ,'}
                 </span>
                 <span className="text-slate-200 tabular-nums">
                   Files Found:{' '}
                   <span className="text-[#4C8DFF] font-semibold">
-                    {isScanning ? scanProgress.foundCount : carvedItems.length}
+                    {isScanning ? scanProgress.foundCount : carvedItems.length || allItems.length}
                   </span>{' '}
                   <span className="text-slate-400">
-                    ({formatBytes(isScanning ? scanProgress.foundBytes : totalDiscoveredBytes)})
+                    (
+                    {formatBytes(
+                      isScanning
+                        ? scanProgress.foundBytes
+                        : carvedItems.length > 0
+                          ? totalDiscoveredBytes
+                          : allItems.reduce((s, i) => s + i.size, 0),
+                    )}
+                    )
                   </span>
                 </span>
               </div>
@@ -2760,21 +2968,44 @@ export const App: React.FC = () => {
                   Reading sector: {scanProgress.currentSector.toLocaleString()}/
                   {scanProgress.totalSectors.toLocaleString()}
                 </span>
-                {!isScanning && (
-                  <button
-                    type="button"
-                    onClick={() => {
-                      if (nativeDriveTargetRef.current) {
-                        const t = nativeDriveTargetRef.current;
-                        void runNativeStreamingScan(t.devicePath, t.totalBytes, t.label);
-                      } else {
-                        startFreshScanState(diskBytes);
-                      }
-                    }}
-                    className="inline-flex items-center gap-1 text-[#4C8DFF] hover:underline font-sans shrink-0 ml-1"
-                  >
-                    <RotateCcw className="w-3 h-3" /> Re-scan
-                  </button>
+                {!isScanning && (diskBytes.length > 0 || useNativeScan) && (
+                  <div className="inline-flex items-center gap-2 shrink-0 ml-1">
+                    <button
+                      type="button"
+                      onClick={() => {
+                        if (nativeDriveTargetRef.current) {
+                          const t = nativeDriveTargetRef.current;
+                          void runNativeStreamingScan(t.devicePath, t.totalBytes, t.label);
+                        } else {
+                          startFreshScanState(diskBytes);
+                        }
+                      }}
+                      className="inline-flex items-center gap-1 text-[#4C8DFF] hover:underline font-sans shrink-0"
+                    >
+                      <RotateCcw className="w-3 h-3" /> Re-scan
+                    </button>
+                    {completedQuickOnly && (
+                      <button
+                        type="button"
+                        onClick={() => {
+                          if (nativeDriveTargetRef.current) {
+                            const t = nativeDriveTargetRef.current;
+                            void runNativeStreamingScan(t.devicePath, t.totalBytes, t.label, 'full', 'deep');
+                          } else {
+                            isPausedRef.current = false;
+                            setIsPaused(false);
+                            setIsScanning(true);
+                            setCompletedQuickOnly(false);
+                            setScanPhase('deep');
+                            setForceDeepRun(true);
+                          }
+                        }}
+                        className="px-2.5 py-0.5 rounded bg-[#262B36] hover:bg-[#313847] border border-[#3B4255] text-[#60A5FA] font-sans font-medium whitespace-nowrap transition-colors"
+                      >
+                        Run Deep Scan
+                      </button>
+                    )}
+                  </div>
                 )}
               </div>
             </div>
@@ -2879,6 +3110,7 @@ export const App: React.FC = () => {
           paranoid={paranoid}
           keepCorrupted={keepCorrupted}
           enabledFormats={enabledFormats}
+          deletedFilter={deletedFilter}
           statusFilter={statusFilter}
           likelihoodFilter={likelihoodFilter}
           sizeFilter={sizeFilter}
@@ -2890,6 +3122,7 @@ export const App: React.FC = () => {
           onChangeParanoid={setParanoid}
           onChangeKeepCorrupted={setKeepCorrupted}
           onChangeEnabledFormats={setEnabledFormats}
+          onChangeDeletedFilter={setDeletedFilter}
           onChangeStatusFilter={setStatusFilter}
           onChangeLikelihoodFilter={setLikelihoodFilter}
           onChangeSizeFilter={setSizeFilter}

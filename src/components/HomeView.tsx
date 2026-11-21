@@ -16,6 +16,7 @@ import {
   Wrench,
 } from 'lucide-react';
 import { formatBytes } from '../engine/crc32';
+import { ScanMode } from '../engine/explorerTypes';
 import {
   getDesktopBridge,
   WindowsDriveInfo,
@@ -25,6 +26,8 @@ import {
 export type HomeNavSection = 'hardware' | 'sdcard' | 'repair' | 'partition';
 
 interface HomeViewProps {
+  scanMode: ScanMode;
+  onChangeScanMode: (mode: ScanMode) => void;
   onScanPhysicalDrive: (drive: WindowsDriveInfo) => Promise<void>;
   onOpenDiskPicker: () => void;
   onScanFolder: () => void;
@@ -37,6 +40,8 @@ interface HomeViewProps {
 }
 
 export const HomeView: React.FC<HomeViewProps> = ({
+  scanMode,
+  onChangeScanMode,
   onScanPhysicalDrive,
   onOpenDiskPicker,
   onScanFolder,
@@ -54,8 +59,8 @@ export const HomeView: React.FC<HomeViewProps> = ({
   const [loadingDrives, setLoadingDrives] = useState<boolean>(false);
   const [selectedDevicePath, setSelectedDevicePath] = useState<string | null>(null);
   const [selectedQuickTarget, setSelectedQuickTarget] = useState<
-    'recycle' | 'desktop' | 'folder' | 'image' | 'unknown'
-  >('image');
+    'recycle' | 'desktop' | 'folder' | 'image' | 'unknown' | null
+  >(desktop ? null : 'image');
   const [scanningDrivePath, setScanningDrivePath] = useState<string | null>(null);
 
   const loadHardware = async () => {
@@ -68,7 +73,10 @@ export const HomeView: React.FC<HomeViewProps> = ({
       ]);
       setDrives(drvList);
       setVolumes(volList);
-      setSelectedDevicePath((cur) => cur ?? drvList[0]?.devicePath ?? null);
+      setSelectedDevicePath((cur) => {
+        if (cur && drvList.some((d) => d.devicePath === cur)) return cur;
+        return selectedQuickTarget ? null : drvList[0]?.devicePath ?? null;
+      });
     } finally {
       setLoadingDrives(false);
     }
@@ -84,6 +92,9 @@ export const HomeView: React.FC<HomeViewProps> = ({
         setVolumes(volList);
         if (drvList.length > 0) {
           setSelectedDevicePath((cur) => cur ?? drvList[0].devicePath);
+          setSelectedQuickTarget(null);
+        } else {
+          setSelectedQuickTarget((cur) => cur ?? 'recycle');
         }
       })
       .catch(() => {});
@@ -167,8 +178,10 @@ export const HomeView: React.FC<HomeViewProps> = ({
       <button
         key={drv.devicePath}
         type="button"
-        onClick={() => setSelectedDevicePath(drv.devicePath)}
-        onDoubleClick={() => void onScanPhysicalDrive(drv)}
+        onClick={() => {
+          setSelectedDevicePath(drv.devicePath);
+          setSelectedQuickTarget(null);
+        }}
         className={`relative text-left p-3.5 rounded-md border transition-all flex items-center gap-3.5 ${
           isSel
             ? 'bg-[#222938] border-[#3A7AFE]'
@@ -399,106 +412,66 @@ export const HomeView: React.FC<HomeViewProps> = ({
                 </div>
               )}
 
-              {/* Specify a location (matches Screenshot 4 horizontal icon grid) */}
+              {/* Specify a location (click to select, then click Search for Lost Data) */}
               <div className="space-y-3 pt-1">
                 <div className="text-xs font-medium text-slate-400">Specify a location</div>
                 <div className="grid grid-cols-2 sm:grid-cols-3 gap-3.5 max-w-3xl">
-                  <button
-                    type="button"
-                    onClick={() => {
-                      setSelectedDevicePath(null);
-                      setSelectedQuickTarget('recycle');
-                      void onScanRecycleBin();
-                    }}
-                    className={`flex items-center gap-3.5 p-3.5 rounded-md border text-left transition-colors ${
-                      !selectedDevicePath && selectedQuickTarget === 'recycle'
-                        ? 'bg-[#222938] border-[#3A7AFE]'
-                        : 'bg-transparent border-transparent hover:bg-[#252A36]'
-                    }`}
-                  >
-                    <div className="w-11 h-11 rounded-lg bg-[#252B37] border border-[#323A4C] flex items-center justify-center shrink-0">
-                      <Trash2 className="w-5 h-5 text-slate-300" />
-                    </div>
-                    <span className="text-xs font-medium text-slate-200">Recycle Bin</span>
-                  </button>
-
-                  <button
-                    type="button"
-                    onClick={() => {
-                      setSelectedDevicePath(null);
-                      setSelectedQuickTarget('desktop');
-                      void onScanDesktop();
-                    }}
-                    className={`flex items-center gap-3.5 p-3.5 rounded-md border text-left transition-colors ${
-                      !selectedDevicePath && selectedQuickTarget === 'desktop'
-                        ? 'bg-[#222938] border-[#3A7AFE]'
-                        : 'bg-transparent border-transparent hover:bg-[#252A36]'
-                    }`}
-                  >
-                    <div className="w-11 h-11 rounded-lg bg-[#252B37] border border-[#323A4C] flex items-center justify-center shrink-0">
-                      <Monitor className="w-5 h-5 text-[#4C8DFF]" />
-                    </div>
-                    <span className="text-xs font-medium text-slate-200">Desktop</span>
-                  </button>
-
-                  <button
-                    type="button"
-                    onClick={() => {
-                      setSelectedDevicePath(null);
-                      setSelectedQuickTarget('folder');
-                      onScanFolder();
-                    }}
-                    className={`flex items-center gap-3.5 p-3.5 rounded-md border text-left transition-colors ${
-                      !selectedDevicePath && selectedQuickTarget === 'folder'
-                        ? 'bg-[#222938] border-[#3A7AFE]'
-                        : 'bg-transparent border-transparent hover:bg-[#252A36]'
-                    }`}
-                  >
-                    <div className="w-11 h-11 rounded-lg bg-[#252B37] border border-[#323A4C] flex items-center justify-center shrink-0">
-                      <Folder className="w-5 h-5 text-[#4C8DFF] fill-[#4C8DFF]/25" />
-                    </div>
-                    <span className="text-xs font-medium text-slate-200">Select Folder</span>
-                  </button>
-
-                  <button
-                    type="button"
-                    onClick={() => {
-                      setSelectedDevicePath(null);
-                      setSelectedQuickTarget('image');
-                      onOpenDiskPicker();
-                    }}
-                    className={`flex items-center gap-3.5 p-3.5 rounded-md border text-left transition-colors ${
-                      !selectedDevicePath && selectedQuickTarget === 'image'
-                        ? 'bg-[#222938] border-[#3A7AFE]'
-                        : 'bg-transparent border-transparent hover:bg-[#252A36]'
-                    }`}
-                  >
-                    <div className="w-11 h-11 rounded-lg bg-[#252B37] border border-[#323A4C] flex items-center justify-center shrink-0">
-                      <Disc className="w-5 h-5 text-[#60A5FA]" />
-                    </div>
-                    <span className="text-xs font-medium text-slate-200">Disk Image</span>
-                  </button>
-
-                  <button
-                    type="button"
-                    onClick={() => {
-                      setSelectedDevicePath(null);
-                      setSelectedQuickTarget('unknown');
-                      onOpenUnknownFiles();
-                    }}
-                    className={`flex items-center gap-3.5 p-3.5 rounded-md border text-left transition-colors ${
-                      !selectedDevicePath && selectedQuickTarget === 'unknown'
-                        ? 'bg-[#222938] border-[#3A7AFE]'
-                        : 'bg-transparent border-transparent hover:bg-[#252A36]'
-                    }`}
-                  >
-                    <div className="w-11 h-11 rounded-lg bg-[#252B37] border border-[#323A4C] flex items-center justify-center shrink-0">
-                      <FileQuestion className="w-5 h-5 text-emerald-400" />
-                    </div>
-                    <span className="text-xs font-medium text-slate-200">
-                      Unknown File (fidentify)
-                    </span>
-                  </button>
+                  {(
+                    [
+                      {
+                        id: 'recycle',
+                        label: 'Recycle Bin',
+                        icon: <Trash2 className="w-5 h-5 text-slate-300" />,
+                      },
+                      {
+                        id: 'desktop',
+                        label: 'Desktop',
+                        icon: <Monitor className="w-5 h-5 text-[#4C8DFF]" />,
+                      },
+                      {
+                        id: 'folder',
+                        label: 'Select Folder',
+                        icon: <Folder className="w-5 h-5 text-[#4C8DFF] fill-[#4C8DFF]/25" />,
+                      },
+                      {
+                        id: 'image',
+                        label: 'Disk Image',
+                        icon: <Disc className="w-5 h-5 text-[#60A5FA]" />,
+                      },
+                      {
+                        id: 'unknown',
+                        label: 'Unknown File (fidentify)',
+                        icon: <FileQuestion className="w-5 h-5 text-emerald-400" />,
+                      },
+                    ] as const
+                  ).map((tile) => {
+                    const isTileSel = !selectedDevicePath && selectedQuickTarget === tile.id;
+                    return (
+                      <button
+                        key={tile.id}
+                        type="button"
+                        onClick={() => {
+                          setSelectedDevicePath(null);
+                          setSelectedQuickTarget(tile.id);
+                        }}
+                        className={`relative flex items-center gap-3.5 p-3.5 rounded-md border text-left transition-colors ${
+                          isTileSel
+                            ? 'bg-[#222938] border-[#3A7AFE]'
+                            : 'bg-[#191C23] border-[#2B303C] hover:border-[#3D4659] hover:bg-[#252A36]'
+                        }`}
+                      >
+                        {isTileSel && (
+                          <span className="absolute top-2 right-2 w-4 h-4 rounded-full bg-[#3A7AFE] flex items-center justify-center">
+                            <Check className="w-2.5 h-2.5 text-white stroke-[3]" />
+                          </span>
+                        )}
+                        <div className="w-11 h-11 rounded-lg bg-[#252B37] border border-[#323A4C] flex items-center justify-center shrink-0">
+                          {tile.icon}
+                        </div>
+                        <span className="text-xs font-medium text-slate-200 pr-4">{tile.label}</span>
+                      </button>
+                    );
+                  })}
                 </div>
               </div>
             </>
@@ -577,14 +550,50 @@ export const HomeView: React.FC<HomeViewProps> = ({
             Load Saved Session (.tdscan.json)
           </button>
 
-          <button
-            type="button"
-            onClick={() => void triggerSearch()}
-            disabled={scanningDrivePath !== null}
-            className="px-7 py-2 rounded-md text-xs font-medium bg-[#3A7AFE] hover:bg-[#2F6EEB] active:scale-[0.98] disabled:opacity-40 text-white transition-all"
-          >
-            {scanningDrivePath ? 'Starting Scan...' : 'Search for Lost Data'}
-          </button>
+          <div className="flex items-center gap-3">
+            <div
+              className="inline-flex items-center bg-[#14171D] rounded-md border border-[#2D3342] p-0.5 text-[11px]"
+              role="group"
+              aria-label="Scan depth mode"
+            >
+              <button
+                type="button"
+                onClick={() => onChangeScanMode('quick')}
+                className={`px-3 py-1.5 rounded transition-colors ${
+                  scanMode === 'quick'
+                    ? 'bg-[#2A3244] text-white font-medium'
+                    : 'text-slate-400 hover:text-slate-200'
+                }`}
+                title="Fast filesystem metadata scan ($MFT, $UsnJrnl, FAT32, exFAT, VSS)"
+              >
+                Quick Scan
+              </button>
+              <button
+                type="button"
+                onClick={() => onChangeScanMode('full')}
+                className={`px-3 py-1.5 rounded transition-colors ${
+                  scanMode === 'full'
+                    ? 'bg-[#2A3244] text-white font-medium'
+                    : 'text-slate-400 hover:text-slate-200'
+                }`}
+                title="Quick metadata scan followed by deep sector-by-sector raw signature carving"
+              >
+                Quick + Deep Scan
+              </button>
+            </div>
+
+            <button
+              type="button"
+              onClick={() => void triggerSearch()}
+              disabled={
+                scanningDrivePath !== null ||
+                (section !== 'repair' && !selectedDrive && !selectedQuickTarget)
+              }
+              className="px-7 py-2 rounded-md text-xs font-medium bg-[#3A7AFE] hover:bg-[#2F6EEB] active:scale-[0.98] disabled:opacity-40 text-white transition-all"
+            >
+              {scanningDrivePath ? 'Starting Scan...' : 'Search for Lost Data'}
+            </button>
+          </div>
         </footer>
       </main>
     </div>

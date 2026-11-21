@@ -18,6 +18,7 @@ export interface MftDeletedRecord {
   reconstructedPath: string;
   isDirectory: boolean;
   inUse: boolean;
+  isDeleted: boolean;
   fileSize: number;
   modifiedAtMs: number;
   residentData: Uint8Array | null;
@@ -333,7 +334,9 @@ function checkClustersAgainstBitmap(
 export function scanNtfsMftRecordsInBuffer(
   diskBytes: Uint8Array,
   partitions: PartitionEntry[],
+  options?: { includeExisting?: boolean },
 ): MftDeletedRecord[] {
+  const includeExisting = options?.includeExisting ?? false;
   const dirMap = new Map<string, { parentRecord: number; name: string }>();
   const bitmapByPartition = new Map<string, Uint8Array>();
 
@@ -348,7 +351,7 @@ export function scanNtfsMftRecordsInBuffer(
   const candidates: ParsedCandidate[] = [];
   const seenOffsets = new Set<number>();
 
-  // Pass 1: Read MFT records -> collect directories, $Bitmap (#6), and deleted files
+  // Pass 1: Read MFT records -> collect directories, $Bitmap (#6), and deleted (or existing) files
   for (let off = 0; off + 1024 <= diskBytes.length; off += 512) {
     if (
       diskBytes[off] !== 0x46 ||
@@ -403,7 +406,9 @@ export function scanNtfsMftRecordsInBuffer(
       continue;
     }
 
-    if (parsed.inUse || parsed.filename.startsWith('$') || seenOffsets.has(off)) continue;
+    if ((!includeExisting && parsed.inUse) || parsed.filename.startsWith('$') || seenOffsets.has(off)) {
+      continue;
+    }
     seenOffsets.add(off);
     candidates.push({ off, partId, partName, volOffset, clusterBytes, parsed });
   }
@@ -444,7 +449,7 @@ export function scanNtfsMftRecordsInBuffer(
     let overwrittenClusters = 0;
     let totalClusters = 0;
 
-    if (bitmap && parsed.runs.length > 0) {
+    if (bitmap && parsed.runs.length > 0 && !parsed.inUse) {
       bitmapChecked = true;
       const check = checkClustersAgainstBitmap(bitmap, parsed.runs);
       overwrittenClusters = check.overwrittenClusters;
@@ -462,6 +467,7 @@ export function scanNtfsMftRecordsInBuffer(
       reconstructedPath,
       isDirectory: false,
       inUse: parsed.inUse,
+      isDeleted: !parsed.inUse,
       fileSize: parsed.fileSize || reconstructedBytes.length,
       modifiedAtMs: parsed.modifiedAtMs,
       residentData: parsed.residentData,

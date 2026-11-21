@@ -46,6 +46,8 @@ export const RecoveryModal: React.FC<RecoveryModalProps> = ({
   const [selectedRootDir, setSelectedRootDir] = useState<string | null>(null);
   const [folderLayout, setFolderLayout] = useState<'type' | 'path'>('type');
   const [enableFileRepair, setEnableFileRepair] = useState<boolean>(true);
+  const [referenceVideoName, setReferenceVideoName] = useState<string | null>(null);
+  const [referenceVideoBytes, setReferenceVideoBytes] = useState<Uint8Array | null>(null);
   const [includeRepairedImg, setIncludeRepairedImg] = useState<boolean>(!!repairedDiskBytes);
   const [saving, setSaving] = useState<boolean>(false);
   const [resultMessage, setResultMessage] = useState<string | null>(null);
@@ -78,6 +80,9 @@ export const RecoveryModal: React.FC<RecoveryModalProps> = ({
   }, [desktop, selectedRootDir]);
 
   const truncatedCount = items.filter((i) => i.status === 'OK_TRUNCATED').length;
+  const hasBrokenVideo = items.some(
+    (i) => i.status === 'OK_TRUNCATED' && ['mp4', 'mov', 'm4v'].includes(i.extension.toLowerCase()),
+  );
   const supportsDirectoryPicker =
     !!desktop ||
     (typeof window !== 'undefined' &&
@@ -140,7 +145,7 @@ export const RecoveryModal: React.FC<RecoveryModalProps> = ({
           }
           let payload = item.data;
           if (enableFileRepair && item.status === 'OK_TRUNCATED') {
-            const rep = repairFileBuffer(item.extension, payload);
+            const rep = repairFileBuffer(item.extension, payload, referenceVideoBytes ?? undefined);
             if (rep.repaired) payload = rep.data;
           }
           return {
@@ -216,7 +221,7 @@ export const RecoveryModal: React.FC<RecoveryModalProps> = ({
           } else {
             let payload = item.data;
             if (enableFileRepair && item.status === 'OK_TRUNCATED') {
-              const rep = repairFileBuffer(item.extension, payload);
+              const rep = repairFileBuffer(item.extension, payload, referenceVideoBytes ?? undefined);
               if (rep.repaired) {
                 payload = rep.data;
                 repairedCount++;
@@ -263,7 +268,7 @@ export const RecoveryModal: React.FC<RecoveryModalProps> = ({
         }
 
         if (enableFileRepair && item.status === 'OK_TRUNCATED') {
-          const rep = repairFileBuffer(item.extension, payload);
+          const rep = repairFileBuffer(item.extension, payload, referenceVideoBytes ?? undefined);
           if (rep.repaired) {
             payload = rep.data;
             repairedCount++;
@@ -494,6 +499,32 @@ export const RecoveryModal: React.FC<RecoveryModalProps> = ({
                   className="accent-[#3A7AFE]"
                 />
               </label>
+            )}
+
+            {hasBrokenVideo && enableFileRepair && (
+              <div className="flex items-center justify-between gap-2 px-2 pt-1.5 border-t border-[#262B36] text-[11px] text-slate-300">
+                <span className="truncate" title={referenceVideoName || undefined}>
+                  {referenceVideoName
+                    ? `Reference clip: ${referenceVideoName}`
+                    : 'Optional healthy camera .mp4/.mov for moov repair'}
+                </span>
+                <label className="px-2 py-0.5 rounded bg-[#262B36] hover:bg-[#2F3644] border border-[#343A48] text-slate-200 cursor-pointer shrink-0">
+                  Choose Video
+                  <input
+                    type="file"
+                    accept=".mp4,.mov,.m4v"
+                    className="hidden"
+                    onChange={async (e) => {
+                      const f = e.target.files?.[0];
+                      if (!f) return;
+                      const slice = new Uint8Array(await f.slice(0, 8 * 1024 * 1024).arrayBuffer());
+                      setReferenceVideoName(f.name);
+                      setReferenceVideoBytes(slice);
+                      e.target.value = '';
+                    }}
+                  />
+                </label>
+              </div>
             )}
           </div>
 

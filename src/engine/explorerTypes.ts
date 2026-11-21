@@ -16,6 +16,9 @@ export interface FileSourceRef {
   browserFile?: File;
 }
 
+export type ScanMode = 'quick' | 'full';
+export type DeletedFilter = 'all' | 'deleted' | 'existing';
+
 export interface ExplorerFileItem {
   id: string;
   filename: string;
@@ -26,6 +29,8 @@ export interface ExplorerFileItem {
   calculatedSize: number | null;
   status: 'OK' | 'OK_TRUNCATED' | 'HEADER_ONLY' | 'UNKNOWN';
   sourceKind: 'carved' | 'ntfs-mft' | 'fidentify' | 'recycle-bin' | 'folder';
+  isDeleted?: boolean;
+  scanPhase?: 'quick' | 'deep' | 'vss' | 'usn';
   partitionId: string;
   partitionName: string;
   originalPath?: string;
@@ -157,6 +162,8 @@ export interface SerializedScanSessionItem {
   calculatedSize: number | null;
   status: ExplorerFileItem['status'];
   sourceKind: ExplorerFileItem['sourceKind'];
+  isDeleted?: boolean;
+  scanPhase?: 'quick' | 'deep' | 'vss' | 'usn';
   partitionId: string;
   partitionName: string;
   originalPath?: string;

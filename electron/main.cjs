@@ -1,7 +1,9 @@
 const { app, BrowserWindow, dialog, ipcMain } = require('electron');
 const { execFile } = require('node:child_process');
 const fs = require('node:fs');
+const os = require('node:os');
 const path = require('node:path');
+const { Worker } = require('node:worker_threads');
 
 const activeScans = new Map();
 const WINDOWS_EPOCH_DIFF_MS = 11644473600000;
@@ -121,6 +123,8 @@ function walkFolderEntries(dirPath, outList, maxFiles = 5000, recycleMeta = null
           size: info.size,
           modifiedAt: recycleMeta ? recycleMeta.deletedAtMs : info.mtimeMs,
           sourceKind: isRecycledChild ? 'recycle-bin' : 'folder',
+          isDeleted: isRecycledChild,
+          scanPhase: 'quick',
           offset: 0,
           sector: 0,
           devicePath: full,
@@ -191,6 +195,8 @@ function scanRecycleDir(recycleRoot, outList, maxFiles = 5000) {
           size: info.size,
           modifiedAt: meta?.deletedAtMs || info.mtimeMs,
           sourceKind: 'recycle-bin',
+          isDeleted: true,
+          scanPhase: 'quick',
           offset: 0,
           sector: 0,
           devicePath: fullR,
@@ -549,8 +555,8 @@ function extractLfnCharsCjs(entry) {
   return out;
 }
 
-// Stream FAT32 directory clusters via fs.readSync to recover deleted LFN files + subdirectories + extents
-function scanFat32VolumeFromFd(fd, devicePath, vol, limitBytes) {
+// Stream FAT32 directory clusters via fs.readSync to recover deleted + existing LFN files
+function scanFat32VolumeFromFd(fd, devicePath, vol, limitBytes, includeExisting = false) {
   const out = [];
   const boot = vol.bootBuf;
   if (!boot) return out;
@@ -648,7 +654,7 @@ function scanFat32VolumeFromFd(fd, devicePath, vol, limitBytes) {
           }
           continue;
         }
-        if (!isDeleted || fileSize === 0 || firstCluster < 2) continue;
+        if ((!isDeleted && !includeExisting) || fileSize === 0 || firstCluster < 2) continue;
 
         const needed = Math.max(1, Math.ceil(fileSize / clusterBytes));
         const extents = [];
@@ -695,13 +701,15 @@ function scanFat32VolumeFromFd(fd, devicePath, vol, limitBytes) {
           calculatedSize: fileSize,
           modifiedAt,
           sourceKind: 'ntfs-mft',
+          isDeleted,
+          scanPhase: 'quick',
           offset: extents[0].offset,
           sector: Math.floor(extents[0].offset / 512),
           devicePath,
           runs: extents,
           mftResident: false,
-          mftOverwritten: overwritten,
-          mftBitmapIntact: !overwritten,
+          mftOverwritten: isDeleted ? overwritten : false,
+          mftBitmapIntact: isDeleted ? !overwritten : true,
           headerSample: new Uint8Array(hBuf.buffer, hBuf.byteOffset, hRead),
         });
       }
@@ -716,8 +724,8 @@ function scanFat32VolumeFromFd(fd, devicePath, vol, limitBytes) {
   return out;
 }
 
-// Stream exFAT directory clusters via fs.readSync to recover deleted 0x05 entries + Allocation Bitmap checks
-function scanExfatVolumeFromFd(fd, devicePath, vol, limitBytes) {
+// Stream exFAT directory clusters via fs.readSync to recover deleted 0x05 + existing 0x85 entries
+function scanExfatVolumeFromFd(fd, devicePath, vol, limitBytes, includeExisting = false) {
   const out = [];
   const boot = vol.bootBuf;
   if (!boot) return out;
@@ -826,7 +834,7 @@ function scanExfatVolumeFromFd(fd, devicePath, vol, limitBytes) {
           }
           continue;
         }
-        if (!isDeleted || dataLength === 0 || firstCluster < 2) continue;
+        if ((!isDeleted && !includeExisting) || dataLength === 0 || firstCluster < 2) continue;
 
         const needed = Math.max(1, Math.ceil(dataLength / clusterBytes));
         const extents = [];
@@ -872,13 +880,15 @@ function scanExfatVolumeFromFd(fd, devicePath, vol, limitBytes) {
           calculatedSize: dataLength,
           modifiedAt,
           sourceKind: 'ntfs-mft',
+          isDeleted,
+          scanPhase: 'quick',
           offset: extents[0].offset,
           sector: Math.floor(extents[0].offset / 512),
           devicePath,
           runs: extents,
           mftResident: false,
-          mftOverwritten: overwritten,
-          mftBitmapIntact: bitmap !== null && !overwritten,
+          mftOverwritten: isDeleted ? overwritten : false,
+          mftBitmapIntact: isDeleted ? (bitmap !== null && !overwritten) : true,
           headerSample: new Uint8Array(hBuf.buffer, hBuf.byteOffset, hRead),
         });
       }
@@ -927,15 +937,105 @@ function decodeNtfsRunlistCjs(buf, start, maxEnd, lowestVcn, highestVcn) {
   return runs;
 }
 
-function parseMftRecordRaw(fd, absOffset, ntfsParts, limitBytes, dirMap, bitmapByVol) {
-  const work = Buffer.allocUnsafe(1024);
-  if (fs.readSync(fd, work, 0, 1024, absOffset) < 1024) return null;
-  const usaOffset = work.readUInt16LE(4);
-  const usaCount = work.readUInt16LE(6);
-  const firstAttrOffset = work.readUInt16LE(20);
-  const flags = work.readUInt16LE(22);
-  const usedBytes = work.readUInt32LE(24);
-  const recordNumber = work.readUInt32LE(44);
+function parseUsnJournalBufferCjs(buf, dirMap, volKey, maxEntries = 1000) {
+  const out = [];
+  const seen = new Set();
+  let pos = 0;
+
+  while (pos + 64 <= buf.length && out.length < maxEntries) {
+    const recLen = buf.readUInt32LE(pos);
+    if (recLen === 0) {
+      const nextPage = Math.floor(pos / 4096) * 4096 + 4096;
+      if (nextPage <= pos) break;
+      pos = nextPage;
+      continue;
+    }
+    if (recLen < 60 || pos + recLen > buf.length) break;
+
+    const majorVer = buf.readUInt16LE(pos + 4);
+    if (majorVer !== 2 && majorVer !== 3) {
+      pos += recLen;
+      continue;
+    }
+
+    const fileRefLow = buf.readUInt32LE(pos + 8);
+    const parentRefLow = buf.readUInt32LE(pos + 16);
+    const tsLo = buf.readUInt32LE(pos + 32);
+    const tsHi = buf.readUInt32LE(pos + 36);
+    const reason = buf.readUInt32LE(pos + 40);
+    const fileAttrs = buf.readUInt32LE(pos + 52);
+
+    let nameLenOff = 56;
+    let nameOffOff = 58;
+    if (majorVer === 3) {
+      nameLenOff = 72;
+      nameOffOff = 74;
+    }
+    const nameLen = buf.readUInt16LE(pos + nameLenOff);
+    const nameOffset = buf.readUInt16LE(pos + nameOffOff);
+
+    const isDelete = (reason & (0x00000200 | 0x00001000)) !== 0;
+    const isDir = (fileAttrs & 0x10) !== 0;
+
+    if (isDelete && !isDir && nameLen >= 2 && pos + nameOffset + nameLen <= pos + recLen) {
+      const filename = buf.toString('utf16le', pos + nameOffset, pos + nameOffset + nameLen).split('\0')[0];
+      if (filename && !filename.startsWith('$')) {
+        const parts = [filename];
+        let cur = parentRefLow;
+        const visited = new Set();
+        let guard = 0;
+        while (cur > 5 && !visited.has(cur) && guard < 24) {
+          visited.add(cur);
+          const node = dirMap.get(`${volKey}:${cur}`);
+          if (!node || !node.name || node.name === '.') break;
+          parts.unshift(node.name);
+          if (node.parentRecord === cur) break;
+          cur = node.parentRecord;
+          guard++;
+        }
+        const reconstructedPath = `\\${parts.join('\\')}`;
+        const key = `${fileRefLow}:${reconstructedPath}`;
+        if (!seen.has(key)) {
+          seen.add(key);
+          const ticks = tsHi * 4294967296 + tsLo;
+          const modifiedAt = ticks > 0 ? Math.floor(ticks / 10000 - WINDOWS_EPOCH_DIFF_MS) : Date.now();
+          out.push({
+            id: `usn-${volKey}-${fileRefLow}-${pos}`,
+            filename,
+            originalPath: reconstructedPath,
+            extensionHint: path.extname(filename).replace(/^\./, '').toLowerCase(),
+            size: 0,
+            calculatedSize: 0,
+            modifiedAt,
+            sourceKind: 'ntfs-mft',
+            isDeleted: true,
+            scanPhase: 'usn',
+            offset: 0,
+            sector: 0,
+            devicePath: '',
+            mftOverwritten: true,
+            headerSample: new Uint8Array(0),
+          });
+        }
+      }
+    }
+
+    pos += recLen;
+  }
+
+  return out;
+}
+
+function parseMftRecordBuffer(work, absOffset, ntfsParts, fd, limitBytes, dirMap, bitmapByVol, includeExisting = false) {
+  if (!work || work.length < 1024) return null;
+  if (work[0] !== 0x46 || work[1] !== 0x49 || work[2] !== 0x4c || work[3] !== 0x45) return null;
+  const rec = Buffer.from(work.subarray(0, 1024));
+  const usaOffset = rec.readUInt16LE(4);
+  const usaCount = rec.readUInt16LE(6);
+  const firstAttrOffset = rec.readUInt16LE(20);
+  const flags = rec.readUInt16LE(22);
+  const usedBytes = rec.readUInt32LE(24);
+  const recordNumber = rec.readUInt32LE(44);
 
   if (
     usaOffset < 42 ||
@@ -948,12 +1048,12 @@ function parseMftRecordRaw(fd, absOffset, ntfsParts, limitBytes, dirMap, bitmapB
     return null;
   }
 
-  const usn = work.readUInt16LE(usaOffset);
+  const usn = rec.readUInt16LE(usaOffset);
   for (let s = 1; s < usaCount && s * 512 <= 1024; s++) {
     const sectorEnd = s * 512 - 2;
-    if (work.readUInt16LE(sectorEnd) !== usn) return null;
-    work[sectorEnd] = work[usaOffset + s * 2];
-    work[sectorEnd + 1] = work[usaOffset + s * 2 + 1];
+    if (rec.readUInt16LE(sectorEnd) !== usn) return null;
+    rec[sectorEnd] = rec[usaOffset + s * 2];
+    rec[sectorEnd + 1] = rec[usaOffset + s * 2 + 1];
   }
 
   const inUse = (flags & 0x0001) !== 0;
@@ -967,56 +1067,71 @@ function parseMftRecordRaw(fd, absOffset, ntfsParts, limitBytes, dirMap, bitmapB
   let fileSize = 0;
   let residentPayload = null;
   let rawRuns = [];
+  let usnRuns = [];
+  let usnSize = 0;
 
   while (pos + 16 <= usedBytes) {
-    const attrType = work.readUInt32LE(pos);
+    const attrType = rec.readUInt32LE(pos);
     if (attrType === 0xffffffff) break;
-    const attrLen = work.readUInt32LE(pos + 4);
+    const attrLen = rec.readUInt32LE(pos + 4);
     if (attrLen < 16 || pos + attrLen > usedBytes) break;
-    const form = work[pos + 8];
-    const nameLen = work[pos + 9];
+    const form = rec[pos + 8];
+    const nameLen = rec[pos + 9];
+    const nameOff = rec.readUInt16LE(pos + 10);
+    const attrName =
+      nameLen > 0 && pos + nameOff + nameLen * 2 <= pos + attrLen
+        ? rec.toString('utf16le', pos + nameOff, pos + nameOff + nameLen * 2)
+        : '';
 
     if (attrType === 0x10 && form === 0 && pos + 24 <= usedBytes) {
-      const vo = work.readUInt16LE(pos + 20);
-      const vl = work.readUInt32LE(pos + 16);
+      const vo = rec.readUInt16LE(pos + 20);
+      const vl = rec.readUInt32LE(pos + 16);
       if (vl >= 32 && pos + vo + 32 <= pos + attrLen) {
-        const lo = work.readUInt32LE(pos + vo + 8);
-        const hi = work.readUInt32LE(pos + vo + 12);
+        const lo = rec.readUInt32LE(pos + vo + 8);
+        const hi = rec.readUInt32LE(pos + vo + 12);
         const ticks = hi * 4294967296 + lo;
         if (ticks > 0) modifiedAt = Math.floor(ticks / 10000 - WINDOWS_EPOCH_DIFF_MS);
       }
     } else if (attrType === 0x30 && form === 0 && pos + 24 <= usedBytes) {
-      const vo = work.readUInt16LE(pos + 20);
-      const vl = work.readUInt32LE(pos + 16);
+      const vo = rec.readUInt16LE(pos + 20);
+      const vl = rec.readUInt32LE(pos + 16);
       const fb = pos + vo;
       if (vl >= 66 && fb + 66 <= pos + attrLen) {
-        const fnLen = work[fb + 64];
-        const fnSpace = work[fb + 65];
-        const cand = work.toString('utf16le', fb + 66, Math.min(pos + attrLen, fb + 66 + fnLen * 2)).split('\0')[0];
+        const fnLen = rec[fb + 64];
+        const fnSpace = rec[fb + 65];
+        const cand = rec.toString('utf16le', fb + 66, Math.min(pos + attrLen, fb + 66 + fnLen * 2)).split('\0')[0];
         const rank = fnSpace === 1 || fnSpace === 3 ? 2 : fnSpace === 0 ? 1 : 0;
         if (cand && rank >= nameScore) {
           nameScore = rank;
           filename = cand;
-          parentRecord = work.readUInt32LE(fb);
-          const fnSize = work.readUInt32LE(fb + 48) + work.readUInt32LE(fb + 52) * 4294967296;
+          parentRecord = rec.readUInt32LE(fb);
+          const fnSize = rec.readUInt32LE(fb + 48) + rec.readUInt32LE(fb + 52) * 4294967296;
           if (fileSize === 0 && fnSize > 0) fileSize = fnSize;
         }
       }
+    } else if (attrType === 0x80 && attrName === '$J' && form === 1 && pos + 64 <= pos + attrLen) {
+      const loVcn = rec.readUInt32LE(pos + 16) + rec.readUInt32LE(pos + 20) * 4294967296;
+      const hiVcn = rec.readUInt32LE(pos + 24) + rec.readUInt32LE(pos + 28) * 4294967296;
+      const mpOff = rec.readUInt16LE(pos + 32);
+      usnSize = rec.readUInt32LE(pos + 48) + rec.readUInt32LE(pos + 52) * 4294967296;
+      if (pos + mpOff < pos + attrLen) {
+        usnRuns = decodeNtfsRunlistCjs(rec, pos + mpOff, pos + attrLen, loVcn, hiVcn);
+      }
     } else if (attrType === 0x80 && nameLen === 0) {
       if (form === 0 && pos + 24 <= usedBytes) {
-        const vl = work.readUInt32LE(pos + 16);
-        const vo = work.readUInt16LE(pos + 20);
+        const vl = rec.readUInt32LE(pos + 16);
+        const vo = rec.readUInt16LE(pos + 20);
         if (pos + vo + vl <= pos + attrLen) {
           fileSize = vl;
-          residentPayload = Buffer.from(work.subarray(pos + vo, pos + vo + vl));
+          residentPayload = Buffer.from(rec.subarray(pos + vo, pos + vo + vl));
         }
       } else if (form === 1 && pos + 64 <= pos + attrLen) {
-        const loVcn = work.readUInt32LE(pos + 16) + work.readUInt32LE(pos + 20) * 4294967296;
-        const hiVcn = work.readUInt32LE(pos + 24) + work.readUInt32LE(pos + 28) * 4294967296;
-        const mpOff = work.readUInt16LE(pos + 32);
-        fileSize = work.readUInt32LE(pos + 48) + work.readUInt32LE(pos + 52) * 4294967296;
+        const loVcn = rec.readUInt32LE(pos + 16) + rec.readUInt32LE(pos + 20) * 4294967296;
+        const hiVcn = rec.readUInt32LE(pos + 24) + rec.readUInt32LE(pos + 28) * 4294967296;
+        const mpOff = rec.readUInt16LE(pos + 32);
+        fileSize = rec.readUInt32LE(pos + 48) + rec.readUInt32LE(pos + 52) * 4294967296;
         if (pos + mpOff < pos + attrLen) {
-          rawRuns = decodeNtfsRunlistCjs(work, pos + mpOff, pos + attrLen, loVcn, hiVcn);
+          rawRuns = decodeNtfsRunlistCjs(rec, pos + mpOff, pos + attrLen, loVcn, hiVcn);
         }
       }
     }
@@ -1032,7 +1147,6 @@ function parseMftRecordRaw(fd, absOffset, ntfsParts, limitBytes, dirMap, bitmapB
     return { consumed: true };
   }
 
-  // Capture NTFS $Bitmap (#6) allocation bitmap for cluster overwrite checks
   if (recordNumber === 6 && filename === '$Bitmap') {
     if (residentPayload && residentPayload.length > 0) {
       bitmapByVol.set(volKey, residentPayload);
@@ -1045,9 +1159,7 @@ function parseMftRecordRaw(fd, absOffset, ntfsParts, limitBytes, dirMap, bitmapB
         const take = Math.min(r.clusterCount * part.clusterBytes, bmSize - bmCursor);
         if (r.lcn >= 0) {
           const bOff = part.volStart + r.lcn * part.clusterBytes;
-          if (bOff + take <= limitBytes) {
-            fs.readSync(fd, bm, bmCursor, take, bOff);
-          }
+          if (bOff + take <= limitBytes) fs.readSync(fd, bm, bmCursor, take, bOff);
         }
         bmCursor += take;
       }
@@ -1056,7 +1168,12 @@ function parseMftRecordRaw(fd, absOffset, ntfsParts, limitBytes, dirMap, bitmapB
     return { consumed: true };
   }
 
-  if (inUse || filename.startsWith('$') || fileSize === 0) return null;
+  if (filename === '$UsnJrnl' && usnRuns.length > 0) {
+    return { consumed: true, usnVol: part, usnRuns, usnSize };
+  }
+
+  const isDeleted = !inUse;
+  if ((!isDeleted && !includeExisting) || filename.startsWith('$') || fileSize === 0) return null;
   const ext = path.extname(filename).replace(/^\./, '').toLowerCase();
 
   if (residentPayload) {
@@ -1064,6 +1181,7 @@ function parseMftRecordRaw(fd, absOffset, ntfsParts, limitBytes, dirMap, bitmapB
       consumed: true,
       volKey,
       parentRecord,
+      isDeleted,
       rawRuns: [],
       entry: {
         id: `mft-${absOffset}-${recordNumber}`,
@@ -1074,6 +1192,8 @@ function parseMftRecordRaw(fd, absOffset, ntfsParts, limitBytes, dirMap, bitmapB
         calculatedSize: residentPayload.length,
         modifiedAt,
         sourceKind: 'ntfs-mft',
+        isDeleted,
+        scanPhase: 'quick',
         offset: absOffset,
         sector: Math.floor(absOffset / 512),
         devicePath: '',
@@ -1107,6 +1227,7 @@ function parseMftRecordRaw(fd, absOffset, ntfsParts, limitBytes, dirMap, bitmapB
     consumed: true,
     volKey,
     parentRecord,
+    isDeleted,
     rawRuns,
     entry: {
       id: `mft-${absOffset}-${recordNumber}`,
@@ -1117,6 +1238,8 @@ function parseMftRecordRaw(fd, absOffset, ntfsParts, limitBytes, dirMap, bitmapB
       calculatedSize: fileSize,
       modifiedAt,
       sourceKind: 'ntfs-mft',
+      isDeleted,
+      scanPhase: 'quick',
       offset: extents[0].offset,
       sector: Math.floor(absOffset / 512),
       devicePath: '',
@@ -1125,6 +1248,130 @@ function parseMftRecordRaw(fd, absOffset, ntfsParts, limitBytes, dirMap, bitmapB
       headerSample: new Uint8Array(hdrBuf.buffer, hdrBuf.byteOffset, hRead),
     },
   };
+}
+
+// Fast Contiguous NTFS $MFT + $UsnJrnl:$J Streamer (seconds instead of scanning whole multi-TB platters)
+function scanNtfsMftContiguous(fd, devicePath, ntfsParts, limitBytes, includeExisting = false, maxRecords = 250000) {
+  const candidates = [];
+  const dirMap = new Map();
+  const bitmapByVol = new Map();
+  const usnSources = [];
+  const entries = [];
+  let recordCount = 0;
+
+  for (const part of ntfsParts) {
+    const boot = Buffer.allocUnsafe(512);
+    if (fs.readSync(fd, boot, 0, 512, part.volStart) < 512) continue;
+    const mftStartLcn = Number(boot.readBigUInt64LE(48));
+    if (!Number.isFinite(mftStartLcn) || mftStartLcn <= 0) continue;
+
+    const mftOffset0 = part.volStart + mftStartLcn * part.clusterBytes;
+    if (mftOffset0 + 1024 > limitBytes) continue;
+
+    const rec0 = Buffer.allocUnsafe(1024);
+    if (fs.readSync(fd, rec0, 0, 1024, mftOffset0) < 1024) continue;
+    if (rec0.toString('ascii', 0, 4) !== 'FILE') continue;
+
+    // Extract $MFT Record #0's unnamed $DATA runlist so we stream all $MFT extents contiguously
+    const usaOffset = rec0.readUInt16LE(4);
+    const usaCount = rec0.readUInt16LE(6);
+    const firstAttr = rec0.readUInt16LE(20);
+    const usedBytes = rec0.readUInt32LE(24);
+    if (usaOffset >= 42 && usaCount >= 2 && usaOffset + usaCount * 2 <= 1024) {
+      const usn = rec0.readUInt16LE(usaOffset);
+      for (let s = 1; s < usaCount && s * 512 <= 1024; s++) {
+        const se = s * 512 - 2;
+        if (rec0.readUInt16LE(se) === usn) {
+          rec0[se] = rec0[usaOffset + s * 2];
+          rec0[se + 1] = rec0[usaOffset + s * 2 + 1];
+        }
+      }
+    }
+
+    let mftRuns = [{ lcn: mftStartLcn, clusterCount: 64 }];
+    let pos = firstAttr;
+    while (pos + 16 <= usedBytes && pos + 16 <= 1024) {
+      const at = rec0.readUInt32LE(pos);
+      if (at === 0xffffffff) break;
+      const al = rec0.readUInt32LE(pos + 4);
+      if (al < 16 || pos + al > usedBytes) break;
+      if (at === 0x80 && rec0[pos + 8] === 1 && rec0[pos + 9] === 0 && pos + 64 <= pos + al) {
+        const loVcn = rec0.readUInt32LE(pos + 16) + rec0.readUInt32LE(pos + 20) * 4294967296;
+        const hiVcn = rec0.readUInt32LE(pos + 24) + rec0.readUInt32LE(pos + 28) * 4294967296;
+        const mpOff = rec0.readUInt16LE(pos + 32);
+        const decoded = decodeNtfsRunlistCjs(rec0, pos + mpOff, pos + al, loVcn, hiVcn);
+        if (decoded.length > 0) mftRuns = decoded;
+        break;
+      }
+      pos += al;
+    }
+
+    const chunkSize = 4 * 1024 * 1024;
+    const chunkBuf = Buffer.allocUnsafe(chunkSize);
+
+    for (const run of mftRuns) {
+      if (run.lcn < 0 || recordCount >= maxRecords) continue;
+      let runByteStart = part.volStart + run.lcn * part.clusterBytes;
+      let remBytes = run.clusterCount * part.clusterBytes;
+      while (remBytes >= 1024 && runByteStart + 1024 <= limitBytes && recordCount < maxRecords) {
+        const toRead = Math.min(chunkSize, remBytes, limitBytes - runByteStart);
+        const alignedRead = Math.floor(toRead / 1024) * 1024;
+        if (alignedRead < 1024) break;
+        const n = fs.readSync(fd, chunkBuf, 0, alignedRead, runByteStart);
+        if (n < 1024) break;
+
+        for (let off = 0; off + 1024 <= n && recordCount < maxRecords; off += 1024) {
+          recordCount++;
+          const mftRes = parseMftRecordBuffer(
+            chunkBuf.subarray(off, off + 1024),
+            runByteStart + off,
+            ntfsParts,
+            fd,
+            limitBytes,
+            dirMap,
+            bitmapByVol,
+            includeExisting,
+          );
+          if (mftRes?.usnRuns) {
+            usnSources.push(mftRes);
+          } else if (mftRes?.entry) {
+            mftRes.entry.devicePath = devicePath;
+            candidates.push(mftRes);
+            entries.push(mftRes.entry);
+          }
+        }
+        runByteStart += n;
+        remBytes -= n;
+      }
+    }
+  }
+
+  finalizeNtfsMftMetadata(candidates, dirMap, bitmapByVol);
+
+  // Parse recent $UsnJrnl:$J deleted entries
+  for (const src of usnSources) {
+    const part = src.usnVol;
+    const tailRuns = src.usnRuns.slice(-4);
+    for (const r of tailRuns) {
+      if (r.lcn < 0) continue;
+      const off = part.volStart + r.lcn * part.clusterBytes;
+      const len = Math.min(4 * 1024 * 1024, r.clusterCount * part.clusterBytes, limitBytes - off);
+      if (len < 128) continue;
+      const uBuf = Buffer.allocUnsafe(len);
+      try {
+        const n = fs.readSync(fd, uBuf, 0, len, off);
+        const usnEntries = parseUsnJournalBufferCjs(uBuf.subarray(0, n), dirMap, part.volStart, 400);
+        for (const u of usnEntries) {
+          u.devicePath = devicePath;
+          entries.push(u);
+        }
+      } catch {
+        // skip unreadable USN slice
+      }
+    }
+  }
+
+  return { entries, dirMap, bitmapByVol };
 }
 
 function finalizeNtfsMftMetadata(mftRecords, dirMap, bitmapByVol) {
@@ -1145,7 +1392,7 @@ function finalizeNtfsMftMetadata(mftRecords, dirMap, bitmapByVol) {
     rec.entry.originalPath = `\\${parts.join('\\')}`;
 
     const bm = bitmapByVol.get(rec.volKey);
-    if (bm && rec.rawRuns.length > 0) {
+    if (bm && rec.rawRuns.length > 0 && rec.isDeleted) {
       let overwritten = false;
       for (const r of rec.rawRuns) {
         if (r.lcn < 0) continue;
@@ -1163,6 +1410,289 @@ function finalizeNtfsMftMetadata(mftRecords, dirMap, bitmapByVol) {
       rec.entry.mftBitmapIntact = !overwritten;
     }
   }
+}
+
+async function resolveBackingPhysicalDrive(winPath) {
+  if (process.platform !== 'win32' || !winPath || !/^[A-Za-z]:/.test(winPath)) return null;
+  const letter = winPath[0].toUpperCase();
+  const rows = await runPowerShellJson(
+    `Get-Partition -DriveLetter '${letter}' -ErrorAction SilentlyContinue | Select-Object DiskNumber | ConvertTo-Json -Compress`,
+  );
+  if (!rows || rows.length === 0 || rows[0].DiskNumber === undefined) return null;
+  return {
+    driveLetter: `${letter}:`,
+    devicePath: `\\\\.\\PhysicalDrive${Number(rows[0].DiskNumber)}`,
+    relPrefix: winPath.slice(2).replace(/^\\+/, ''),
+  };
+}
+
+async function scanVssSnapshotsForPrefix(relPrefix, existingPathsSet, outList, maxFiles = 1500) {
+  if (process.platform !== 'win32' || outList.length >= maxFiles) return;
+  const shadows = await runPowerShellJson(
+    'Get-CimInstance Win32_ShadowCopy -ErrorAction SilentlyContinue | Select-Object DeviceObject,InstallDate | ConvertTo-Json -Compress',
+  );
+  if (!shadows || shadows.length === 0) return;
+
+  for (const sh of shadows.slice(-3)) {
+    if (outList.length >= maxFiles || !sh?.DeviceObject) continue;
+    const baseObj = String(sh.DeviceObject).replace(/\\+$/, '');
+    const targetDir = relPrefix ? `${baseObj}\\${relPrefix}` : `${baseObj}\\`;
+    const temp = [];
+    walkFolderEntries(targetDir, temp, Math.min(600, maxFiles - outList.length), null, '');
+    for (const item of temp) {
+      const normKey = `${relPrefix ? relPrefix.toLowerCase() + '\\' : ''}${item.filename.toLowerCase()}`;
+      if (existingPathsSet.has(normKey)) continue;
+      existingPathsSet.add(normKey);
+      item.id = `vss-${sh.DeviceObject}-${item.devicePath}`;
+      item.isDeleted = true;
+      item.scanPhase = 'vss';
+      item.originalPath = relPrefix ? `\\${relPrefix}\\${item.filename}` : `\\${item.filename}`;
+      outList.push(item);
+    }
+  }
+}
+
+async function huntDeletedInBackingDrive(backing, isRecycleBin, maxEntries = 2000) {
+  let fd;
+  try {
+    fd = fs.openSync(backing.devicePath, 'r');
+  } catch {
+    return { status: 'needs-admin', entries: [] };
+  }
+
+  try {
+    const disks = await runPowerShellJson(
+      `Get-Disk | Where-Object { $_.Number -eq ${Number(backing.devicePath.replace(/\D+/g, '') || 0)} } | Select-Object Size | ConvertTo-Json -Compress`,
+    );
+    const diskSize = Number(disks?.[0]?.Size || 0);
+    const limitBytes = diskSize > 0 ? diskSize : 512 * 1024 * 1024 * 1024;
+    const volumes = detectVolumesFromDisk(fd, limitBytes);
+    const ntfsParts = volumes.filter((v) => v.fsType === 'ntfs');
+
+    const candidates = [];
+    if (ntfsParts.length > 0) {
+      const mftRes = scanNtfsMftContiguous(fd, backing.devicePath, ntfsParts, limitBytes, false, 160000);
+      candidates.push(...mftRes.entries);
+    }
+    for (const vol of volumes) {
+      if (vol.fsType === 'fat32') {
+        candidates.push(...scanFat32VolumeFromFd(fd, backing.devicePath, vol, limitBytes, false));
+      } else if (vol.fsType === 'exfat') {
+        candidates.push(...scanExfatVolumeFromFd(fd, backing.devicePath, vol, limitBytes, false));
+      }
+    }
+
+    const normPrefix = (backing.relPrefix || '').toLowerCase().replace(/^\\+|\\+$/g, '');
+    const filtered = [];
+    for (const item of candidates) {
+      if (filtered.length >= maxEntries) break;
+      const itemPath = String(item.originalPath || '').toLowerCase();
+      if (isRecycleBin) {
+        if (itemPath.includes('$recycle.bin') || item.scanPhase === 'usn') {
+          filtered.push(item);
+        }
+      } else if (normPrefix) {
+        if (itemPath.includes(normPrefix)) {
+          filtered.push(item);
+        }
+      } else {
+        filtered.push(item);
+      }
+    }
+    return { status: 'ok', entries: filtered };
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
+function makeBoxCjs(type, children) {
+  const payloadLen = children.reduce((s, c) => s + c.length, 0);
+  const out = Buffer.allocUnsafe(8 + payloadLen);
+  out.writeUInt32BE(out.length, 0);
+  out.write(type.slice(0, 4), 4, 'ascii');
+  let p = 8;
+  for (const c of children) {
+    c.copy(out, p);
+    p += c.length;
+  }
+  return out;
+}
+
+function fullBoxCjs(type, version, flags, payload) {
+  const vf = Buffer.allocUnsafe(4);
+  vf[0] = version & 0xff;
+  vf[1] = (flags >> 16) & 0xff;
+  vf[2] = (flags >> 8) & 0xff;
+  vf[3] = flags & 0xff;
+  return makeBoxCjs(type, [vf, payload]);
+}
+
+function repairTruncatedMp4BufferCjs(rawBuf) {
+  if (!rawBuf || rawBuf.length < 32) return null;
+  let pos = 0;
+  let ftypSlice = null;
+  let mdatOffset = -1;
+  let mdatDataStart = -1;
+  let mdatDataEnd = -1;
+  let hasMoov = false;
+
+  while (pos + 8 <= rawBuf.length) {
+    let sz = rawBuf.readUInt32BE(pos);
+    const tp = rawBuf.toString('ascii', pos + 4, pos + 8);
+    let hdrSize = 8;
+    if (sz === 1 && pos + 16 <= rawBuf.length) {
+      sz = rawBuf.readUInt32BE(pos + 8) * 4294967296 + rawBuf.readUInt32BE(pos + 12);
+      hdrSize = 16;
+    } else if (sz === 0) {
+      sz = rawBuf.length - pos;
+    }
+    if (!/^[\x20-\x7e]{4}$/.test(tp) || sz < 8) break;
+    const end = Math.min(rawBuf.length, pos + sz);
+    if (tp === 'ftyp') ftypSlice = Buffer.from(rawBuf.subarray(pos, end));
+    if (tp === 'moov') hasMoov = true;
+    if (tp === 'mdat') {
+      mdatOffset = pos;
+      mdatDataStart = pos + hdrSize;
+      mdatDataEnd = end;
+      break;
+    }
+    pos = end;
+  }
+  if (hasMoov || mdatOffset < 0 || mdatDataEnd <= mdatDataStart) return null;
+
+  const payload = rawBuf.subarray(mdatDataStart, mdatDataEnd);
+  let sps = null;
+  let pps = null;
+  const sampleOffsets = [];
+  const sampleSizes = [];
+  const syncSamples = [];
+
+  // Detect AVCC length-prefixed frames or Annex-B start codes inside mdat
+  let p = 0;
+  while (p + 5 <= payload.length && sampleSizes.length < 20000) {
+    const nalLen = payload.readUInt32BE(p);
+    if (nalLen > 0 && p + 4 + nalLen <= payload.length) {
+      const nt = payload[p + 4] & 0x1f;
+      if (nt === 7 && !sps) sps = Buffer.from(payload.subarray(p + 4, p + 4 + nalLen));
+      if (nt === 8 && !pps) pps = Buffer.from(payload.subarray(p + 4, p + 4 + nalLen));
+      if (nt === 1 || nt === 5) {
+        sampleOffsets.push(p);
+        sampleSizes.push(4 + nalLen);
+        if (nt === 5) syncSamples.push(sampleSizes.length);
+      }
+      p += 4 + nalLen;
+      continue;
+    }
+    break;
+  }
+
+  if (sampleSizes.length === 0) {
+    sampleOffsets.push(0);
+    sampleSizes.push(payload.length);
+    syncSamples.push(1);
+  }
+
+  const useSps = sps || Buffer.from([0x67, 0x42, 0xe0, 0x1f, 0xda, 0x01, 0x40, 0x16, 0xe4]);
+  const usePps = pps || Buffer.from([0x68, 0xce, 0x3c, 0x80]);
+
+  const avcC = makeBoxCjs('avcC', [
+    Buffer.from([1, useSps[1] || 0x42, useSps[2] || 0xe0, useSps[3] || 0x1f, 0xff, 0xe1]),
+    Buffer.from([(useSps.length >> 8) & 0xff, useSps.length & 0xff]),
+    useSps,
+    Buffer.from([1, (usePps.length >> 8) & 0xff, usePps.length & 0xff]),
+    usePps,
+  ]);
+
+  const avc1Payload = Buffer.alloc(78);
+  avc1Payload.writeUInt16BE(1, 6);
+  avc1Payload.writeUInt16BE(1280, 24);
+  avc1Payload.writeUInt16BE(720, 26);
+  avc1Payload.writeUInt32BE(0x00480000, 28);
+  avc1Payload.writeUInt32BE(0x00480000, 32);
+  avc1Payload.writeUInt16BE(1, 40);
+  avc1Payload.writeUInt16BE(24, 74);
+  avc1Payload.writeInt16BE(-1, 76);
+
+  const stsdBuf = Buffer.allocUnsafe(4);
+  stsdBuf.writeUInt32BE(1, 0);
+  const stsd = fullBoxCjs('stsd', 0, 0, Buffer.concat([stsdBuf, makeBoxCjs('avc1', [avc1Payload, avcC])]));
+
+  const sttsP = Buffer.alloc(12);
+  sttsP.writeUInt32BE(1, 0);
+  sttsP.writeUInt32BE(sampleSizes.length, 4);
+  sttsP.writeUInt32BE(30, 8);
+  const stts = fullBoxCjs('stts', 0, 0, sttsP);
+
+  const stscP = Buffer.alloc(16);
+  stscP.writeUInt32BE(1, 0);
+  stscP.writeUInt32BE(1, 4);
+  stscP.writeUInt32BE(1, 8);
+  stscP.writeUInt32BE(1, 12);
+  const stsc = fullBoxCjs('stsc', 0, 0, stscP);
+
+  const stszP = Buffer.alloc(8 + sampleSizes.length * 4);
+  stszP.writeUInt32BE(0, 0);
+  stszP.writeUInt32BE(sampleSizes.length, 4);
+  for (let i = 0; i < sampleSizes.length; i++) stszP.writeUInt32BE(sampleSizes[i], 8 + i * 4);
+  const stsz = fullBoxCjs('stsz', 0, 0, stszP);
+
+  const stssIdx = syncSamples.length > 0 ? syncSamples : [1];
+  const stssP = Buffer.alloc(4 + stssIdx.length * 4);
+  stssP.writeUInt32BE(stssIdx.length, 0);
+  for (let i = 0; i < stssIdx.length; i++) stssP.writeUInt32BE(stssIdx[i], 4 + i * 4);
+  const stss = fullBoxCjs('stss', 0, 0, stssP);
+
+  const stcoP = Buffer.alloc(4 + sampleOffsets.length * 4);
+  stcoP.writeUInt32BE(sampleOffsets.length, 0);
+  const ftyp = ftypSlice || Buffer.from([0, 0, 0, 20, 0x66, 0x74, 0x79, 0x70, 0x6d, 0x70, 0x34, 0x32, 0, 0, 0, 0, 0x69, 0x73, 0x6f, 0x6d]);
+  const newMdat = makeBoxCjs('mdat', [payload]);
+  const mdatPayloadBase = ftyp.length + 8;
+
+  for (let i = 0; i < sampleOffsets.length; i++) {
+    stcoP.writeUInt32BE(mdatPayloadBase + sampleOffsets[i], 4 + i * 4);
+  }
+  const stco = fullBoxCjs('stco', 0, 0, stcoP);
+
+  const timescale = 900;
+  const duration = sampleSizes.length * 30;
+  const mvhdP = Buffer.alloc(96);
+  mvhdP.writeUInt32BE(timescale, 8);
+  mvhdP.writeUInt32BE(duration, 12);
+  mvhdP.writeUInt32BE(0x00010000, 16);
+  mvhdP.writeUInt16BE(0x0100, 20);
+  mvhdP.writeUInt32BE(0x00010000, 32);
+  mvhdP.writeUInt32BE(0x00010000, 48);
+  mvhdP.writeUInt32BE(0x40000000, 64);
+  mvhdP.writeUInt32BE(2, 92);
+
+  const tkhdP = Buffer.alloc(80);
+  tkhdP.writeUInt32BE(1, 8);
+  tkhdP.writeUInt32BE(duration, 16);
+  tkhdP.writeUInt32BE(0x00010000, 36);
+  tkhdP.writeUInt32BE(0x00010000, 52);
+  tkhdP.writeUInt32BE(0x40000000, 68);
+  tkhdP.writeUInt32BE(1280 << 16, 72);
+  tkhdP.writeUInt32BE(720 << 16, 76);
+
+  const mdhdP = Buffer.alloc(20);
+  mdhdP.writeUInt32BE(timescale, 8);
+  mdhdP.writeUInt32BE(duration, 12);
+  mdhdP.writeUInt16BE(0x55c4, 16);
+
+  const hdlrP = Buffer.alloc(24);
+  hdlrP.write('vide', 4, 'ascii');
+  const drefP = Buffer.alloc(4);
+  drefP.writeUInt32BE(1, 0);
+  const urlBox = fullBoxCjs('url ', 0, 1, Buffer.alloc(0));
+  const dinf = makeBoxCjs('dinf', [fullBoxCjs('dref', 0, 0, Buffer.concat([drefP, urlBox]))]);
+  const vmhd = fullBoxCjs('vmhd', 0, 1, Buffer.alloc(8));
+  const stbl = makeBoxCjs('stbl', [stsd, stts, stsc, stsz, stco, stss]);
+  const minf = makeBoxCjs('minf', [vmhd, dinf, stbl]);
+  const mdia = makeBoxCjs('mdia', [fullBoxCjs('mdhd', 0, 0, mdhdP), fullBoxCjs('hdlr', 0, 0, hdlrP), minf]);
+  const trak = makeBoxCjs('trak', [fullBoxCjs('tkhd', 0, 3, tkhdP), mdia]);
+  const moov = makeBoxCjs('moov', [fullBoxCjs('mvhd', 0, 0, mvhdP), trak]);
+
+  return Buffer.concat([ftyp, newMdat, moov]);
 }
 
 function createWindow() {
@@ -1285,15 +1815,47 @@ app.whenReady().then(() => {
     return res.filePaths[0];
   });
 
-  ipcMain.handle('win:scan-folder', async (_event, folderPath) => {
-    const out = [];
-    walkFolderEntries(folderPath, out, 5000);
-    return out;
+  ipcMain.handle('win:list-bitlocker', async () => {
+    if (process.platform !== 'win32') return [];
+    const vols = await runPowerShellJson(
+      'Get-BitLockerVolume -ErrorAction SilentlyContinue | Select-Object MountPoint,LockStatus,EncryptionPercentage,VolumeStatus,ProtectionStatus | ConvertTo-Json -Compress',
+    );
+    return vols.map((v) => ({
+      mountPoint: String(v.MountPoint || ''),
+      lockStatus: String(v.LockStatus || 'Unknown'),
+      encryptionPercent: Number(v.EncryptionPercentage || 0),
+      volumeStatus: String(v.VolumeStatus || ''),
+    }));
   });
 
-  ipcMain.handle('win:scan-recycle-bin', async () => {
+  ipcMain.handle('win:unlock-bitlocker', async (_event, { driveLetter, recoveryKey, password }) => {
+    if (process.platform !== 'win32') return { ok: false, error: 'Only supported on Windows.' };
+    const cleanLetter = String(driveLetter || '').trim().replace(/:$/, '');
+    if (!/^[A-Za-z]$/.test(cleanLetter)) return { ok: false, error: 'Invalid drive letter.' };
+    const args = ['-unlock', `${cleanLetter}:`];
+    if (recoveryKey && String(recoveryKey).trim()) {
+      args.push('-RecoveryPassword', String(recoveryKey).trim());
+    } else if (password && String(password).trim()) {
+      args.push('-Password', String(password).trim());
+    } else {
+      return { ok: false, error: 'Enter a 48-digit BitLocker recovery password or user password.' };
+    }
+    return await new Promise((resolve) => {
+      execFile('manage-bde.exe', args, { windowsHide: true }, (err, stdout, stderr) => {
+        if (err) {
+          resolve({ ok: false, error: (stderr || stdout || err.message || 'Unlock failed').trim() });
+          return;
+        }
+        resolve({ ok: true, message: (stdout || `Unlocked ${cleanLetter}:`).trim() });
+      });
+    });
+  });
+
+  async function scanLocationAndDeleted(targetPath, isRecycleBin) {
     const out = [];
-    if (process.platform === 'win32') {
+    const existingSet = new Set();
+
+    if (isRecycleBin && process.platform === 'win32') {
       const roots = await runPowerShellJson(
         'Get-PSDrive -PSProvider FileSystem | Select-Object Root | ConvertTo-Json -Compress',
       );
@@ -1302,282 +1864,265 @@ app.whenReady().then(() => {
           scanRecycleDir(path.join(String(r.Root), '$Recycle.Bin'), out, 5000);
         }
       }
+    } else if (targetPath) {
+      walkFolderEntries(targetPath, out, 5000);
+      for (const item of out) {
+        existingSet.add(item.filename.toLowerCase());
+      }
     }
-    return out;
+
+    let deletedLookupStatus = 'unsupported';
+    let backingDrive;
+    if (process.platform === 'win32') {
+      const probePath = targetPath || `${process.env.SystemDrive || 'C:'}\\`;
+      const backing = await resolveBackingPhysicalDrive(probePath);
+      if (backing) {
+        backingDrive = backing.devicePath;
+        await scanVssSnapshotsForPrefix(backing.relPrefix, existingSet, out, 1500);
+        const delRes = await huntDeletedInBackingDrive(backing, isRecycleBin, 2000);
+        deletedLookupStatus = delRes.status;
+        if (delRes.entries.length > 0) {
+          out.push(...delRes.entries);
+        }
+      }
+    }
+
+    return {
+      entries: out,
+      path: targetPath,
+      deletedLookupStatus,
+      backingDrive,
+    };
+  }
+
+  ipcMain.handle('win:scan-folder', async (_event, folderPath) => {
+    return await scanLocationAndDeleted(folderPath, false);
+  });
+
+  ipcMain.handle('win:scan-recycle-bin', async () => {
+    return await scanLocationAndDeleted('$Recycle.Bin', true);
   });
 
   ipcMain.handle('win:scan-desktop', async () => {
     const desktopPath = app.getPath('desktop');
-    const out = [];
-    walkFolderEntries(desktopPath, out, 5000);
-    return { path: desktopPath, entries: out };
+    return await scanLocationAndDeleted(desktopPath, false);
   });
 
   ipcMain.handle('win:pause-drive-scan', async (_event, scanId) => {
     const state = activeScans.get(scanId);
-    if (state) state.paused = true;
+    if (state) {
+      state.paused = true;
+      if (state.ctrl) Atomics.store(state.ctrl, 0, 1);
+    }
   });
 
   ipcMain.handle('win:resume-drive-scan', async (_event, scanId) => {
     const state = activeScans.get(scanId);
-    if (state) state.paused = false;
+    if (state) {
+      state.paused = false;
+      if (state.ctrl) Atomics.store(state.ctrl, 0, 0);
+    }
   });
 
   ipcMain.handle('win:cancel-drive-scan', async (_event, scanId) => {
     const state = activeScans.get(scanId);
-    if (state) state.cancelled = true;
+    if (state) {
+      state.cancelled = true;
+      if (state.ctrl) Atomics.store(state.ctrl, 0, 2);
+    }
   });
 
-  ipcMain.handle('win:start-drive-scan', async (event, { scanId, devicePath, totalBytes, blockSize = 512, resumeOffset = 0 }) => {
-    const state = { cancelled: false, paused: false };
-    activeScans.set(scanId, state);
+  ipcMain.handle(
+    'win:start-drive-scan',
+    async (
+      event,
+      {
+        scanId,
+        devicePath,
+        totalBytes,
+        blockSize = 512,
+        resumeOffset = 0,
+        scanMode = 'full',
+        startPhase = 'quick',
+        includeExisting = true,
+      },
+    ) => {
+      const ctrlSab = typeof SharedArrayBuffer !== 'undefined' ? new SharedArrayBuffer(4) : null;
+      const ctrl = ctrlSab ? new Int32Array(ctrlSab) : null;
+      const state = { cancelled: false, paused: false, ctrl };
+      activeScans.set(scanId, state);
 
-    const step = Math.max(512, Math.floor(blockSize / 512) * 512);
-    const chunkSize = 4 * 1024 * 1024; // 4 MiB sector-aligned read chunks
-    const chunkBuf = Buffer.allocUnsafe(chunkSize);
-    const results = [];
-    const ntfsCandidates = [];
-    const mftDirMap = new Map();
-    const ntfsBitmapByVol = new Map();
-    let foundBytes = 0;
-    let fileIndex = 1;
-    let cursor = Math.max(0, Math.floor(resumeOffset / 512) * 512);
+      const step = Math.max(512, Math.floor(blockSize / 512) * 512);
+      const results = [];
+      const seenOffsets = new Set();
+      let foundBytes = 0;
 
-    const fd = fs.openSync(devicePath, 'r');
-    try {
-      const limitBytes = totalBytes > 0 ? totalBytes : fs.fstatSync(fd).size;
-      const volumes = detectVolumesFromDisk(fd, limitBytes);
-      const ntfsParts = volumes.filter((v) => v.fsType === 'ntfs');
+      const fd = fs.openSync(devicePath, 'r');
+      let limitBytes = 0;
+      let volumes = [];
+      try {
+        limitBytes = totalBytes > 0 ? totalBytes : fs.fstatSync(fd).size;
+        volumes = detectVolumesFromDisk(fd, limitBytes);
 
-      // Pass 1 (Metadata): Scan FAT32 and exFAT deleted directory entries first
-      if (cursor === 0) {
-        const pass1Batch = [];
-        for (const vol of volumes) {
-          if (state.cancelled) break;
-          if (vol.fsType === 'fat32') {
-            const fatItems = scanFat32VolumeFromFd(fd, devicePath, vol, limitBytes);
-            for (const item of fatItems) {
+        // Stage 1: Fast Filesystem Metadata Scan (Contiguous NTFS $MFT + $UsnJrnl:$J + FAT32 + exFAT + VSS)
+        if (startPhase !== 'deep' && resumeOffset === 0 && !state.cancelled) {
+          event.sender.send('win:drive-scan-progress', {
+            scanId,
+            currentBytes: 0,
+            totalBytes: limitBytes,
+            percent: 2,
+            foundCount: 0,
+            foundBytes: 0,
+            phase: 'quick',
+          });
+
+          const quickBatch = [];
+          const ntfsParts = volumes.filter((v) => v.fsType === 'ntfs');
+          if (ntfsParts.length > 0) {
+            const ntfsQuick = scanNtfsMftContiguous(fd, devicePath, ntfsParts, limitBytes, includeExisting);
+            for (const item of ntfsQuick.entries) {
               results.push(item);
-              pass1Batch.push(item);
+              quickBatch.push(item);
               foundBytes += item.size;
+              if (item.offset > 0) seenOffsets.add(item.offset);
             }
-          } else if (vol.fsType === 'exfat') {
-            const exItems = scanExfatVolumeFromFd(fd, devicePath, vol, limitBytes);
-            for (const item of exItems) {
+          }
+
+          for (const vol of volumes) {
+            if (state.cancelled) break;
+            const fsList =
+              vol.fsType === 'fat32'
+                ? scanFat32VolumeFromFd(fd, devicePath, vol, limitBytes, includeExisting)
+                : vol.fsType === 'exfat'
+                  ? scanExfatVolumeFromFd(fd, devicePath, vol, limitBytes, includeExisting)
+                  : [];
+            for (const item of fsList) {
               results.push(item);
-              pass1Batch.push(item);
+              quickBatch.push(item);
               foundBytes += item.size;
+              if (item.offset > 0) seenOffsets.add(item.offset);
+            }
+          }
+
+          if (quickBatch.length > 0) {
+            for (let i = 0; i < quickBatch.length; i += 250) {
+              event.sender.send('win:drive-scan-batch', {
+                scanId,
+                entries: quickBatch.slice(i, i + 250),
+              });
             }
           }
         }
-        if (pass1Batch.length > 0) {
-          event.sender.send('win:drive-scan-batch', { scanId, entries: pass1Batch });
-        }
+      } finally {
+        fs.closeSync(fd);
       }
 
-      // Pass 2 (Deep Sector Carving + NTFS $MFT Record Harvesting)
-      while (cursor + 512 <= limitBytes && !state.cancelled) {
-        while (state.paused && !state.cancelled) {
-          await new Promise((r) => setTimeout(r, 80));
+      if (scanMode === 'quick' || state.cancelled) {
+        event.sender.send('win:drive-scan-progress', {
+          scanId,
+          currentBytes: limitBytes,
+          totalBytes: limitBytes,
+          percent: 100,
+          foundCount: results.length,
+          foundBytes,
+          phase: 'quick',
+        });
+        activeScans.delete(scanId);
+        return results;
+      }
+
+      // Stage 2: Parallel Deep Sector Carving across Node worker_threads (with 64-bit zero skip)
+      const cursorStart = Math.max(0, Math.floor(resumeOffset / 512) * 512);
+      const remainingBytes = Math.max(0, limitBytes - cursorStart);
+      const workerCount =
+        remainingBytes >= 4 * 1024 * 1024
+          ? Math.min(4, Math.max(1, os.cpus().length - 1))
+          : 1;
+      const sliceBytes = Math.ceil(remainingBytes / workerCount / 512) * 512;
+
+      let totalBytesRead = cursorStart;
+      let latestName;
+
+      await new Promise((resolveAll) => {
+        let finished = 0;
+        if (remainingBytes < 512) {
+          resolveAll();
+          return;
         }
-        if (state.cancelled) break;
-
-        const windowLen = Math.min(chunkSize, Math.floor((limitBytes - cursor) / 512) * 512);
-        if (windowLen < 512) break;
-
-        let n = 0;
-        try {
-          n = fs.readSync(fd, chunkBuf, 0, windowLen, cursor);
-        } catch {
-          break;
-        }
-        if (n < 512) break;
-
-        let local = 0;
-        const chunkBatch = [];
-        while (local + 16 <= n && !state.cancelled) {
-          const b0 = chunkBuf[local];
-          const b1 = chunkBuf[local + 1];
-          const b2 = chunkBuf[local + 2];
-          const b3 = chunkBuf[local + 3];
-          const b4 = chunkBuf[local + 4];
-          const absOffset = cursor + local;
-
-          // NTFS MFT FILE record check (captures dirs, $Bitmap #6, and deleted files)
-          if (b0 === 0x46 && b1 === 0x49 && b2 === 0x4c && b3 === 0x45 && absOffset + 1024 <= limitBytes) {
-            const mftRes = parseMftRecordRaw(fd, absOffset, ntfsParts, limitBytes, mftDirMap, ntfsBitmapByVol);
-            if (mftRes) {
-              if (mftRes.entry) {
-                mftRes.entry.devicePath = devicePath;
-                ntfsCandidates.push(mftRes);
-                results.push(mftRes.entry);
-                chunkBatch.push(mftRes.entry);
-                foundBytes += mftRes.entry.size;
-              }
-              local += 1024;
-              continue;
-            }
-          }
-
-          let matchedExt = null;
-          let measured = null;
-
-          if (b0 === 0xff && b1 === 0xd8 && b2 === 0xff && [0xe0, 0xe1, 0xe2, 0xdb, 0xee, 0xc0, 0xc2].includes(b3)) {
-            matchedExt = 'jpg';
-            measured = measureJpgFromFd(fd, absOffset, limitBytes);
-          } else if (b0 === 0x89 && b1 === 0x50 && b2 === 0x4e && b3 === 0x47 && chunkBuf[local + 4] === 0x0d) {
-            matchedExt = 'png';
-            measured = measurePngFromFd(fd, absOffset, limitBytes);
-          } else if (b0 === 0x47 && b1 === 0x49 && b2 === 0x46 && b3 === 0x38) {
-            matchedExt = 'gif';
-            measured = measureGifFromFd(fd, absOffset, limitBytes);
-          } else if (b0 === 0x42 && b1 === 0x4d && local + 18 <= n) {
-            const bfSize = chunkBuf.readUInt32LE(local + 2);
-            const dibSize = chunkBuf.readUInt32LE(local + 14);
-            if (bfSize > 54 && bfSize < 100 * 1024 * 1024 && [12, 40, 52, 56, 108, 124].includes(dibSize)) {
-              matchedExt = 'bmp';
-              measured = { size: Math.min(bfSize, limitBytes - absOffset), truncated: bfSize > limitBytes - absOffset };
-            }
-          } else if (b4 === 0x66 && chunkBuf[local + 5] === 0x74 && chunkBuf[local + 6] === 0x79 && chunkBuf[local + 7] === 0x70) {
-            matchedExt = 'mp4';
-            measured = measureMp4FromFd(fd, absOffset, limitBytes);
-          } else if (b0 === 0x1a && b1 === 0x45 && b2 === 0xdf && b3 === 0xa3) {
-            matchedExt = 'mkv';
-            measured = { size: Math.min(16 * 1024 * 1024, limitBytes - absOffset), truncated: false };
-          } else if (b0 === 0x52 && b1 === 0x49 && b2 === 0x46 && b3 === 0x46) {
-            const fourcc = chunkBuf.toString('ascii', local + 8, local + 12);
-            if (fourcc === 'WAVE' || fourcc === 'AVI ' || fourcc === 'WEBP') {
-              matchedExt = fourcc === 'WAVE' ? 'wav' : fourcc === 'AVI ' ? 'avi' : 'webp';
-              const riffSize = chunkBuf.readUInt32LE(local + 4) + 8;
-              measured = {
-                size: Math.min(riffSize, limitBytes - absOffset),
-                truncated: riffSize > limitBytes - absOffset,
-              };
-            }
-          } else if (b0 === 0x30 && b1 === 0x26 && b2 === 0xb2 && b3 === 0x75) {
-            matchedExt = 'wmv';
-            measured = { size: Math.min(16 * 1024 * 1024, limitBytes - absOffset), truncated: false };
-          } else if (b0 === 0x46 && b1 === 0x4c && b2 === 0x56 && b3 === 0x01) {
-            matchedExt = 'flv';
-            measured = { size: Math.min(16 * 1024 * 1024, limitBytes - absOffset), truncated: false };
-          } else if (b0 === 0x25 && b1 === 0x50 && b2 === 0x44 && b3 === 0x46 && b4 === 0x2d) {
-            matchedExt = 'pdf';
-            measured = measurePdfFromFd(fd, absOffset, limitBytes);
-          } else if (b0 === 0x50 && b1 === 0x4b && b2 === 0x03 && b3 === 0x04) {
-            matchedExt = 'zip';
-            measured = measureZipFromFd(fd, absOffset, limitBytes);
-          } else if (b0 === 0xd0 && b1 === 0xcf && b2 === 0x11 && b3 === 0xe0) {
-            matchedExt = 'doc';
-            measured = { size: Math.min(4 * 1024 * 1024, limitBytes - absOffset), truncated: false };
-          } else if (b0 === 0x7b && b1 === 0x5c && b2 === 0x72 && b3 === 0x74 && b4 === 0x66) {
-            matchedExt = 'rtf';
-            measured = { size: Math.min(2 * 1024 * 1024, limitBytes - absOffset), truncated: false };
-          } else if (b0 === 0x53 && b1 === 0x51 && b2 === 0x4c && b3 === 0x69 && chunkBuf.toString('ascii', local, local + 15) === 'SQLite format 3') {
-            matchedExt = 'sqlite';
-            measured = measureSqliteFromFd(fd, absOffset, limitBytes);
-          } else if (b0 === 0x49 && b1 === 0x44 && b2 === 0x33 && local + 10 <= n) {
-            const tagSz =
-              ((chunkBuf[local + 6] & 0x7f) << 21) |
-              ((chunkBuf[local + 7] & 0x7f) << 14) |
-              ((chunkBuf[local + 8] & 0x7f) << 7) |
-              (chunkBuf[local + 9] & 0x7f);
-            if (tagSz > 0) {
-              matchedExt = 'mp3';
-              measured = { size: Math.min(tagSz + 4 * 1024 * 1024, limitBytes - absOffset), truncated: false };
-            }
-          } else if (b0 === 0x66 && b1 === 0x4c && b2 === 0x61 && b3 === 0x43) {
-            matchedExt = 'flac';
-            measured = { size: Math.min(16 * 1024 * 1024, limitBytes - absOffset), truncated: false };
-          } else if (b0 === 0x4f && b1 === 0x67 && b2 === 0x67 && b3 === 0x53) {
-            matchedExt = 'ogg';
-            measured = { size: Math.min(8 * 1024 * 1024, limitBytes - absOffset), truncated: false };
-          } else if (b0 === 0x52 && b1 === 0x61 && b2 === 0x72 && b3 === 0x21) {
-            matchedExt = 'rar';
-            measured = { size: Math.min(16 * 1024 * 1024, limitBytes - absOffset), truncated: false };
-          } else if (b0 === 0x37 && b1 === 0x7a && b2 === 0xbc && b3 === 0xaf && b4 === 0x27) {
-            matchedExt = '7z';
-            measured = { size: Math.min(16 * 1024 * 1024, limitBytes - absOffset), truncated: false };
-          } else if (b0 === 0x1f && b1 === 0x8b && b2 === 0x08) {
-            matchedExt = 'gz';
-            measured = { size: Math.min(8 * 1024 * 1024, limitBytes - absOffset), truncated: false };
-          } else if ((b0 === 0x49 && b1 === 0x49 && b2 === 0x2a && b3 === 0x00) || (b0 === 0x4d && b1 === 0x4d && b2 === 0x00 && b3 === 0x2a)) {
-            matchedExt = 'tif';
-            measured = { size: Math.min(16 * 1024 * 1024, limitBytes - absOffset), truncated: false };
-          } else if (b0 === 0x38 && b1 === 0x42 && b2 === 0x50 && b3 === 0x53) {
-            matchedExt = 'psd';
-            measured = { size: Math.min(24 * 1024 * 1024, limitBytes - absOffset), truncated: false };
-          }
-
-          if (matchedExt && measured && measured.size >= 32) {
-            const pad = String(fileIndex).padStart(6, '0');
-            const filename = `${matchedExt.toUpperCase()}_${pad}.${matchedExt}`;
-            const headerLen = Math.min(65536, measured.size);
-            const hdrSample = Buffer.allocUnsafe(headerLen);
-            const hRead = fs.readSync(fd, hdrSample, 0, headerLen, absOffset);
-
-            const carvedEntry = {
-              id: `drv-${absOffset}-${matchedExt}`,
-              filename,
-              originalPath: `${devicePath} @ sector ${Math.floor(absOffset / 512)}`,
-              extensionHint: matchedExt,
-              size: measured.size,
-              calculatedSize: measured.size,
-              truncated: measured.truncated,
-              modifiedAt: Date.now(),
-              sourceKind: 'carved',
-              offset: absOffset,
-              sector: Math.floor(absOffset / 512),
-              devicePath,
-              headerSample: new Uint8Array(hdrSample.buffer, hdrSample.byteOffset, hRead),
-            };
-            results.push(carvedEntry);
-            chunkBatch.push(carvedEntry);
-
-            foundBytes += measured.size;
-            fileIndex++;
-
-            const alignedSkip = Math.max(step, Math.ceil(measured.size / step) * step);
-            local += alignedSkip;
+        for (let w = 0; w < workerCount; w++) {
+          const rStart = cursorStart + w * sliceBytes;
+          const rEnd = w === workerCount - 1 ? limitBytes : Math.min(limitBytes, rStart + sliceBytes);
+          if (rStart >= rEnd) {
+            finished++;
+            if (finished >= workerCount) resolveAll();
             continue;
           }
 
-          local += step;
+          const worker = new Worker(path.join(__dirname, 'scannerWorker.cjs'), {
+            workerData: {
+              devicePath,
+              rangeStart: rStart,
+              rangeEnd: rEnd,
+              totalLimitBytes: limitBytes,
+              step,
+              workerIndex: w,
+              ctrlBuffer: ctrlSab,
+            },
+          });
+
+          worker.on('message', (msg) => {
+            if (!msg) return;
+            if (msg.type === 'batch' && Array.isArray(msg.entries)) {
+              const fresh = [];
+              for (const entry of msg.entries) {
+                if (seenOffsets.has(entry.offset)) continue;
+                seenOffsets.add(entry.offset);
+                results.push(entry);
+                fresh.push(entry);
+                foundBytes += entry.size;
+              }
+              if (fresh.length > 0) {
+                event.sender.send('win:drive-scan-batch', { scanId, entries: fresh });
+              }
+            } else if (msg.type === 'progress') {
+              totalBytesRead = Math.min(limitBytes, totalBytesRead + (msg.deltaBytes || 0));
+              if (msg.latestName) latestName = msg.latestName;
+              event.sender.send('win:drive-scan-progress', {
+                scanId,
+                currentBytes: totalBytesRead,
+                totalBytes: limitBytes,
+                percent: Math.min(99, Math.round((totalBytesRead / Math.max(1, limitBytes)) * 100)),
+                foundCount: results.length,
+                foundBytes,
+                latestName,
+                phase: 'deep',
+              });
+            }
+          });
+
+          const onWorkerDone = () => {
+            finished++;
+            if (finished >= workerCount) resolveAll();
+          };
+          worker.on('exit', onWorkerDone);
+          worker.on('error', onWorkerDone);
         }
-
-        if (chunkBatch.length > 0) {
-          event.sender.send('win:drive-scan-batch', { scanId, entries: chunkBatch });
-        }
-
-        cursor += n;
-        event.sender.send('win:drive-scan-progress', {
-          scanId,
-          currentBytes: cursor,
-          totalBytes: limitBytes,
-          percent: Math.min(99, Math.round((cursor / limitBytes) * 100)),
-          foundCount: results.length,
-          foundBytes,
-          latestName: results.length > 0 ? results[results.length - 1].filename : undefined,
-        });
-        await new Promise((r) => setTimeout(r, 0));
-      }
-
-      finalizeNtfsMftMetadata(ntfsCandidates, mftDirMap, ntfsBitmapByVol);
+      });
 
       event.sender.send('win:drive-scan-progress', {
         scanId,
-        currentBytes: cursor,
+        currentBytes: state.cancelled ? totalBytesRead : limitBytes,
         totalBytes: limitBytes,
-        percent: state.cancelled ? Math.round((cursor / limitBytes) * 100) : 100,
+        percent: state.cancelled ? Math.round((totalBytesRead / Math.max(1, limitBytes)) * 100) : 100,
         foundCount: results.length,
         foundBytes,
+        phase: 'deep',
       });
 
-      return results;
-    } finally {
       activeScans.delete(scanId);
-      fs.closeSync(fd);
-    }
-  });
+      return results;
+    },
+  );
 
   ipcMain.handle('win:recover-files', async (_event, { destinationDir, items }) => {
     let targetRoot = destinationDir;
@@ -1703,6 +2248,30 @@ app.whenReady().then(() => {
             fs.writeSync(dstFd, Buffer.from([0xff, 0xd9]));
             repairedCount++;
           }
+        } else if (
+          item.repairIfTruncated &&
+          ['mp4', 'mov', 'm4v'].includes(String(item.extension || '').toLowerCase()) &&
+          item.size <= 128 * 1024 * 1024
+        ) {
+          fs.closeSync(dstFd);
+          const rawBuf = fs.readFileSync(partialPath);
+          const rebuilt = repairTruncatedMp4BufferCjs(rawBuf);
+          if (rebuilt) {
+            fs.writeFileSync(partialPath, rebuilt);
+            repairedCount++;
+          }
+          if (item.modifiedAtMs) {
+            const dt = new Date(item.modifiedAtMs);
+            try {
+              fs.utimesSync(partialPath, dt, dt);
+            } catch {
+              // ignore timestamp error
+            }
+          }
+          fs.renameSync(partialPath, destPath);
+          committed = true;
+          savedCount++;
+          continue;
         }
 
         if (item.modifiedAtMs) {

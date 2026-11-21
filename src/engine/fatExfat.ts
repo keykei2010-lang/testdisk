@@ -10,6 +10,7 @@ export interface FsDeletedRecord {
   extents: { offset: number; length: number }[];
   partitionId: string;
   partitionName: string;
+  isDeleted: boolean;
   bitmapChecked: boolean;
   overwritten: boolean;
   reconstructedBytes: Uint8Array;
@@ -68,7 +69,11 @@ function readFat32ClusterBytes(
  * Scans FAT32 directory clusters (root + subdirectories up to depth 8) for deleted 0xE5 entries,
  * reconstructing UTF-16LE Long File Names (LFN), DOS timestamps, and cluster extents.
  */
-function scanFat32Partition(disk: Uint8Array, part: PartitionEntry): FsDeletedRecord[] {
+function scanFat32Partition(
+  disk: Uint8Array,
+  part: PartitionEntry,
+  includeExisting = false,
+): FsDeletedRecord[] {
   const volStart = part.startOffset;
   if (volStart + 512 > disk.length) return [];
   const dv = new DataView(disk.buffer, disk.byteOffset + volStart, 512);
@@ -190,7 +195,7 @@ function scanFat32Partition(disk: Uint8Array, part: PartitionEntry): FsDeletedRe
           continue;
         }
 
-        if (!isDeletedEntry || fileSize === 0 || firstCluster < 2) continue;
+        if ((!includeExisting && !isDeletedEntry) || fileSize === 0 || firstCluster < 2) continue;
 
         // Build extents: follow FAT chain if intact, otherwise contiguous fallback
         const neededClusters = Math.max(1, Math.ceil(fileSize / clusterBytes));
@@ -199,8 +204,6 @@ function scanFat32Partition(disk: Uint8Array, part: PartitionEntry): FsDeletedRe
         const firstFatVal = readFatEntry(firstCluster);
 
         if (firstFatVal !== 0) {
-          // Wait: if FAT entry is non-zero on a deleted entry, either FAT chain remained or cluster was reallocated!
-          // Check if subsequent clusters look like a valid linked chain or single-cluster EOF (>= 0x0ffffff8)
           let c = firstCluster;
           let rem = fileSize;
           const seenChain = new Set<number>();
@@ -216,15 +219,13 @@ function scanFat32Partition(disk: Uint8Array, part: PartitionEntry): FsDeletedRe
             if (next === 0 || next >= 0x0ffffff8) break;
             c = next;
           }
-          // If recovered extents don't reach fileSize while FAT had non-zero link, mark likely overwritten
           const covered = extents.reduce((s, e) => s + e.length, 0);
-          if (covered < fileSize) overwritten = true;
+          if (isDeletedEntry && covered < fileSize) overwritten = true;
         } else {
-          // Standard Windows/Camera FAT32 deletion zeros FAT entries -> assume contiguous clusters
           let rem = fileSize;
           for (let ci = 0; ci < neededClusters && rem > 0; ci++) {
             const c = firstCluster + ci;
-            if (ci > 0 && readFatEntry(c) !== 0) {
+            if (isDeletedEntry && ci > 0 && readFatEntry(c) !== 0) {
               overwritten = true;
             }
             const byteOff = dataStart + (c - 2) * clusterBytes;
@@ -258,6 +259,7 @@ function scanFat32Partition(disk: Uint8Array, part: PartitionEntry): FsDeletedRe
           extents,
           partitionId: part.id,
           partitionName: `FAT32 (${part.name})`,
+          isDeleted: isDeletedEntry,
           bitmapChecked: fatByteLen >= 16,
           overwritten,
           reconstructedBytes: out,
@@ -279,7 +281,11 @@ function scanFat32Partition(disk: Uint8Array, part: PartitionEntry): FsDeletedRe
  * Scans exFAT directory entry sets (0x85/0x05 File + 0xC0/0x40 Stream + 0xC1/0x41 FileName)
  * and uses exFAT Allocation Bitmap (0x81) to verify whether deleted clusters are intact.
  */
-function scanExfatPartition(disk: Uint8Array, part: PartitionEntry): FsDeletedRecord[] {
+function scanExfatPartition(
+  disk: Uint8Array,
+  part: PartitionEntry,
+  includeExisting = false,
+): FsDeletedRecord[] {
   const volStart = part.startOffset;
   if (volStart + 512 > disk.length) return [];
   const dv = new DataView(disk.buffer, disk.byteOffset + volStart, 512);
@@ -417,7 +423,7 @@ function scanExfatPartition(disk: Uint8Array, part: PartitionEntry): FsDeletedRe
           continue;
         }
 
-        if (!isDeleted || dataLength === 0 || firstCluster < 2) continue;
+        if ((!includeExisting && !isDeleted) || dataLength === 0 || firstCluster < 2) continue;
 
         const needed = Math.max(1, Math.ceil(dataLength / clusterBytes));
         const extents: { offset: number; length: number }[] = [];
@@ -427,7 +433,7 @@ function scanExfatPartition(disk: Uint8Array, part: PartitionEntry): FsDeletedRe
         if (noFatChain || readFat(firstCluster) === 0) {
           for (let ci = 0; ci < needed && rem > 0; ci++) {
             const c = firstCluster + ci;
-            if (bitmap && isClusterAllocated(c)) overwritten = true;
+            if (isDeleted && bitmap && isClusterAllocated(c)) overwritten = true;
             const byteOff = heapStart + (c - 2) * clusterBytes;
             const take = Math.min(rem, clusterBytes);
             if (byteOff + take <= disk.length) {
@@ -440,7 +446,7 @@ function scanExfatPartition(disk: Uint8Array, part: PartitionEntry): FsDeletedRe
           const seen = new Set<number>();
           while (c >= 2 && c < 0xfffffff0 && rem > 0 && !seen.has(c) && extents.length < 4096) {
             seen.add(c);
-            if (bitmap && isClusterAllocated(c)) overwritten = true;
+            if (isDeleted && bitmap && isClusterAllocated(c)) overwritten = true;
             const byteOff = heapStart + (c - 2) * clusterBytes;
             const take = Math.min(rem, clusterBytes);
             if (byteOff + take <= disk.length) {
@@ -474,6 +480,7 @@ function scanExfatPartition(disk: Uint8Array, part: PartitionEntry): FsDeletedRe
           extents,
           partitionId: part.id,
           partitionName: `exFAT (${part.name})`,
+          isDeleted,
           bitmapChecked: bitmap !== null,
           overwritten,
           reconstructedBytes: out,
@@ -493,14 +500,16 @@ function scanExfatPartition(disk: Uint8Array, part: PartitionEntry): FsDeletedRe
 export function scanFatAndExfatDeletedInBuffer(
   diskBytes: Uint8Array,
   partitions: PartitionEntry[],
+  options?: { includeExisting?: boolean },
 ): FsDeletedRecord[] {
+  const includeExisting = options?.includeExisting ?? false;
   const out: FsDeletedRecord[] = [];
   for (const part of partitions) {
     const fs = part.detectedFs?.filesystem;
     if (fs === 'FAT32') {
-      out.push(...scanFat32Partition(diskBytes, part));
+      out.push(...scanFat32Partition(diskBytes, part, includeExisting));
     } else if (fs === 'exFAT') {
-      out.push(...scanExfatPartition(diskBytes, part));
+      out.push(...scanExfatPartition(diskBytes, part, includeExisting));
     }
   }
   return out;

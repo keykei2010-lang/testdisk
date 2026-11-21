@@ -2,6 +2,7 @@ import React from 'react';
 import { Check, SlidersHorizontal, X } from 'lucide-react';
 import { FILE_FORMATS, FileFamily } from '../engine/signatures';
 import {
+  DeletedFilter,
   GroupByKey,
   RecoveryLikelihoodTier,
   SortDir,
@@ -14,6 +15,7 @@ interface FilterPopoverProps {
   keepCorrupted: boolean;
   enabledFormats: Set<string>;
   statusFilter: 'all' | 'ok' | 'truncated';
+  deletedFilter: DeletedFilter;
   likelihoodFilter: 'all' | RecoveryLikelihoodTier;
   sizeFilter: 'all' | 'small' | 'medium' | 'large';
   hideDuplicates: boolean;
@@ -25,6 +27,7 @@ interface FilterPopoverProps {
   onChangeKeepCorrupted: (val: boolean) => void;
   onChangeEnabledFormats: (next: Set<string>) => void;
   onChangeStatusFilter: (val: 'all' | 'ok' | 'truncated') => void;
+  onChangeDeletedFilter: (val: DeletedFilter) => void;
   onChangeLikelihoodFilter: (val: 'all' | RecoveryLikelihoodTier) => void;
   onChangeSizeFilter: (val: 'all' | 'small' | 'medium' | 'large') => void;
   onChangeHideDuplicates: (val: boolean) => void;
@@ -43,6 +46,7 @@ export const FilterPopover: React.FC<FilterPopoverProps> = ({
   keepCorrupted,
   enabledFormats,
   statusFilter,
+  deletedFilter,
   likelihoodFilter,
   sizeFilter,
   hideDuplicates,
@@ -54,6 +58,7 @@ export const FilterPopover: React.FC<FilterPopoverProps> = ({
   onChangeKeepCorrupted,
   onChangeEnabledFormats,
   onChangeStatusFilter,
+  onChangeDeletedFilter,
   onChangeLikelihoodFilter,
   onChangeSizeFilter,
   onChangeHideDuplicates,
@@ -214,6 +219,21 @@ export const FilterPopover: React.FC<FilterPopoverProps> = ({
                 <option value="small">Small (&lt; 2 KB)</option>
                 <option value="medium">Medium (2 KB – 100 KB)</option>
                 <option value="large">Large (&gt; 100 KB)</option>
+              </select>
+            </div>
+
+            <div className="sm:col-span-2">
+              <label className="block font-medium text-slate-300 mb-1.5">
+                Deletion State
+              </label>
+              <select
+                value={deletedFilter}
+                onChange={(e) => onChangeDeletedFilter(e.target.value as DeletedFilter)}
+                className="w-full px-3 py-1.5 rounded bg-[#222630] border border-[#343A48] text-slate-100"
+              >
+                <option value="all">All Discovered Files (Deleted + Existing)</option>
+                <option value="deleted">Deleted / Lost Files Only</option>
+                <option value="existing">Existing / Active Files Only</option>
               </select>
             </div>
 

@@ -151,6 +151,94 @@ export const FILE_FORMATS: FileFormatDefinition[] = [
     maxFilesize: 100 * MB,
   },
   {
+    id: 'cr2',
+    extension: 'cr2',
+    description: 'Canon Camera RAW (.cr2)',
+    family: 'Pictures',
+    mimeType: 'image/x-canon-cr2',
+    signatureHex: '49 49 2A 00 ... 43 52 02 00',
+    signatureOffset: 0,
+    enableByDefault: true,
+    maxFilesize: 100 * MB,
+  },
+  {
+    id: 'cr3',
+    extension: 'cr3',
+    description: 'Canon Camera RAW v3 (.cr3)',
+    family: 'Pictures',
+    mimeType: 'image/x-canon-cr3',
+    signatureHex: '66 74 79 70 63 72 78 20',
+    signatureOffset: 4,
+    enableByDefault: true,
+    maxFilesize: 120 * MB,
+  },
+  {
+    id: 'nef',
+    extension: 'nef',
+    description: 'Nikon Electronic Format RAW (.nef)',
+    family: 'Pictures',
+    mimeType: 'image/x-nikon-nef',
+    signatureHex: '4D 4D 00 2A / 49 49 2A 00 (NIKON)',
+    signatureOffset: 0,
+    enableByDefault: true,
+    maxFilesize: 100 * MB,
+  },
+  {
+    id: 'arw',
+    extension: 'arw',
+    description: 'Sony Alpha Camera RAW (.arw)',
+    family: 'Pictures',
+    mimeType: 'image/x-sony-arw',
+    signatureHex: '49 49 2A 00 (SONY)',
+    signatureOffset: 0,
+    enableByDefault: true,
+    maxFilesize: 120 * MB,
+  },
+  {
+    id: 'dng',
+    extension: 'dng',
+    description: 'Adobe Digital Negative RAW (.dng)',
+    family: 'Pictures',
+    mimeType: 'image/x-adobe-dng',
+    signatureHex: '49 49 2A 00 (DNGVersion 0xC612)',
+    signatureOffset: 0,
+    enableByDefault: true,
+    maxFilesize: 120 * MB,
+  },
+  {
+    id: 'raf',
+    extension: 'raf',
+    description: 'Fujifilm Camera RAW (.raf)',
+    family: 'Pictures',
+    mimeType: 'image/x-fuji-raf',
+    signatureHex: '46 55 4A 49 46 49 4C 4D',
+    signatureOffset: 0,
+    enableByDefault: true,
+    maxFilesize: 120 * MB,
+  },
+  {
+    id: 'orf',
+    extension: 'orf',
+    description: 'Olympus / OM System RAW (.orf)',
+    family: 'Pictures',
+    mimeType: 'image/x-olympus-orf',
+    signatureHex: '49 49 52 4F / 4D 4D 4F 52',
+    signatureOffset: 0,
+    enableByDefault: true,
+    maxFilesize: 100 * MB,
+  },
+  {
+    id: 'rw2',
+    extension: 'rw2',
+    description: 'Panasonic Lumix Camera RAW (.rw2)',
+    family: 'Pictures',
+    mimeType: 'image/x-panasonic-rw2',
+    signatureHex: '49 49 55 00',
+    signatureOffset: 0,
+    enableByDefault: true,
+    maxFilesize: 100 * MB,
+  },
+  {
     id: 'ico',
     extension: 'ico',
     description: 'Windows Icon Resource (.ico)',
@@ -955,18 +1043,38 @@ export function identifyBuffer(
     }
   }
 
-  // 6. TIFF
-  if (
-    isEnabled('tiff') &&
-    buf.length >= 8 &&
-    ((buf[0] === 0x49 && buf[1] === 0x49 && buf[2] === 0x2a && buf[3] === 0x00) ||
-      (buf[0] === 0x4d && buf[1] === 0x4d && buf[2] === 0x00 && buf[3] === 0x2a))
-  ) {
-    const def = FORMAT_MAP.get('tiff')!;
-    const endian = buf[0] === 0x49 ? 'Little-Endian (II)' : 'Big-Endian (MM)';
+  // 5b. Fujifilm RAF Camera RAW
+  if (isEnabled('raf') && buf.length >= 64 && readAscii(buf, 0, 15) === 'FUJIFILMCCD-RAW') {
+    const def = FORMAT_MAP.get('raf')!;
+    const model = readAscii(buf, 28, 32).replace(/\0.*$/, '').trim();
     return {
-      formatId: 'tiff',
-      extension: 'tif',
+      formatId: 'raf',
+      extension: 'raf',
+      description: def.description,
+      family: def.family,
+      mimeType: def.mimeType,
+      matchedOffset: 0,
+      matchedLength: 15,
+      calculatedSize: buf.length,
+      status: 'HEADER_ONLY',
+      metadata: {
+        camera: model || 'Fujifilm',
+        details: model ? `Fujifilm RAW · ${model}` : 'Fujifilm CCD-RAW container',
+      },
+    };
+  }
+
+  // 5c. Olympus ORF & Panasonic RW2 Camera RAW
+  if (
+    isEnabled('orf') &&
+    buf.length >= 16 &&
+    ((buf[0] === 0x49 && buf[1] === 0x49 && buf[2] === 0x52 && buf[3] === 0x4f) ||
+      (buf[0] === 0x4d && buf[1] === 0x4d && buf[2] === 0x4f && buf[3] === 0x52))
+  ) {
+    const def = FORMAT_MAP.get('orf')!;
+    return {
+      formatId: 'orf',
+      extension: 'orf',
       description: def.description,
       family: def.family,
       mimeType: def.mimeType,
@@ -974,8 +1082,155 @@ export function identifyBuffer(
       matchedLength: 4,
       calculatedSize: buf.length,
       status: 'HEADER_ONLY',
-      metadata: { details: `TIFF ${endian}` },
+      metadata: { camera: 'Olympus', details: 'Olympus RAW (IIRO/MMOR)' },
     };
+  }
+
+  if (
+    isEnabled('rw2') &&
+    buf.length >= 16 &&
+    buf[0] === 0x49 &&
+    buf[1] === 0x49 &&
+    buf[2] === 0x55 &&
+    buf[3] === 0x00
+  ) {
+    const def = FORMAT_MAP.get('rw2')!;
+    return {
+      formatId: 'rw2',
+      extension: 'rw2',
+      description: def.description,
+      family: def.family,
+      mimeType: def.mimeType,
+      matchedOffset: 0,
+      matchedLength: 4,
+      calculatedSize: buf.length,
+      status: 'HEADER_ONLY',
+      metadata: { camera: 'Panasonic Lumix', details: 'Panasonic RAW (IIU\\0)' },
+    };
+  }
+
+  // 5d. Canon CR3 Camera RAW (ISO BMFF ftypcrx )
+  if (
+    isEnabled('cr3') &&
+    buf.length >= 16 &&
+    readAscii(buf, 4, 8) === 'ftypcrx '
+  ) {
+    const def = FORMAT_MAP.get('cr3')!;
+    const mp4 = validateAndMeasureMp4(buf, 0, buf.length);
+    return {
+      formatId: 'cr3',
+      extension: 'cr3',
+      description: def.description,
+      family: def.family,
+      mimeType: def.mimeType,
+      matchedOffset: 4,
+      matchedLength: 8,
+      calculatedSize: mp4?.size ?? buf.length,
+      status: mp4 ? (mp4.truncated ? 'OK_TRUNCATED' : 'OK') : 'HEADER_ONLY',
+      metadata: {
+        camera: 'Canon',
+        details: 'Canon CR3 ISO BMFF RAW',
+      },
+    };
+  }
+
+  // 6. TIFF & TIFF-derived Camera RAW (CR2 / DNG / NEF / ARW via IFD0 inspection)
+  if (
+    buf.length >= 16 &&
+    ((buf[0] === 0x49 && buf[1] === 0x49 && buf[2] === 0x2a && buf[3] === 0x00) ||
+      (buf[0] === 0x4d && buf[1] === 0x4d && buf[2] === 0x00 && buf[3] === 0x2a))
+  ) {
+    const isLe = buf[0] === 0x49;
+    const u16 = (p: number) => (isLe ? readUint16LE(buf, p) : readUint16BE(buf, p));
+    const u32 = (p: number) => (isLe ? readUint32LE(buf, p) : readUint32BE(buf, p));
+
+    // Canon CR2 signature: byte 8..11 === 'CR\x02\x00'
+    if (
+      isEnabled('cr2') &&
+      buf[8] === 0x43 &&
+      buf[9] === 0x52 &&
+      buf[10] === 0x02 &&
+      buf[11] === 0x00
+    ) {
+      const def = FORMAT_MAP.get('cr2')!;
+      return {
+        formatId: 'cr2',
+        extension: 'cr2',
+        description: def.description,
+        family: def.family,
+        mimeType: def.mimeType,
+        matchedOffset: 0,
+        matchedLength: 10,
+        calculatedSize: buf.length,
+        status: 'HEADER_ONLY',
+        metadata: { camera: 'Canon', details: 'Canon CR2 Camera RAW' },
+      };
+    }
+
+    // Parse IFD0 tags for DNGVersion (0xC612) or Camera Make (0x010F -> NIKON / SONY)
+    const ifdOff = u32(4);
+    let rawId: 'dng' | 'nef' | 'arw' | null = null;
+    let cameraMake = '';
+    if (ifdOff >= 8 && ifdOff + 2 <= buf.length) {
+      const count = Math.min(64, u16(ifdOff));
+      for (let i = 0; i < count; i++) {
+        const eOff = ifdOff + 2 + i * 12;
+        if (eOff + 12 > buf.length) break;
+        const tag = u16(eOff);
+        if (tag === 0xc612) {
+          rawId = 'dng';
+        } else if (tag === 0x010f) {
+          const valCount = u32(eOff + 4);
+          const valOff = valCount <= 4 ? eOff + 8 : u32(eOff + 8);
+          if (valOff + Math.min(32, valCount) <= buf.length) {
+            cameraMake = readAscii(buf, valOff, Math.min(32, valCount))
+              .replace(/\0.*$/, '')
+              .trim();
+          }
+        }
+      }
+      if (!rawId && cameraMake) {
+        const up = cameraMake.toUpperCase();
+        if (up.includes('NIKON')) rawId = 'nef';
+        else if (up.includes('SONY')) rawId = 'arw';
+      }
+    }
+
+    if (rawId && isEnabled(rawId)) {
+      const def = FORMAT_MAP.get(rawId)!;
+      return {
+        formatId: rawId,
+        extension: rawId,
+        description: def.description,
+        family: def.family,
+        mimeType: def.mimeType,
+        matchedOffset: 0,
+        matchedLength: 4,
+        calculatedSize: buf.length,
+        status: 'HEADER_ONLY',
+        metadata: {
+          camera: cameraMake || rawId.toUpperCase(),
+          details: `${def.description}${cameraMake ? ` · ${cameraMake}` : ''}`,
+        },
+      };
+    }
+
+    if (isEnabled('tiff')) {
+      const def = FORMAT_MAP.get('tiff')!;
+      const endian = isLe ? 'Little-Endian (II)' : 'Big-Endian (MM)';
+      return {
+        formatId: 'tiff',
+        extension: 'tif',
+        description: def.description,
+        family: def.family,
+        mimeType: def.mimeType,
+        matchedOffset: 0,
+        matchedLength: 4,
+        calculatedSize: buf.length,
+        status: 'HEADER_ONLY',
+        metadata: { details: `TIFF ${endian}` },
+      };
+    }
   }
 
   // 7. PDF
@@ -1371,6 +1626,7 @@ export function carveDiskBuffer(
     const b0 = diskBytes[cursor];
     const b1 = diskBytes[cursor + 1];
     const b2 = diskBytes[cursor + 2];
+    const b3 = diskBytes[cursor + 3];
     const b4 = diskBytes[cursor + 4];
 
     // Fast signature pre-filter (like PhotoRec's file_check_list[buffer[offset]])
@@ -1380,6 +1636,9 @@ export function carveDiskBuffer(
       (b0 === 0x47 && b1 === 0x49 && b2 === 0x46) ||
       (b0 === 0x42 && b1 === 0x4d) ||
       (b0 === 0x52 && b1 === 0x49 && b2 === 0x46) ||
+      (b0 === 0x49 && b1 === 0x49 && ((b2 === 0x2a && b3 === 0x00) || (b2 === 0x52 && b3 === 0x4f) || (b2 === 0x55 && b3 === 0x00))) ||
+      (b0 === 0x4d && b1 === 0x4d && ((b2 === 0x00 && b3 === 0x2a) || (b2 === 0x4f && b3 === 0x52))) ||
+      (b0 === 0x46 && b1 === 0x55 && b2 === 0x4a && b3 === 0x49) ||
       (b0 === 0x25 && b1 === 0x50 && b2 === 0x44) ||
       (b0 === 0x50 && b1 === 0x4b && b2 === 0x03) ||
       (b0 === 0x37 && b1 === 0x7a && b2 === 0xbc) ||
@@ -1392,7 +1651,7 @@ export function carveDiskBuffer(
       (b0 === 0x4f && b1 === 0x67 && b2 === 0x67) ||
       (b0 === 0x7f && b1 === 0x45 && b2 === 0x4c) ||
       (b0 === 0x4d && b1 === 0x5a) ||
-      (b0 === 0x00 && b1 === 0x00 && (b2 === 0x01 || b2 === 0x02) && diskBytes[cursor + 3] === 0x00);
+      (b0 === 0x00 && b1 === 0x00 && (b2 === 0x01 || b2 === 0x02) && b3 === 0x00);
 
     if (maybeMatch) {
       const slice = diskBytes.subarray(cursor, Math.min(end, cursor + 16 * MB));
@@ -1443,10 +1702,11 @@ export function carveDiskBuffer(
 export interface AsyncCarveControls {
   isCancelled: () => boolean;
   isPaused: () => boolean;
+  onBatch?: (batch: CarvedFile[]) => void;
 }
 
 /**
- * Chunked asynchronous carver that yields to the main thread and streams live sector progress.
+ * Chunked asynchronous carver that yields to the main thread and streams live sector progress and file batches.
  */
 export async function carveDiskBufferAsync(
   diskBytes: Uint8Array,
@@ -1455,6 +1715,7 @@ export async function carveDiskBufferAsync(
   controls?: AsyncCarveControls,
 ): Promise<CarvedFile[]> {
   const results: CarvedFile[] = [];
+  let pendingBatch: CarvedFile[] = [];
   const start = Math.max(0, options.startByte);
   const end = Math.min(diskBytes.length, options.endByte);
   const step = Math.max(512, options.blockSize);
@@ -1463,6 +1724,13 @@ export async function carveDiskBufferAsync(
   let foundBytes = 0;
   let cursor = start;
   let stepsSinceYield = 0;
+
+  const flushBatch = () => {
+    if (pendingBatch.length > 0 && controls?.onBatch) {
+      controls.onBatch(pendingBatch);
+      pendingBatch = [];
+    }
+  };
 
   while (cursor + 16 <= end) {
     if (controls?.isCancelled()) {
@@ -1479,6 +1747,7 @@ export async function carveDiskBufferAsync(
     const b0 = diskBytes[cursor];
     const b1 = diskBytes[cursor + 1];
     const b2 = diskBytes[cursor + 2];
+    const b3 = diskBytes[cursor + 3];
     const b4 = diskBytes[cursor + 4];
 
     const maybeMatch =
@@ -1487,6 +1756,9 @@ export async function carveDiskBufferAsync(
       (b0 === 0x47 && b1 === 0x49 && b2 === 0x46) ||
       (b0 === 0x42 && b1 === 0x4d) ||
       (b0 === 0x52 && b1 === 0x49 && b2 === 0x46) ||
+      (b0 === 0x49 && b1 === 0x49 && ((b2 === 0x2a && b3 === 0x00) || (b2 === 0x52 && b3 === 0x4f) || (b2 === 0x55 && b3 === 0x00))) ||
+      (b0 === 0x4d && b1 === 0x4d && ((b2 === 0x00 && b3 === 0x2a) || (b2 === 0x4f && b3 === 0x52))) ||
+      (b0 === 0x46 && b1 === 0x55 && b2 === 0x4a && b3 === 0x49) ||
       (b0 === 0x25 && b1 === 0x50 && b2 === 0x44) ||
       (b0 === 0x50 && b1 === 0x4b && b2 === 0x03) ||
       (b0 === 0x37 && b1 === 0x7a && b2 === 0xbc) ||
@@ -1499,7 +1771,7 @@ export async function carveDiskBufferAsync(
       (b0 === 0x4f && b1 === 0x67 && b2 === 0x67) ||
       (b0 === 0x7f && b1 === 0x45 && b2 === 0x4c) ||
       (b0 === 0x4d && b1 === 0x5a) ||
-      (b0 === 0x00 && b1 === 0x00 && (b2 === 0x01 || b2 === 0x02) && diskBytes[cursor + 3] === 0x00);
+      (b0 === 0x00 && b1 === 0x00 && (b2 === 0x01 || b2 === 0x02) && b3 === 0x00);
 
     if (maybeMatch) {
       const slice = diskBytes.subarray(cursor, Math.min(end, cursor + 16 * MB));
@@ -1533,6 +1805,7 @@ export async function carveDiskBufferAsync(
           };
 
           results.push(carved);
+          pendingBatch.push(carved);
           foundBytes += clampedSize;
           fileIndex++;
 
@@ -1546,11 +1819,16 @@ export async function carveDiskBufferAsync(
             latestFile: carved,
           });
 
+          if (pendingBatch.length >= 16) {
+            flushBatch();
+          }
+
           const alignedAdvance = Math.max(step, Math.ceil(clampedSize / step) * step);
           cursor += alignedAdvance;
           stepsSinceYield += 1;
           if (stepsSinceYield >= 400) {
             stepsSinceYield = 0;
+            flushBatch();
             await new Promise((r) => setTimeout(r, 0));
           }
           continue;
@@ -1562,6 +1840,7 @@ export async function carveDiskBufferAsync(
     stepsSinceYield++;
     if (stepsSinceYield >= 1200) {
       stepsSinceYield = 0;
+      flushBatch();
       const currentSector = Math.floor((cursor - start) / 512);
       onProgress({
         currentSector,
@@ -1574,6 +1853,7 @@ export async function carveDiskBufferAsync(
     }
   }
 
+  flushBatch();
   onProgress({
     currentSector: totalSectors,
     totalSectors,

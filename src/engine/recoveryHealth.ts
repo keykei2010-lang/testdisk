@@ -1,5 +1,6 @@
 import { computeCrc32 } from './crc32';
 import { RecoveryLikelihoodTier } from './explorerTypes';
+import { rebuildMp4WithMoov } from './mp4Repair';
 import { IdentifyMetadata } from './signatures';
 
 export interface RecoveryLikelihoodAssessment {
@@ -204,6 +205,7 @@ export function formatCompactCount(count: number): string {
 export function repairFileBuffer(
   extension: string,
   data: Uint8Array,
+  referenceBytes?: Uint8Array,
 ): { repaired: boolean; data: Uint8Array; note: string } {
   const ext = extension.toLowerCase();
 
@@ -272,39 +274,9 @@ export function repairFileBuffer(
   }
 
   if ((ext === 'mp4' || ext === 'mov' || ext === 'm4v') && data.length >= 16) {
-    const patched = data.slice();
-    const dv = new DataView(patched.buffer);
-    let pos = 0;
-    let changed = false;
-
-    while (pos + 8 <= patched.length) {
-      const size = dv.getUint32(pos, false);
-      const type = String.fromCharCode(
-        patched[pos + 4],
-        patched[pos + 5],
-        patched[pos + 6],
-        patched[pos + 7],
-      );
-      if (!/^[\x20-\x7e]{4}$/.test(type)) break;
-
-      if (size === 0 || pos + size > patched.length) {
-        const clamped = patched.length - pos;
-        if (clamped >= 8) {
-          dv.setUint32(pos, clamped, false);
-          changed = true;
-        }
-        break;
-      }
-      if (size < 8) break;
-      pos += size;
-    }
-
-    if (changed) {
-      return {
-        repaired: true,
-        data: patched,
-        note: 'Reorganized ISO BMFF atom sizes and patched truncated mdat container length.',
-      };
+    const rebuilt = rebuildMp4WithMoov(data, referenceBytes);
+    if (rebuilt.repaired) {
+      return rebuilt;
     }
   }
 

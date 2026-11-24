@@ -48,6 +48,30 @@ jobs:
             release/*.exe
           if-no-files-found: error
 
+      - name: Move dev-build tag to current commit
+        if: ${{ !startsWith(github.ref, 'refs/tags/v') }}
+        shell: pwsh
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -f dev-build ${{ github.sha }}
+          git push -f origin refs/tags/dev-build
+
+      - name: Update rolling dev-build pre-release (no manual release needed)
+        if: ${{ !startsWith(github.ref, 'refs/tags/v') }}
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: dev-build
+          name: Latest Dev Build (Auto-Updated)
+          body: |
+            Automatically rebuilt from commit `${{ github.sha }}` (`${{ github.ref_name }}`).
+            Bookmark this page or direct ZIP link to always download the newest test build without creating new releases.
+          prerelease: true
+          make_latest: false
+          files: |
+            TestDisk-PhotoRec-Windows-Portable.zip
+            release/*.exe
+
       - name: Publish GitHub Release on tag
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2

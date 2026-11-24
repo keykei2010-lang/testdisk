@@ -29,16 +29,13 @@ You can either download the ready-to-run Windows ZIP built automatically by GitH
 
 This repository includes a GitHub Actions workflow (`.github/workflows/build-windows.yml`) that compiles the Windows portable package (`TestDisk-PhotoRec-Windows-Portable.zip`).
 
-1. Open your repository on **GitHub**.
-   - **If you pushed a release tag** (e.g. `v7.2.0`): open the **Releases** page on the right sidebar and download **`TestDisk-PhotoRec-Windows-Portable.zip`**.
-   - **If you pushed to `main` / `master` or ran the workflow manually**:
-     1. Click the **Actions** tab at the top of your GitHub repository.
-     2. Select **Build Windows Portable ZIP** in the left sidebar (if no run exists yet, click **Run workflow**).
-     3. Open the latest green completed workflow run and scroll down to **Artifacts**.
-     4. Click **`TestDisk-PhotoRec-Windows-Portable`** to download it.
-2. When your browser asks where to save (or after downloading into `Downloads`):
-   - Move **`TestDisk-PhotoRec-Windows-Portable.zip`** onto your **Desktop** (`C:\Users\<YourName>\Desktop\`), or drag it from your browser/Downloads folder onto the Desktop.
-   - *(Note: GitHub Actions Artifacts wrap files in an archive download, so if opening the downloaded zip reveals another `TestDisk-PhotoRec-Windows-Portable.zip` inside it, drag that inner file or extract it straight onto your Desktop.)*
+1. Open your repository on **GitHub**:
+   - **Latest Dev Build (Auto-Updated on every push — no new release needed):** Open the **`dev-build`** pre-release under **Releases** (`releases/tag/dev-build`) and click **`TestDisk-PhotoRec-Windows-Portable.zip`**. You can bookmark the direct download URL `releases/download/dev-build/TestDisk-PhotoRec-Windows-Portable.zip` so you always get the newest build ~5 minutes after pushing code.
+   - **Numbered Releases** (e.g. `v7.2.0`): open **Releases** on the right sidebar and download **`TestDisk-PhotoRec-Windows-Portable.zip`**.
+   - **Workflow Artifacts (Actions tab):**
+     1. Click **Actions** -> **Build Windows Portable ZIP**.
+     2. Open the latest green run and download **`TestDisk-PhotoRec-Windows-Portable`** under **Artifacts**.
+2. Save or move **`TestDisk-PhotoRec-Windows-Portable.zip`** onto your **Desktop** (`C:\Users\<YourName>\Desktop\`).
 
 ### Option 2: Build the ZIP Locally and Copy to Your Desktop (Windows PowerShell)
 

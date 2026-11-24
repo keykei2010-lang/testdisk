@@ -16,7 +16,14 @@
     "productName": "TestDisk-PhotoRec",
     "files": [
       "dist/**/*",
-      "electron/**/*"
+      "electron/**/*",
+      "!electron/bin/**"
+    ],
+    "extraResources": [
+      {
+        "from": "electron/bin",
+        "to": "engines"
+      }
     ],
     "win": {
       "target": [
@@ -32,8 +39,7 @@
             "x64"
           ]
         }
-      ],
-      "requestedExecutionLevel": "requireAdministrator"
+      ]
     },
     "directories": {
       "output": "release"

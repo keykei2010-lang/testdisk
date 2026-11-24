@@ -1,3 +1,5 @@
+import { EngineCapabilities } from './explorerTypes';
+
 export interface WindowsDriveInfo {
   number: number;
   devicePath: string;
@@ -35,9 +37,14 @@ export interface NativeScannedEntry {
   calculatedSize?: number | null;
   truncated?: boolean;
   runs?: { offset: number; length: number }[];
+  tskInode?: string;
+  tskOffset?: number;
+  discoveryCrc32?: number;
   mftResident?: boolean;
   mftOverwritten?: boolean;
   mftBitmapIntact?: boolean;
+  partitionName?: string;
+  details?: string;
 }
 
 export interface NativeScanProgressEvent {
@@ -76,23 +83,71 @@ export interface BitLockerVolumeInfo {
   lockStatus: string;
 }
 
+export interface VideoPreviewResult {
+  thumbnailDataUrl?: string;
+  codec?: string | null;
+  width?: number | null;
+  height?: number | null;
+  durationSec?: number | null;
+}
+
+export interface NativeRecoverFailure {
+  filename: string;
+  reason: string;
+}
+
 export interface NativeRecoverRequestItem {
   filename: string;
   folder: string;
-  sourceKind: 'memory' | 'native-device' | 'native-runs' | 'native-file';
+  sourceKind: 'memory' | 'native-device' | 'native-runs' | 'native-file' | 'native-tsk';
   devicePath?: string;
   offset: number;
   size: number;
   runs?: { offset: number; length: number }[];
+  tskInode?: string;
+  tskOffset?: number;
+  discoveryCrc32?: number;
   memoryBytes?: Uint8Array;
   extension: string;
   repairIfTruncated: boolean;
   modifiedAtMs?: number;
 }
 
+export interface RepairMediaFileParams {
+  filename: string;
+  extension: string;
+  filePath?: string;
+  buffer?: Uint8Array;
+  sourceKind?: 'memory' | 'native-device' | 'native-runs' | 'native-file' | 'native-tsk';
+  devicePath?: string;
+  offset?: number;
+  size?: number;
+  runs?: { offset: number; length: number }[];
+  tskInode?: string;
+  tskOffset?: number;
+  referenceBuffer?: Uint8Array;
+  allowTranscodeFallback?: boolean;
+  saveWithDialog?: boolean;
+}
+
+export interface RepairMediaFileResult {
+  ok: boolean;
+  canceled?: boolean;
+  tier: string;
+  repairedSize: number;
+  note: string;
+  previewDataUrl?: string;
+  outputPath?: string;
+  repairedBytes?: Uint8Array;
+  salvagedPreviewBytes?: Uint8Array;
+  error?: string;
+}
+
 export interface DesktopBridge {
   isDesktop: boolean;
   platform: string;
+  getEngineCapabilities: () => Promise<EngineCapabilities>;
+  relaunchAsAdmin: () => Promise<{ ok: boolean; error?: string }>;
   listWindowsDrives: () => Promise<WindowsDriveInfo[]>;
   listWindowsVolumes: () => Promise<WindowsVolumeInfo[]>;
   listBitLockerVolumes: () => Promise<BitLockerVolumeInfo[]>;
@@ -105,7 +160,18 @@ export interface DesktopBridge {
     devicePath: string,
     startByte?: number,
     maxBytes?: number,
+    tskInode?: string,
+    tskOffset?: number,
   ) => Promise<Uint8Array>;
+  probeVideoPreview: (params: {
+    filePath?: string;
+    buffer?: Uint8Array;
+    tskInode?: string;
+    tskOffset?: number;
+    devicePath?: string;
+  }) => Promise<VideoPreviewResult | null>;
+  repairMediaFile: (params: RepairMediaFileParams) => Promise<RepairMediaFileResult>;
+  identifyFilesNative: (filePaths: string[]) => Promise<Record<string, string>>;
   pickDiskImage: () => Promise<{ path: string; name: string; sizeBytes: number } | null>;
   pickFolder: () => Promise<string | null>;
   scanFolder: (folderPath: string) => Promise<LocationScanResponse>;
@@ -118,6 +184,7 @@ export interface DesktopBridge {
     blockSize: number;
     scanMode?: 'quick' | 'full';
     startPhase?: 'quick' | 'deep';
+    unallocatedOnly?: boolean;
     includeExisting?: boolean;
     pathFilter?: string;
     resumeOffset?: number;
@@ -130,11 +197,15 @@ export interface DesktopBridge {
   recoverFilesToFolder: (params: {
     destinationDir: string | null;
     items: NativeRecoverRequestItem[];
+    scannedDevicePath?: string;
   }) => Promise<{
     canceled?: boolean;
     savedCount: number;
+    verifiedCount?: number;
     destinationDir: string;
     repairedCount: number;
+    reportPath?: string;
+    failures?: NativeRecoverFailure[];
     error?: string;
   }>;
   saveTextReport: (params: {

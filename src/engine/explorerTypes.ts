@@ -8,16 +8,30 @@ export interface ExtentRun {
 }
 
 export interface FileSourceRef {
-  kind: 'memory' | 'native-device' | 'native-runs' | 'native-file' | 'browser-file';
+  kind: 'memory' | 'native-device' | 'native-runs' | 'native-file' | 'native-tsk' | 'browser-file';
   devicePath?: string;
   offset: number;
   size: number;
   runs?: ExtentRun[];
+  tskInode?: string;
+  tskOffset?: number;
   browserFile?: File;
 }
 
 export type ScanMode = 'quick' | 'full';
+export type ScanCoverage = 'unallocated' | 'whole';
+export type GridThumbSize = 'sm' | 'md' | 'lg';
 export type DeletedFilter = 'all' | 'deleted' | 'existing';
+
+export interface EngineCapabilities {
+  isAdmin: boolean;
+  sleuthkit: boolean;
+  mmls: boolean;
+  photorec: boolean;
+  fidentify: boolean;
+  ffmpeg: boolean;
+  ffprobe: boolean;
+}
 
 export interface ExplorerFileItem {
   id: string;
@@ -48,6 +62,7 @@ export interface ExplorerFileItem {
   recoveryReason: string;
   repaired?: boolean;
   contentFingerprint?: string;
+  discoveryCrc32?: number;
 }
 
 export type TreeMode = 'path' | 'type';

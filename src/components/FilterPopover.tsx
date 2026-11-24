@@ -3,6 +3,7 @@ import { Check, SlidersHorizontal, X } from 'lucide-react';
 import { FILE_FORMATS, FileFamily } from '../engine/signatures';
 import {
   DeletedFilter,
+  GridThumbSize,
   GroupByKey,
   RecoveryLikelihoodTier,
   SortDir,
@@ -19,6 +20,8 @@ interface FilterPopoverProps {
   likelihoodFilter: 'all' | RecoveryLikelihoodTier;
   sizeFilter: 'all' | 'small' | 'medium' | 'large';
   hideDuplicates: boolean;
+  unallocatedOnly: boolean;
+  gridThumbSize: GridThumbSize;
   sortKey: SortKey;
   sortDir: SortDir;
   groupBy: GroupByKey;
@@ -31,6 +34,8 @@ interface FilterPopoverProps {
   onChangeLikelihoodFilter: (val: 'all' | RecoveryLikelihoodTier) => void;
   onChangeSizeFilter: (val: 'all' | 'small' | 'medium' | 'large') => void;
   onChangeHideDuplicates: (val: boolean) => void;
+  onChangeUnallocatedOnly: (val: boolean) => void;
+  onChangeGridThumbSize: (val: GridThumbSize) => void;
   onChangeSortKey: (val: SortKey) => void;
   onChangeSortDir: (val: SortDir) => void;
   onChangeGroupBy: (val: GroupByKey) => void;
@@ -50,6 +55,8 @@ export const FilterPopover: React.FC<FilterPopoverProps> = ({
   likelihoodFilter,
   sizeFilter,
   hideDuplicates,
+  unallocatedOnly,
+  gridThumbSize,
   sortKey,
   sortDir,
   groupBy,
@@ -62,6 +69,8 @@ export const FilterPopover: React.FC<FilterPopoverProps> = ({
   onChangeLikelihoodFilter,
   onChangeSizeFilter,
   onChangeHideDuplicates,
+  onChangeUnallocatedOnly,
+  onChangeGridThumbSize,
   onChangeSortKey,
   onChangeSortDir,
   onChangeGroupBy,
@@ -222,7 +231,7 @@ export const FilterPopover: React.FC<FilterPopoverProps> = ({
               </select>
             </div>
 
-            <div className="sm:col-span-2">
+            <div>
               <label className="block font-medium text-slate-300 mb-1.5">
                 Deletion State
               </label>
@@ -234,6 +243,21 @@ export const FilterPopover: React.FC<FilterPopoverProps> = ({
                 <option value="all">All Discovered Files (Deleted + Existing)</option>
                 <option value="deleted">Deleted / Lost Files Only</option>
                 <option value="existing">Existing / Active Files Only</option>
+              </select>
+            </div>
+
+            <div>
+              <label className="block font-medium text-slate-300 mb-1.5">
+                Grid Thumbnail Size
+              </label>
+              <select
+                value={gridThumbSize}
+                onChange={(e) => onChangeGridThumbSize(e.target.value as GridThumbSize)}
+                className="w-full px-3 py-1.5 rounded bg-[#222630] border border-[#343A48] text-slate-100"
+              >
+                <option value="sm">Compact (High Density)</option>
+                <option value="md">Medium (Default)</option>
+                <option value="lg">Large (Detailed Previews)</option>
               </select>
             </div>
 
@@ -255,6 +279,16 @@ export const FilterPopover: React.FC<FilterPopoverProps> = ({
                 className="rounded border-slate-600 bg-[#16181F] accent-[#3A7AFE]"
               />
               Keep corrupted / truncated files
+            </label>
+
+            <label className="inline-flex items-center gap-2 text-slate-300 cursor-pointer sm:col-span-2">
+              <input
+                type="checkbox"
+                checked={unallocatedOnly}
+                onChange={(e) => onChangeUnallocatedOnly(e.target.checked)}
+                className="rounded border-slate-600 bg-[#16181F] accent-[#3A7AFE]"
+              />
+              Unallocated clusters only (skip active NTFS $Bitmap clusters during Deep Scan)
             </label>
 
             <label className="inline-flex items-center gap-2 text-slate-300 cursor-pointer sm:col-span-2">

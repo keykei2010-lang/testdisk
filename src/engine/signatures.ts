@@ -1,3 +1,4 @@
+import { computeCrc32 } from './crc32';
 import { parseExifFromJpeg } from './exif';
 
 export type FileFamily = 'Pictures' | 'Videos' | 'Documents' | 'Audio' | 'Archives' | 'Others';
@@ -61,6 +62,7 @@ export interface CarvedFile {
   data: Uint8Array;
   partitionId?: string;
   partitionName?: string;
+  discoveryCrc32?: number;
 }
 
 export interface CarveOptions {
@@ -70,6 +72,8 @@ export interface CarveOptions {
   paranoid: boolean;
   keepCorrupted: boolean;
   enabledFormats: Set<string>;
+  unallocatedOnly?: boolean;
+  allocatedChecker?: (offset: number) => boolean;
 }
 
 export interface CarveProgress {
@@ -1623,6 +1627,11 @@ export function carveDiskBuffer(
   let cursor = start;
 
   while (cursor + 16 <= end) {
+    if (options.unallocatedOnly && options.allocatedChecker?.(cursor)) {
+      cursor += step;
+      continue;
+    }
+
     const b0 = diskBytes[cursor];
     const b1 = diskBytes[cursor + 1];
     const b2 = diskBytes[cursor + 2];
@@ -1665,6 +1674,7 @@ export function carveDiskBuffer(
           const sector = Math.floor(cursor / 512);
           const padNum = String(fileIndex).padStart(4, '0');
           const carvedData = diskBytes.slice(cursor, cursor + clampedSize);
+          const discoveryCrc32 = computeCrc32(carvedData, 0, Math.min(65536, carvedData.length));
 
           results.push({
             id: `${cursor}-${match.extension}`,
@@ -1682,6 +1692,7 @@ export function carveDiskBuffer(
             status: isTruncated ? 'OK_TRUNCATED' : 'OK',
             metadata: match.metadata,
             data: carvedData,
+            discoveryCrc32,
           });
 
           fileIndex++;
@@ -1744,6 +1755,25 @@ export async function carveDiskBufferAsync(
       break;
     }
 
+    if (options.unallocatedOnly && options.allocatedChecker?.(cursor)) {
+      cursor += step;
+      stepsSinceYield++;
+      if (stepsSinceYield >= 1200) {
+        stepsSinceYield = 0;
+        flushBatch();
+        const currentSector = Math.floor((cursor - start) / 512);
+        onProgress({
+          currentSector,
+          totalSectors,
+          percent: Math.min(99, Math.round((currentSector / totalSectors) * 100)),
+          foundCount: results.length,
+          foundBytes,
+        });
+        await new Promise((r) => setTimeout(r, 0));
+      }
+      continue;
+    }
+
     const b0 = diskBytes[cursor];
     const b1 = diskBytes[cursor + 1];
     const b2 = diskBytes[cursor + 2];
@@ -1785,6 +1815,7 @@ export async function carveDiskBufferAsync(
           const sector = Math.floor(cursor / 512);
           const padNum = String(fileIndex).padStart(6, '0');
           const carvedData = diskBytes.slice(cursor, cursor + clampedSize);
+          const discoveryCrc32 = computeCrc32(carvedData, 0, Math.min(65536, carvedData.length));
 
           const carved: CarvedFile = {
             id: `${cursor}-${match.extension}`,
@@ -1802,6 +1833,7 @@ export async function carveDiskBufferAsync(
             status: isTruncated ? 'OK_TRUNCATED' : 'OK',
             metadata: match.metadata,
             data: carvedData,
+            discoveryCrc32,
           };
 
           results.push(carved);

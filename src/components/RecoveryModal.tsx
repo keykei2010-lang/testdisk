@@ -1,9 +1,13 @@
-import React, { useEffect, useState } from 'react';
-import { Archive, CheckCircle2, Folder, HardDrive, X } from 'lucide-react';
+import React, { useEffect, useMemo, useState } from 'react';
+import { AlertTriangle, Archive, CheckCircle2, Folder, HardDrive, X } from 'lucide-react';
 import { createZipArchive, formatBytes } from '../engine/crc32';
-import { getDesktopBridge, WindowsVolumeInfo } from '../engine/desktopBridge';
+import {
+  getDesktopBridge,
+  NativeRecoverFailure,
+  WindowsVolumeInfo,
+} from '../engine/desktopBridge';
 import { FileSourceRef } from '../engine/explorerTypes';
-import { repairFileBuffer } from '../engine/recoveryHealth';
+import { repairFileBuffer, resolvePreferredExtension } from '../engine/recoveryHealth';
 import { identifyBuffer } from '../engine/signatures';
 
 export interface RecoverableItem {
@@ -18,20 +22,65 @@ export interface RecoverableItem {
   status: 'OK' | 'OK_TRUNCATED' | 'HEADER_ONLY' | 'UNKNOWN';
   data: Uint8Array;
   sourceRef?: FileSourceRef;
+  discoveryCrc32?: number;
 }
 
 interface RecoveryModalProps {
   items: RecoverableItem[];
   diskName: string;
+  scannedDevicePath?: string | null;
   repairedDiskBytes?: Uint8Array | null;
   onClose: () => void;
 }
 
 const MAX_IN_MEMORY_ZIP_BYTES = 512 * 1024 * 1024;
+const LAST_DEST_STORAGE_KEY = 'td_last_dest_dir';
+
+function readSavedDestDir(): string | null {
+  try {
+    const val = window.localStorage.getItem(LAST_DEST_STORAGE_KEY);
+    return val && val.trim() ? val.trim() : null;
+  } catch {
+    return null;
+  }
+}
+
+function saveLastDestDir(dir: string) {
+  try {
+    if (dir) window.localStorage.setItem(LAST_DEST_STORAGE_KEY, dir);
+  } catch {
+    // ignore storage errors
+  }
+}
+
+function extractDriveLetter(pathStr?: string | null): string | null {
+  if (!pathStr) return null;
+  const m = pathStr.trim().match(/^([A-Za-z]):/);
+  return m ? m[1].toUpperCase() : null;
+}
+
+function makeUniqueArchivePath(folder: string, filename: string, used: Set<string>): string {
+  const basePath = `${folder}/${filename}`;
+  if (!used.has(basePath)) {
+    used.add(basePath);
+    return basePath;
+  }
+  const dot = filename.lastIndexOf('.');
+  const stem = dot > 0 ? filename.slice(0, dot) : filename;
+  const ext = dot > 0 ? filename.slice(dot) : '';
+  let idx = 2;
+  while (used.has(`${folder}/${stem}_${idx}${ext}`)) {
+    idx++;
+  }
+  const unique = `${folder}/${stem}_${idx}${ext}`;
+  used.add(unique);
+  return unique;
+}
 
 export const RecoveryModal: React.FC<RecoveryModalProps> = ({
   items,
   diskName,
+  scannedDevicePath,
   repairedDiskBytes,
   onClose,
 }) => {
@@ -43,7 +92,7 @@ export const RecoveryModal: React.FC<RecoveryModalProps> = ({
     desktop || exceedsZipRamLimit ? 'folder' : 'zip',
   );
   const [volumes, setVolumes] = useState<WindowsVolumeInfo[]>([]);
-  const [selectedRootDir, setSelectedRootDir] = useState<string | null>(null);
+  const [selectedRootDir, setSelectedRootDir] = useState<string | null>(() => readSavedDestDir());
   const [folderLayout, setFolderLayout] = useState<'type' | 'path'>('type');
   const [enableFileRepair, setEnableFileRepair] = useState<boolean>(true);
   const [referenceVideoName, setReferenceVideoName] = useState<string | null>(null);
@@ -51,7 +100,31 @@ export const RecoveryModal: React.FC<RecoveryModalProps> = ({
   const [includeRepairedImg, setIncludeRepairedImg] = useState<boolean>(!!repairedDiskBytes);
   const [saving, setSaving] = useState<boolean>(false);
   const [resultMessage, setResultMessage] = useState<string | null>(null);
+  const [reportPath, setReportPath] = useState<string | null>(null);
+  const [failures, setFailures] = useState<NativeRecoverFailure[]>([]);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
+
+  const sourceDriveLetters = useMemo(() => {
+    const letters = new Set<string>();
+    const fromScanned = extractDriveLetter(scannedDevicePath);
+    if (fromScanned) letters.add(fromScanned);
+    const firstItemDrive = extractDriveLetter(items[0]?.sourceRef?.devicePath);
+    if (firstItemDrive) letters.add(firstItemDrive);
+    // Physical drive labels look like "Samsung SSD 980 (C:, D:)"
+    const parenMatch = diskName.match(/\(([^)]+)\)/);
+    if (parenMatch) {
+      for (const m of parenMatch[1].matchAll(/\b([A-Za-z]):/g)) {
+        letters.add(m[1].toUpperCase());
+      }
+    }
+    return letters;
+  }, [scannedDevicePath, items, diskName]);
+
+  const selectedDriveLetter = extractDriveLetter(selectedRootDir);
+  const sameDriveWarning =
+    destinationMode === 'folder' &&
+    selectedDriveLetter !== null &&
+    sourceDriveLetters.has(selectedDriveLetter);
 
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
@@ -70,18 +143,27 @@ export const RecoveryModal: React.FC<RecoveryModalProps> = ({
         if (!active) return;
         setVolumes(list);
         if (list.length > 0 && selectedRootDir === null) {
-          setSelectedRootDir(`${list[0].rootPath}Recovered_Files`);
+          const safeVol =
+            list.find((v) => !sourceDriveLetters.has(v.driveLetter.slice(0, 1).toUpperCase())) ??
+            list[0];
+          setSelectedRootDir(`${safeVol.rootPath}Recovered_Files`);
         }
       })
       .catch(() => {});
     return () => {
       active = false;
     };
-  }, [desktop, selectedRootDir]);
+  }, [desktop, selectedRootDir, sourceDriveLetters]);
 
   const truncatedCount = items.filter((i) => i.status === 'OK_TRUNCATED').length;
   const hasBrokenVideo = items.some(
-    (i) => i.status === 'OK_TRUNCATED' && ['mp4', 'mov', 'm4v'].includes(i.extension.toLowerCase()),
+    (i) =>
+      i.status === 'OK_TRUNCATED' &&
+      ['mp4', 'mov', 'm4v', '3gp'].includes(i.extension.toLowerCase()),
+  );
+  const hasBrokenJpeg = items.some(
+    (i) =>
+      i.status === 'OK_TRUNCATED' && ['jpg', 'jpeg'].includes(i.extension.toLowerCase()),
   );
   const supportsDirectoryPicker =
     !!desktop ||
@@ -109,6 +191,8 @@ export const RecoveryModal: React.FC<RecoveryModalProps> = ({
   const handleSave = async () => {
     setErrorMessage(null);
     setResultMessage(null);
+    setReportPath(null);
+    setFailures([]);
     setSaving(true);
 
     try {
@@ -129,15 +213,24 @@ export const RecoveryModal: React.FC<RecoveryModalProps> = ({
         const reqItems = filteredItems.map((item) => {
           const folder = resolveOutputFolder(item);
           const refKind = item.sourceRef?.kind;
-          if (refKind === 'native-device' || refKind === 'native-runs' || refKind === 'native-file') {
+          const outName = resolvePreferredExtension(item.filename, item.extension);
+          if (
+            refKind === 'native-device' ||
+            refKind === 'native-runs' ||
+            refKind === 'native-file' ||
+            refKind === 'native-tsk'
+          ) {
             return {
-              filename: item.filename,
+              filename: outName,
               folder,
               sourceKind: refKind,
               devicePath: item.sourceRef?.devicePath,
               offset: item.sourceRef?.offset ?? 0,
               size: item.sourceRef?.size ?? item.size,
               runs: item.sourceRef?.runs,
+              tskInode: item.sourceRef?.tskInode,
+              tskOffset: item.sourceRef?.tskOffset,
+              discoveryCrc32: item.discoveryCrc32,
               extension: item.extension,
               repairIfTruncated: enableFileRepair && item.status === 'OK_TRUNCATED',
               modifiedAtMs: item.modifiedAt,
@@ -149,11 +242,12 @@ export const RecoveryModal: React.FC<RecoveryModalProps> = ({
             if (rep.repaired) payload = rep.data;
           }
           return {
-            filename: item.filename,
+            filename: outName,
             folder,
             sourceKind: 'memory' as const,
             offset: 0,
             size: payload.length,
+            discoveryCrc32: item.discoveryCrc32,
             memoryBytes: payload,
             extension: item.extension,
             repairIfTruncated: false,
@@ -168,6 +262,7 @@ export const RecoveryModal: React.FC<RecoveryModalProps> = ({
             sourceKind: 'memory',
             offset: 0,
             size: repairedDiskBytes.length,
+            discoveryCrc32: undefined,
             memoryBytes: repairedDiskBytes,
             extension: 'img',
             repairIfTruncated: false,
@@ -177,16 +272,22 @@ export const RecoveryModal: React.FC<RecoveryModalProps> = ({
 
         const res = await desktop.recoverFilesToFolder({
           destinationDir: selectedRootDir,
+          scannedDevicePath: scannedDevicePath ?? undefined,
           items: reqItems,
         });
         if (res.error) {
           setErrorMessage(res.error);
         } else if (!res.canceled) {
-          const repNote =
-            res.repairedCount > 0 ? ` (${res.repairedCount} repaired)` : '';
+          if (res.destinationDir) saveLastDestDir(res.destinationDir);
+          const extras: string[] = [];
+          if ((res.verifiedCount ?? 0) > 0) extras.push(`${res.verifiedCount} CRC-verified`);
+          if (res.repairedCount > 0) extras.push(`${res.repairedCount} repaired`);
+          const extraNote = extras.length > 0 ? ` (${extras.join(', ')})` : '';
           setResultMessage(
-            `Saved ${res.savedCount} file(s) to "${res.destinationDir}"${repNote}.`,
+            `Saved ${res.savedCount} file(s) to "${res.destinationDir}"${extraNote}.`,
           );
+          if (res.reportPath) setReportPath(res.reportPath);
+          if (res.failures && res.failures.length > 0) setFailures(res.failures);
         }
         setSaving(false);
         return;
@@ -206,22 +307,46 @@ export const RecoveryModal: React.FC<RecoveryModalProps> = ({
         const rootHandle = await dirPicker({ mode: 'readwrite' });
 
         let repairedCount = 0;
+        const usedPaths = new Set<string>();
         for (const item of filteredItems) {
           const folder = resolveOutputFolder(item);
+          const outName = resolvePreferredExtension(item.filename, item.extension);
+          const uniquePath = makeUniqueArchivePath(folder, outName, usedPaths);
+          const uniqueFilename = uniquePath.slice(folder.length + 1);
           const parts = folder.split('/').filter(Boolean);
           let curDir = rootHandle;
           for (const part of parts) {
             curDir = await curDir.getDirectoryHandle(part, { create: true });
           }
-          const fileHandle = await curDir.getFileHandle(item.filename, { create: true });
+          const fileHandle = await curDir.getFileHandle(uniqueFilename, { create: true });
           const writable = await fileHandle.createWritable();
 
           if (item.sourceRef?.browserFile) {
-            await writable.write(item.sourceRef.browserFile);
+            if (enableFileRepair && item.status === 'OK_TRUNCATED') {
+              let payload: Uint8Array = new Uint8Array(
+                await item.sourceRef.browserFile.arrayBuffer(),
+              );
+              const rep = repairFileBuffer(
+                item.extension,
+                payload,
+                referenceVideoBytes ?? undefined,
+              );
+              if (rep.repaired) {
+                payload = rep.data;
+                repairedCount++;
+              }
+              await writable.write(payload.slice().buffer);
+            } else {
+              await writable.write(item.sourceRef.browserFile);
+            }
           } else {
             let payload = item.data;
             if (enableFileRepair && item.status === 'OK_TRUNCATED') {
-              const rep = repairFileBuffer(item.extension, payload, referenceVideoBytes ?? undefined);
+              const rep = repairFileBuffer(
+                item.extension,
+                payload,
+                referenceVideoBytes ?? undefined,
+              );
               if (rep.repaired) {
                 payload = rep.data;
                 repairedCount++;
@@ -248,6 +373,7 @@ export const RecoveryModal: React.FC<RecoveryModalProps> = ({
       }
 
       let repairedCount = 0;
+      const usedArchivePaths = new Set<string>();
       const archiveFiles: { name: string; data: Uint8Array }[] = [];
       for (const item of filteredItems) {
         let payload = item.data;
@@ -255,6 +381,18 @@ export const RecoveryModal: React.FC<RecoveryModalProps> = ({
           payload = new Uint8Array(await item.sourceRef.browserFile.arrayBuffer());
         } else if (desktop && item.sourceRef?.kind === 'native-file' && item.sourceRef.devicePath) {
           payload = await desktop.readDiskBytes(item.sourceRef.devicePath, 0, item.size);
+        } else if (
+          desktop &&
+          item.sourceRef?.kind === 'native-tsk' &&
+          item.sourceRef.devicePath
+        ) {
+          payload = await desktop.readDiskBytes(
+            item.sourceRef.devicePath,
+            0,
+            item.size,
+            item.sourceRef.tskInode,
+            item.sourceRef.tskOffset,
+          );
         } else if (
           desktop &&
           item.sourceRef?.kind === 'native-device' &&
@@ -276,7 +414,9 @@ export const RecoveryModal: React.FC<RecoveryModalProps> = ({
         }
 
         const folder = resolveOutputFolder(item);
-        archiveFiles.push({ name: `${folder}/${item.filename}`, data: payload });
+        const outName = resolvePreferredExtension(item.filename, item.extension);
+        const archivePath = makeUniqueArchivePath(folder, outName, usedArchivePaths);
+        archiveFiles.push({ name: archivePath, data: payload });
       }
 
       if (includeRepairedImg && repairedDiskBytes) {
@@ -501,18 +641,20 @@ export const RecoveryModal: React.FC<RecoveryModalProps> = ({
               </label>
             )}
 
-            {hasBrokenVideo && enableFileRepair && (
+            {(hasBrokenVideo || hasBrokenJpeg) && enableFileRepair && (
               <div className="flex items-center justify-between gap-2 px-2 pt-1.5 border-t border-[#262B36] text-[11px] text-slate-300">
                 <span className="truncate" title={referenceVideoName || undefined}>
                   {referenceVideoName
-                    ? `Reference clip: ${referenceVideoName}`
-                    : 'Optional healthy camera .mp4/.mov for moov repair'}
+                    ? `Reference sample: ${referenceVideoName}`
+                    : hasBrokenVideo
+                      ? 'Optional healthy camera .mp4/.mov/.jpg for header/moov repair'
+                      : 'Optional healthy camera .jpg for header repair'}
                 </span>
                 <label className="px-2 py-0.5 rounded bg-[#262B36] hover:bg-[#2F3644] border border-[#343A48] text-slate-200 cursor-pointer shrink-0">
-                  Choose Video
+                  Choose Sample
                   <input
                     type="file"
-                    accept=".mp4,.mov,.m4v"
+                    accept=".mp4,.mov,.m4v,.3gp,.jpg,.jpeg"
                     className="hidden"
                     onChange={async (e) => {
                       const f = e.target.files?.[0];
@@ -528,10 +670,45 @@ export const RecoveryModal: React.FC<RecoveryModalProps> = ({
             )}
           </div>
 
+          {sameDriveWarning && (
+            <div className="flex items-start gap-2 text-xs text-amber-200 bg-amber-500/10 border border-amber-500/35 rounded-md px-3 py-2">
+              <AlertTriangle className="w-4 h-4 text-amber-400 shrink-0 mt-0.5" />
+              <span>
+                Destination is on the same drive as the scanned source ({selectedDriveLetter}:) —
+                saving here may overwrite unallocated clusters. Pick a different drive if possible.
+              </span>
+            </div>
+          )}
+
           {resultMessage && (
-            <div className="flex items-center gap-2 text-xs text-emerald-300 bg-emerald-500/10 border border-emerald-500/30 rounded-md px-3 py-2 animate-slide-down">
-              <CheckCircle2 className="w-4 h-4 shrink-0" />
-              <span>{resultMessage}</span>
+            <div className="space-y-1.5 text-xs text-emerald-300 bg-emerald-500/10 border border-emerald-500/30 rounded-md px-3 py-2 animate-slide-down">
+              <div className="flex items-center gap-2">
+                <CheckCircle2 className="w-4 h-4 shrink-0" />
+                <span>{resultMessage}</span>
+              </div>
+              {reportPath && (
+                <div className="text-[11px] font-mono text-emerald-200/85 pl-6 break-all">
+                  Audit log: {reportPath}
+                </div>
+              )}
+            </div>
+          )}
+
+          {failures.length > 0 && (
+            <div className="text-xs text-amber-200 bg-amber-500/10 border border-amber-500/30 rounded-md px-3 py-2 space-y-1 max-h-28 overflow-y-auto">
+              <div className="font-medium">
+                {failures.length} item(s) had warnings/skipped writes:
+              </div>
+              {failures.slice(0, 6).map((f, idx) => (
+                <div key={`${f.filename}-${idx}`} className="text-[11px] font-mono text-amber-200/85">
+                  · {f.filename}: {f.reason}
+                </div>
+              ))}
+              {failures.length > 6 && (
+                <div className="text-[11px] text-amber-300">
+                  +{failures.length - 6} more (see TestDisk-Recovery-Report.txt)
+                </div>
+              )}
             </div>
           )}
 

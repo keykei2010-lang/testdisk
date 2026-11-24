@@ -3,6 +3,7 @@ import {
   CheckCircle2,
   Download,
   FileText,
+  Film,
   HardDrive,
   Image as ImageIcon,
   Maximize2,
@@ -17,8 +18,8 @@ import {
 import { DiskAnalysisResult, PartitionEntry } from '../engine/partitions';
 import { ExplorerFileItem } from '../engine/explorerTypes';
 import { formatBytes } from '../engine/crc32';
-import { getDesktopBridge } from '../engine/desktopBridge';
-import { formatShortDate } from '../engine/recoveryHealth';
+import { getDesktopBridge, VideoPreviewResult } from '../engine/desktopBridge';
+import { formatShortDate, resolvePreferredExtension } from '../engine/recoveryHealth';
 import { useMediaUrl } from '../utils/useMediaUrl';
 import { HexViewer } from './HexViewer';
 
@@ -28,7 +29,7 @@ interface ExplorerInspectorProps {
   analysis: DiskAnalysisResult;
   diskBytes: Uint8Array;
   onRestorePartitionToMbr: (partition: PartitionEntry) => void;
-  onRepairFile: (item: ExplorerFileItem, referenceBytes?: Uint8Array) => void;
+  onRepairFile: (item: ExplorerFileItem, referenceBytes?: Uint8Array) => Promise<void> | void;
   onBitLockerUnlocked?: () => void;
   lightboxOpen: boolean;
   onSetLightboxOpen: (open: boolean) => void;
@@ -133,6 +134,69 @@ export const ExplorerInspector: React.FC<ExplorerInspectorProps> = ({
     mimeType: focusedFile?.mimeType,
   });
   const [failedPreviewUrl, setFailedPreviewUrl] = useState<string | null>(null);
+  const [failedVideoUrl, setFailedVideoUrl] = useState<string | null>(null);
+  const [videoProbeState, setVideoProbeState] = useState<{
+    fileId: string;
+    result: VideoPreviewResult | null;
+  } | null>(null);
+  const [loadedHexState, setLoadedHexState] = useState<{
+    fileId: string;
+    bytes: Uint8Array;
+  } | null>(null);
+
+  useEffect(() => {
+    if (!desktop || !focusedFile || focusedFile.family !== 'Videos') return;
+    let active = true;
+    const ref = focusedFile.sourceRef;
+    const params =
+      ref?.kind === 'native-file' && ref.devicePath
+        ? { filePath: ref.devicePath }
+        : ref?.kind === 'native-tsk' && ref.devicePath
+          ? {
+              devicePath: ref.devicePath,
+              tskInode: ref.tskInode,
+              tskOffset: ref.tskOffset,
+            }
+          : focusedFile.data.byteLength > 0
+            ? { buffer: focusedFile.data }
+            : null;
+    if (!params) return;
+
+    desktop
+      .probeVideoPreview(params)
+      .then((res) => {
+        if (!active) return;
+        setVideoProbeState({ fileId: focusedFile.id, result: res });
+      })
+      .catch(() => {});
+
+    return () => {
+      active = false;
+    };
+  }, [desktop, focusedFile]);
+
+  useEffect(() => {
+    if (!showHex || !desktop || !focusedFile || focusedFile.data.length > 0) return;
+    const ref = focusedFile.sourceRef;
+    if (!ref?.devicePath) return;
+    let active = true;
+    desktop
+      .readDiskBytes(
+        ref.devicePath,
+        ref.kind === 'native-file' ? 0 : ref.offset,
+        4096,
+        ref.tskInode,
+        ref.tskOffset,
+      )
+      .then((bytes) => {
+        if (!active || bytes.length === 0) return;
+        setLoadedHexState({ fileId: focusedFile.id, bytes });
+      })
+      .catch(() => {});
+    return () => {
+      active = false;
+    };
+  }, [showHex, desktop, focusedFile]);
 
   useEffect(() => {
     if (!lightboxOpen) return;
@@ -145,17 +209,16 @@ export const ExplorerInspector: React.FC<ExplorerInspectorProps> = ({
 
   const handleDownloadFile = async (item: ExplorerFileItem) => {
     const bridge = getDesktopBridge();
-    const outName =
-      item.sourceKind === 'fidentify' && item.extension !== 'unknown'
-        ? `${item.filename.replace(/\.[^.]+$/, '')}.${item.extension}`
-        : item.filename;
+    const outName = resolvePreferredExtension(item.filename, item.extension);
 
     if (
+      !item.repaired &&
       bridge &&
       item.sourceRef &&
       (item.sourceRef.kind === 'native-device' ||
         item.sourceRef.kind === 'native-runs' ||
-        item.sourceRef.kind === 'native-file')
+        item.sourceRef.kind === 'native-file' ||
+        item.sourceRef.kind === 'native-tsk')
     ) {
       await bridge.recoverFilesToFolder({
         destinationDir: null,
@@ -168,6 +231,9 @@ export const ExplorerInspector: React.FC<ExplorerInspectorProps> = ({
             offset: item.sourceRef.offset,
             size: item.sourceRef.size,
             runs: item.sourceRef.runs,
+            tskInode: item.sourceRef.tskInode,
+            tskOffset: item.sourceRef.tskOffset,
+            discoveryCrc32: item.discoveryCrc32,
             extension: item.extension,
             repairIfTruncated: item.status === 'OK_TRUNCATED',
             modifiedAtMs: item.modifiedAt,
@@ -177,9 +243,10 @@ export const ExplorerInspector: React.FC<ExplorerInspectorProps> = ({
       return;
     }
 
-    const blob = item.sourceRef?.browserFile
-      ? item.sourceRef.browserFile
-      : new Blob([item.data.slice().buffer], { type: item.mimeType });
+    const blob =
+      item.repaired || !item.sourceRef?.browserFile
+        ? new Blob([item.data.slice().buffer], { type: item.mimeType })
+        : item.sourceRef.browserFile;
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;
@@ -204,6 +271,23 @@ export const ExplorerInspector: React.FC<ExplorerInspectorProps> = ({
       focusedFile.extension === 'eml';
 
     const lc = likelihoodColors(focusedFile.recoveryTier);
+    const videoProbe =
+      videoProbeState?.fileId === focusedFile.id ? videoProbeState.result : null;
+    const videoMetaParts = [
+      videoProbe?.codec ? videoProbe.codec.toUpperCase() : null,
+      videoProbe?.width && videoProbe?.height
+        ? `${videoProbe.width}×${videoProbe.height}`
+        : null,
+      videoProbe?.durationSec != null && videoProbe.durationSec > 0
+        ? `${Math.round(videoProbe.durationSec)}s`
+        : null,
+    ].filter(Boolean);
+    const hexBytes =
+      focusedFile.data.length > 0
+        ? focusedFile.data
+        : loadedHexState?.fileId === focusedFile.id
+          ? loadedHexState.bytes
+          : focusedFile.data;
 
     return (
       <>
@@ -260,9 +344,9 @@ export const ExplorerInspector: React.FC<ExplorerInspectorProps> = ({
                   </div>
                   <audio controls src={previewUrl} className="w-full h-9" />
                 </div>
-              ) : previewUrl && isVideo ? (
+              ) : isVideo && previewUrl && failedVideoUrl !== previewUrl ? (
                 <div
-                  className="w-full h-36 flex items-center justify-center overflow-hidden"
+                  className="w-full h-36 flex items-center justify-center overflow-hidden relative"
                   onDoubleClick={() => onSetLightboxOpen(true)}
                   onWheel={(e) => {
                     e.preventDefault();
@@ -274,9 +358,51 @@ export const ExplorerInspector: React.FC<ExplorerInspectorProps> = ({
                   <video
                     controls
                     src={previewUrl}
+                    onError={() => setFailedVideoUrl(previewUrl)}
                     style={{ transform: `scale(${inlineZoom})` }}
                     className="max-h-36 w-full rounded transition-transform duration-150 ease-out"
                   />
+                  {videoMetaParts.length > 0 && (
+                    <span className="absolute top-1.5 right-1.5 px-1.5 py-0.5 rounded bg-black/75 border border-white/10 text-[10px] font-mono text-slate-200 pointer-events-none">
+                      {videoMetaParts.join(' · ')}
+                    </span>
+                  )}
+                </div>
+              ) : isVideo && videoProbe?.thumbnailDataUrl ? (
+                <div
+                  className="w-full h-36 flex items-center justify-center overflow-hidden relative cursor-zoom-in"
+                  onDoubleClick={() => onSetLightboxOpen(true)}
+                  onWheel={(e) => {
+                    e.preventDefault();
+                    updateZoom({
+                      inlineZoom: clampZoom(inlineZoom + (e.deltaY < 0 ? 0.25 : -0.25)),
+                    });
+                  }}
+                >
+                  <img
+                    src={videoProbe.thumbnailDataUrl}
+                    alt={`${focusedFile.filename} keyframe`}
+                    style={{ transform: `scale(${inlineZoom})` }}
+                    className="max-h-36 object-contain rounded transition-transform duration-150 ease-out"
+                  />
+                  <span className="absolute top-1.5 left-1.5 px-1.5 py-0.5 rounded bg-black/75 border border-white/10 text-[10px] font-mono text-violet-300 pointer-events-none">
+                    FFmpeg Keyframe
+                  </span>
+                  {videoMetaParts.length > 0 && (
+                    <span className="absolute top-1.5 right-1.5 px-1.5 py-0.5 rounded bg-black/75 border border-white/10 text-[10px] font-mono text-slate-200 pointer-events-none">
+                      {videoMetaParts.join(' · ')}
+                    </span>
+                  )}
+                </div>
+              ) : isVideo ? (
+                <div className="text-center space-y-1.5 py-4 px-2">
+                  <Film className="w-7 h-7 mx-auto text-violet-400" />
+                  <div className="text-xs text-slate-300 font-medium">
+                    {videoMetaParts.length > 0 ? videoMetaParts.join(' · ') : 'Video Stream Ready'}
+                  </div>
+                  <div className="text-[11px] text-slate-500">
+                    Save file to reconstruct container &amp; play externally
+                  </div>
                 </div>
               ) : isTextLike ? (
                 <div className="w-full space-y-1.5">
@@ -430,22 +556,25 @@ export const ExplorerInspector: React.FC<ExplorerInspectorProps> = ({
                 </div>
               </div>
 
-              {focusedFile.status === 'OK_TRUNCATED' && !focusedFile.repaired && (
+              {((focusedFile.status === 'OK_TRUNCATED' && !focusedFile.repaired) ||
+                (!focusedFile.repaired &&
+                  ((isImage && previewUrl !== null && failedPreviewUrl === previewUrl) ||
+                    (isVideo && previewUrl !== null && failedVideoUrl === previewUrl)))) && (
                 <div className="space-y-1.5">
                   <button
                     type="button"
-                    onClick={() => onRepairFile(focusedFile)}
+                    onClick={() => void onRepairFile(focusedFile)}
                     className="w-full inline-flex items-center justify-center gap-1.5 py-1.5 px-3 rounded-md text-xs font-medium bg-amber-500/15 border border-amber-500/35 text-amber-200 hover:bg-amber-500/25 transition-colors"
                   >
                     <Wrench className="w-3.5 h-3.5" />
                     Repair Corrupted Structure
                   </button>
-                  {['mp4', 'mov', 'm4v'].includes(focusedFile.extension.toLowerCase()) && (
+                  {['mp4', 'mov', 'm4v', '3gp'].includes(focusedFile.extension.toLowerCase()) && (
                     <label className="block w-full text-center py-1 px-2.5 rounded border border-[#343A48] bg-[#242934] hover:bg-[#2C3342] text-[11px] text-slate-200 cursor-pointer transition-colors">
                       Repair with Healthy Reference Video (.mp4/.mov)
                       <input
                         type="file"
-                        accept=".mp4,.mov,.m4v"
+                        accept=".mp4,.mov,.m4v,.3gp"
                         className="hidden"
                         onChange={async (e) => {
                           const f = e.target.files?.[0];
@@ -453,7 +582,26 @@ export const ExplorerInspector: React.FC<ExplorerInspectorProps> = ({
                           const refBytes = new Uint8Array(
                             await f.slice(0, 8 * 1024 * 1024).arrayBuffer(),
                           );
-                          onRepairFile(focusedFile, refBytes);
+                          void onRepairFile(focusedFile, refBytes);
+                          e.target.value = '';
+                        }}
+                      />
+                    </label>
+                  )}
+                  {['jpg', 'jpeg'].includes(focusedFile.extension.toLowerCase()) && (
+                    <label className="block w-full text-center py-1 px-2.5 rounded border border-[#343A48] bg-[#242934] hover:bg-[#2C3342] text-[11px] text-slate-200 cursor-pointer transition-colors">
+                      Repair with Healthy Reference Photo (.jpg/.jpeg)
+                      <input
+                        type="file"
+                        accept=".jpg,.jpeg"
+                        className="hidden"
+                        onChange={async (e) => {
+                          const f = e.target.files?.[0];
+                          if (!f) return;
+                          const refBytes = new Uint8Array(
+                            await f.slice(0, 4 * 1024 * 1024).arrayBuffer(),
+                          );
+                          void onRepairFile(focusedFile, refBytes);
                           e.target.value = '';
                         }}
                       />
@@ -474,6 +622,25 @@ export const ExplorerInspector: React.FC<ExplorerInspectorProps> = ({
                   <div className="text-slate-400 text-[11px]">Cluster Extents</div>
                   <div className="text-emerald-300 font-mono mt-0.5">
                     {focusedFile.sourceRef.runs.length} runs linked via filesystem metadata
+                  </div>
+                </div>
+              )}
+
+              {focusedFile.discoveryCrc32 !== undefined && (
+                <div>
+                  <div className="text-slate-400 text-[11px]">Discovery CRC-32</div>
+                  <div className="text-emerald-300 font-mono mt-0.5 tabular-nums">
+                    0x{focusedFile.discoveryCrc32.toString(16).padStart(8, '0').toUpperCase()}
+                  </div>
+                </div>
+              )}
+
+              {focusedFile.sourceRef?.kind === 'native-tsk' && focusedFile.sourceRef.tskInode && (
+                <div>
+                  <div className="text-slate-400 text-[11px]">Sleuth Kit Inode</div>
+                  <div className="text-sky-300 font-mono mt-0.5 tabular-nums">
+                    Inode {focusedFile.sourceRef.tskInode} (Offset 0x
+                    {(focusedFile.sourceRef.tskOffset ?? 0).toString(16)})
                   </div>
                 </div>
               )}
@@ -507,7 +674,7 @@ export const ExplorerInspector: React.FC<ExplorerInspectorProps> = ({
 
               {showHex && (
                 <HexViewer
-                  bytes={focusedFile.data}
+                  bytes={hexBytes}
                   baseOffset={focusedFile.offset}
                   maxBytes={128}
                   title="Magic Header Bytes"
@@ -724,23 +891,41 @@ export const ExplorerInspector: React.FC<ExplorerInspectorProps> = ({
                   </div>
                 ) : previewUrl && isAudio ? (
                   <audio controls src={previewUrl} className="w-full max-w-md" />
-                ) : previewUrl && isVideo ? (
+                ) : isVideo && previewUrl && failedVideoUrl !== previewUrl ? (
                   <video
                     controls
                     src={previewUrl}
+                    onError={() => setFailedVideoUrl(previewUrl)}
                     style={{ transform: `translate(${panX}px, ${panY}px) scale(${modalZoom})` }}
                     className={`max-h-[54vh] rounded ${
                       isDragging ? '' : 'transition-transform duration-150 ease-out'
                     }`}
                   />
+                ) : isVideo && videoProbe?.thumbnailDataUrl ? (
+                  <div className="space-y-2 text-center">
+                    <img
+                      src={videoProbe.thumbnailDataUrl}
+                      alt={`${focusedFile.filename} keyframe`}
+                      draggable={false}
+                      style={{ transform: `translate(${panX}px, ${panY}px) scale(${modalZoom})` }}
+                      className={`max-h-[48vh] object-contain rounded mx-auto ${
+                        isDragging ? '' : 'transition-transform duration-150 ease-out'
+                      }`}
+                    />
+                    {videoMetaParts.length > 0 && (
+                      <div className="text-[11px] font-mono text-slate-300">
+                        FFmpeg Keyframe · {videoMetaParts.join(' · ')}
+                      </div>
+                    )}
+                  </div>
                 ) : isTextLike ? (
                   <pre className="w-full max-h-[54vh] overflow-auto text-xs font-mono text-slate-200 whitespace-pre-wrap break-all">
-                    {new TextDecoder().decode(focusedFile.data.subarray(0, 8192))}
+                    {new TextDecoder().decode(hexBytes.subarray(0, 8192))}
                   </pre>
                 ) : (
                   <div className="w-full max-h-[54vh] overflow-auto">
                     <HexViewer
-                      bytes={focusedFile.data}
+                      bytes={hexBytes}
                       baseOffset={focusedFile.offset}
                       maxBytes={512}
                       title="Binary Payload (First 512 B)"

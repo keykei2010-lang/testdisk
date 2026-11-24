@@ -1,5 +1,7 @@
 import React, { useEffect, useState } from 'react';
 import {
+  CheckCircle2,
+  FlaskConical,
   FolderOpen,
   FolderSearch,
   HardDrive,
@@ -13,10 +15,14 @@ import {
 import { DiskAnalysisResult, PartitionEntry } from '../engine/partitions';
 import { formatBytes } from '../engine/crc32';
 import { getDesktopBridge, WindowsDriveInfo } from '../engine/desktopBridge';
+import { EngineCapabilities } from '../engine/explorerTypes';
+import { RecoverySelfTestResult, runRecoverySelfTest } from '../engine/recoveryHealth';
 
 interface DriveHubModalProps {
   analysis: DiskAnalysisResult;
   activePartitionScope: string | null;
+  capabilities?: EngineCapabilities | null;
+  onRelaunchAsAdmin?: () => Promise<void>;
   onStartTargetedScan: (partition: PartitionEntry | null) => void;
   onOpenPhysicalDrive: (drive: WindowsDriveInfo) => Promise<void>;
   onScanFolder: () => void;
@@ -28,6 +34,8 @@ interface DriveHubModalProps {
 export const DriveHubModal: React.FC<DriveHubModalProps> = ({
   analysis,
   activePartitionScope,
+  capabilities,
+  onRelaunchAsAdmin,
   onStartTargetedScan,
   onOpenPhysicalDrive,
   onScanFolder,
@@ -40,6 +48,8 @@ export const DriveHubModal: React.FC<DriveHubModalProps> = ({
   const [loadingDrives, setLoadingDrives] = useState<boolean>(false);
   const [openingDrive, setOpeningDrive] = useState<string | null>(null);
   const [scanningBin, setScanningBin] = useState<boolean>(false);
+  const [selfTestBusy, setSelfTestBusy] = useState<boolean>(false);
+  const [selfTestResult, setSelfTestResult] = useState<RecoverySelfTestResult | null>(null);
 
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
@@ -86,17 +96,53 @@ export const DriveHubModal: React.FC<DriveHubModalProps> = ({
               Select Location, Folder, or Drive to Scan
             </h3>
           </div>
-          <button
-            type="button"
-            onClick={onClose}
-            className="text-slate-400 hover:text-slate-100 p-1 rounded"
-            aria-label="Close drive overview"
-          >
-            <X className="w-4 h-4" />
-          </button>
+          <div className="flex items-center gap-2">
+            <button
+              type="button"
+              disabled={selfTestBusy}
+              onClick={async () => {
+                setSelfTestBusy(true);
+                try {
+                  setSelfTestResult(await runRecoverySelfTest());
+                } finally {
+                  setSelfTestBusy(false);
+                }
+              }}
+              className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded bg-[#181B22] hover:bg-[#2A3140] border border-[#343A48] text-xs text-slate-200 disabled:opacity-50"
+            >
+              <FlaskConical className="w-3.5 h-3.5 text-[#4C8DFF]" />
+              {selfTestBusy ? 'Testing...' : 'Run Engine Self-Test'}
+            </button>
+            <button
+              type="button"
+              onClick={onClose}
+              className="text-slate-400 hover:text-slate-100 p-1 rounded"
+              aria-label="Close drive overview"
+            >
+              <X className="w-4 h-4" />
+            </button>
+          </div>
         </div>
 
         <div className="p-5 space-y-5 text-xs overflow-y-auto">
+          {selfTestResult && (
+            <div
+              className={`p-3 rounded-md border space-y-1.5 ${
+                selfTestResult.passed
+                  ? 'bg-emerald-500/10 border-emerald-500/30 text-emerald-200'
+                  : 'bg-rose-500/10 border-rose-500/30 text-rose-200'
+              }`}
+            >
+              <div className="flex items-center gap-1.5 font-medium">
+                <CheckCircle2 className="w-3.5 h-3.5 shrink-0" />
+                <span>
+                  {selfTestResult.checks.filter((c) => c.passed).length}/{selfTestResult.checks.length}{' '}
+                  checks passed ({selfTestResult.durationMs}ms) · SHA-256{' '}
+                  {selfTestResult.sha256Hex.slice(0, 12)}...
+                </span>
+              </div>
+            </div>
+          )}
           {/* Common Windows Locations (matching EaseUS Specify a Location) */}
           <div className="space-y-2">
             <div className="font-semibold text-slate-200">Common Locations</div>
@@ -154,18 +200,30 @@ export const DriveHubModal: React.FC<DriveHubModalProps> = ({
           {/* Windows Physical Drives Section (Active inside Windows Desktop .exe) */}
           {desktop && (
             <div className="space-y-2">
-              <div className="flex items-center justify-between">
+              <div className="flex items-center justify-between gap-2">
                 <span className="font-semibold text-slate-200">
                   Windows Physical Drives (Streaming Sector Scan)
                 </span>
-                <button
-                  type="button"
-                  onClick={() => void refreshDrives()}
-                  className="inline-flex items-center gap-1 text-[#60A5FA] hover:underline"
-                >
-                  <RefreshCw className={`w-3 h-3 ${loadingDrives ? 'animate-spin' : ''}`} />
-                  Refresh Drives
-                </button>
+                <div className="flex items-center gap-3">
+                  {capabilities && !capabilities.isAdmin && onRelaunchAsAdmin && (
+                    <button
+                      type="button"
+                      onClick={() => void onRelaunchAsAdmin()}
+                      className="inline-flex items-center gap-1 px-2 py-0.5 rounded bg-amber-500/15 border border-amber-500/35 text-amber-200 hover:bg-amber-500/25"
+                    >
+                      <ShieldAlert className="w-3 h-3" />
+                      Relaunch as Admin
+                    </button>
+                  )}
+                  <button
+                    type="button"
+                    onClick={() => void refreshDrives()}
+                    className="inline-flex items-center gap-1 text-[#60A5FA] hover:underline"
+                  >
+                    <RefreshCw className={`w-3 h-3 ${loadingDrives ? 'animate-spin' : ''}`} />
+                    Refresh Drives
+                  </button>
+                </div>
               </div>
               {winDrives.length === 0 ? (
                 <div className="p-3 rounded-md bg-[#181B22] border border-[#2D3342] text-slate-400">

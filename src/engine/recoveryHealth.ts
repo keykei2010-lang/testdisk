@@ -1,7 +1,22 @@
 import { computeCrc32 } from './crc32';
-import { RecoveryLikelihoodTier } from './explorerTypes';
-import { rebuildMp4WithMoov } from './mp4Repair';
-import { IdentifyMetadata } from './signatures';
+import { ExplorerFileItem, RecoveryLikelihoodTier } from './explorerTypes';
+import { scanFatAndExfatDeletedInBuffer } from './fatExfat';
+import {
+  extractEmbeddedJpegPreview,
+  inspectJpegStructure,
+  repairAviBuffer,
+  repairJpegBuffer,
+  repairMkvOrWebmBuffer,
+  repairPngBuffer,
+  repairRawOrImageBuffer,
+} from './imageRepair';
+import { inspectMp4Health, rebuildMp4WithMoov } from './mp4Repair';
+import { scanNtfsMftRecordsInBuffer } from './ntfsMft';
+import { analyzeDiskImage } from './partitions';
+import { buildSampleDiskImage } from './sampleDisk';
+import { carveDiskBuffer, FILE_FORMATS, identifyBuffer, IdentifyMetadata } from './signatures';
+
+export { extractEmbeddedJpegPreview, repairJpegBuffer, repairPngBuffer, repairAviBuffer };
 
 export interface RecoveryLikelihoodAssessment {
   chance: number;
@@ -193,55 +208,123 @@ export function formatCompactCount(count: number): string {
   return String(count);
 }
 
+export interface MediaDiagnosis {
+  issue: string;
+  canRepair: boolean;
+  needsReferenceHint: boolean;
+}
+
+export function diagnoseMediaFile(extension: string, data: Uint8Array): MediaDiagnosis {
+  const ext = extension.toLowerCase().replace(/^\./, '');
+  if (['mp4', 'mov', 'm4v', '3gp'].includes(ext)) {
+    const mp4 = inspectMp4Health(data);
+    return {
+      issue: mp4.issueSummary,
+      canRepair: !mp4.valid,
+      needsReferenceHint: mp4.missingMoov || mp4.headerlessStream,
+    };
+  }
+  if (ext === 'jpg' || ext === 'jpeg') {
+    const jpg = inspectJpegStructure(data);
+    if (!jpg.hasSoi || !jpg.hasDqt || !jpg.hasSof) {
+      return {
+        issue: 'Damaged or missing JPEG DQT/SOF header markers.',
+        canRepair: true,
+        needsReferenceHint: true,
+      };
+    }
+    if (!jpg.hasDht) {
+      return {
+        issue: 'Missing JPEG Huffman tables (DHT) before image scan.',
+        canRepair: true,
+        needsReferenceHint: false,
+      };
+    }
+    if (jpg.hasCorruptEntropyMarkers) {
+      return {
+        issue: 'Corrupt 0xFF marker bytes inside JPEG entropy scan (causes gray/green shifts).',
+        canRepair: true,
+        needsReferenceHint: false,
+      };
+    }
+    if (!jpg.hasEoi) {
+      return {
+        issue: 'Truncated JPEG stream missing EOI (0xFFD9) trailer.',
+        canRepair: true,
+        needsReferenceHint: false,
+      };
+    }
+    return { issue: 'JPEG container markers & entropy verified.', canRepair: false, needsReferenceHint: false };
+  }
+  if (ext === 'png') {
+    const iend = [0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82];
+    const tail = data.subarray(Math.max(0, data.length - 12));
+    const hasIend = tail.length === 12 && tail.every((b, i) => b === iend[i]);
+    const ihdrCrcOk = verifyPngIhdrCrc(data);
+    if (ihdrCrcOk === false) {
+      return { issue: 'PNG IHDR CRC-32 mismatch (recomputable).', canRepair: true, needsReferenceHint: false };
+    }
+    if (!hasIend) {
+      return { issue: 'Truncated PNG stream missing IEND trailer / IDAT length clamp.', canRepair: true, needsReferenceHint: false };
+    }
+    return { issue: 'PNG chunks intact.', canRepair: false, needsReferenceHint: false };
+  }
+  if (['cr2', 'cr3', 'nef', 'arw', 'dng', 'orf', 'rw2', 'tif', 'tiff'].includes(ext)) {
+    return {
+      issue: `${ext.toUpperCase()} Camera RAW/TIFF ready for embedded JPEG preview salvage & header check.`,
+      canRepair: true,
+      needsReferenceHint: false,
+    };
+  }
+  if (ext === 'avi' || ext === 'wav' || ext === 'webp' || ext === 'mkv' || ext === 'webm' || ext === 'gif') {
+    return {
+      issue: `Container index/length check ready for .${ext.toUpperCase()} structural repair.`,
+      canRepair: true,
+      needsReferenceHint: false,
+    };
+  }
+  return {
+    issue: 'Ready for structural inspection & magic-byte header verification.',
+    canRepair: false,
+    needsReferenceHint: false,
+  };
+}
+
 /**
- * Structural repair for truncated/damaged carved buffers:
- * - JPEG EOI (0xFFD9)
- * - PNG IEND + CRC
- * - PDF %%EOF trailer
- * - RIFF WAV/AVI/WEBP length patching
- * - BMP bfSize header patching
- * - MP4 / MOV ISO BMFF atom size patching & tail cleanup (Smart Video Reorganization)
+ * Structural repair for truncated/damaged carved & recovered media buffers:
+ * - JPEG EOI, Baseline DHT, RSTn/0xFF entropy sanitizer, Reference Header Transplant & EXIF preview salvage
+ * - PNG chunk CRC-32 repair, truncated IDAT length clamping & IEND trailer
+ * - Camera RAW (CR2/CR3/NEF/ARW/DNG) & TIFF embedded JPEG preview salvage
+ * - AVI idx1 index + avih dwTotalFrames + movi rebuild
+ * - MKV / WebM EBML null-tail trim
+ * - WebP / GIF / BMP / WAV / PDF structural header & EOF repairs
+ * - MP4 / MOV / M4V / 3GP H.264/HEVC SPS parsing, headerless salvage, moov + dual-track audio synthesis
  */
 export function repairFileBuffer(
   extension: string,
   data: Uint8Array,
   referenceBytes?: Uint8Array,
-): { repaired: boolean; data: Uint8Array; note: string } {
-  const ext = extension.toLowerCase();
+): { repaired: boolean; data: Uint8Array; note: string; salvagedPreviewBytes?: Uint8Array } {
+  const ext = extension.toLowerCase().replace(/^\./, '');
 
   if (ext === 'jpg' || ext === 'jpeg') {
-    const hasEoi =
-      data.length >= 2 && data[data.length - 2] === 0xff && data[data.length - 1] === 0xd9;
-    if (!hasEoi) {
-      const patched = new Uint8Array(data.length + 2);
-      patched.set(data, 0);
-      patched[data.length] = 0xff;
-      patched[data.length + 1] = 0xd9;
-      return {
-        repaired: true,
-        data: patched,
-        note: 'Appended missing JPEG EOI (0xFFD9) marker.',
-      };
-    }
+    return repairJpegBuffer(data, referenceBytes);
   }
 
   if (ext === 'png') {
-    const iend = new Uint8Array([
-      0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
-    ]);
-    const tail = data.subarray(Math.max(0, data.length - 12));
-    const alreadyHasIend =
-      tail.length === 12 && tail.every((b, idx) => b === iend[idx]);
-    if (!alreadyHasIend) {
-      const patched = new Uint8Array(data.length + 12);
-      patched.set(data, 0);
-      patched.set(iend, data.length);
-      return {
-        repaired: true,
-        data: patched,
-        note: 'Appended valid PNG IEND chunk and CRC.',
-      };
-    }
+    return repairPngBuffer(data);
+  }
+
+  if (ext === 'avi') {
+    return repairAviBuffer(data);
+  }
+
+  if (ext === 'mkv' || ext === 'webm') {
+    return repairMkvOrWebmBuffer(data);
+  }
+
+  if (['webp', 'gif', 'cr2', 'cr3', 'nef', 'arw', 'dng', 'orf', 'rw2', 'tif', 'tiff'].includes(ext)) {
+    return repairRawOrImageBuffer(ext, data);
   }
 
   if (ext === 'pdf') {
@@ -259,25 +342,22 @@ export function repairFileBuffer(
     }
   }
 
-  if ((ext === 'wav' || ext === 'avi' || ext === 'webp') && data.length >= 12) {
+  if (ext === 'wav' && data.length >= 12) {
     const patched = data.slice();
     const dv = new DataView(patched.buffer);
     dv.setUint32(4, Math.max(4, patched.length - 8), true);
-    if (ext === 'wav' && patched.length >= 44) {
+    if (patched.length >= 44) {
       dv.setUint32(40, Math.max(0, patched.length - 44), true);
     }
     return {
       repaired: true,
       data: patched,
-      note: 'Recalculated RIFF header payload length.',
+      note: 'Recalculated WAV RIFF & data chunk payload length.',
     };
   }
 
-  if ((ext === 'mp4' || ext === 'mov' || ext === 'm4v') && data.length >= 16) {
-    const rebuilt = rebuildMp4WithMoov(data, referenceBytes);
-    if (rebuilt.repaired) {
-      return rebuilt;
-    }
+  if ((ext === 'mp4' || ext === 'mov' || ext === 'm4v' || ext === '3gp') && data.length >= 16) {
+    return rebuildMp4WithMoov(data, referenceBytes);
   }
 
   if (ext === 'bmp' && data.length >= 18) {
@@ -295,5 +375,230 @@ export function repairFileBuffer(
     repaired: false,
     data,
     note: 'Header and structure did not require patching.',
+  };
+}
+
+const ZIP_CONTAINER_EXTS = new Set([
+  'docx',
+  'xlsx',
+  'pptx',
+  'odt',
+  'ods',
+  'odp',
+  'epub',
+  'apk',
+  'jar',
+  'zip',
+]);
+
+const OLE2_CONTAINER_EXTS = new Set(['doc', 'xls', 'ppt', 'msi', 'msg']);
+
+/**
+ * Magic-header extension auto-correction (Digger-inspired):
+ * Fixes missing, `.bin`, `.unknown`, or mismatched extensions using signature detection,
+ * while preserving specialized ZIP (OOXML/ODF/EPUB/APK) & OLE2 office extensions.
+ */
+export function resolvePreferredExtension(filename: string, detectedExt?: string): string {
+  const cleanDetected = String(detectedExt || '')
+    .trim()
+    .toLowerCase()
+    .replace(/^\./, '');
+  if (!cleanDetected || cleanDetected === 'unknown' || cleanDetected === 'bin') {
+    return filename;
+  }
+
+  const lastDot = filename.lastIndexOf('.');
+  const curExt = lastDot > 0 ? filename.slice(lastDot + 1).toLowerCase() : '';
+  const stem = lastDot > 0 ? filename.slice(0, lastDot) : filename;
+
+  if (!curExt || curExt === 'bin' || curExt === 'unknown' || curExt === 'tmp') {
+    return `${stem}.${cleanDetected}`;
+  }
+  if (curExt === cleanDetected) return filename;
+  if ((curExt === 'jpeg' && cleanDetected === 'jpg') || (curExt === 'jpg' && cleanDetected === 'jpeg')) {
+    return filename;
+  }
+  if ((curExt === 'tiff' && cleanDetected === 'tif') || (curExt === 'tif' && cleanDetected === 'tiff')) {
+    return filename;
+  }
+  if (cleanDetected === 'zip' && ZIP_CONTAINER_EXTS.has(curExt)) {
+    return filename;
+  }
+  if (cleanDetected === 'doc' && OLE2_CONTAINER_EXTS.has(curExt)) {
+    return filename;
+  }
+  return `${stem}.${cleanDetected}`;
+}
+
+function escapeCsvCell(raw: string | number | boolean | undefined | null): string {
+  const s = raw === undefined || raw === null ? '' : String(raw);
+  if (/[",\r\n]/.test(s)) {
+    return `"${s.replace(/"/g, '""')}"`;
+  }
+  return s;
+}
+
+export function buildCsvReport(items: ExplorerFileItem[], diskName: string): string {
+  const headers = [
+    'Disk / Source',
+    'Filename',
+    'Extension',
+    'Family',
+    'Size Bytes',
+    'Status',
+    'Recovery Chance %',
+    'Recovery Reason',
+    'Source Engine',
+    'Deleted',
+    'Partition / Origin',
+    'Original Path',
+    'Offset Hex',
+    'Sector',
+    'CRC32 Fingerprint',
+  ];
+  const rows = [headers.map(escapeCsvCell).join(',')];
+  for (const item of items) {
+    rows.push(
+      [
+        diskName,
+        item.filename,
+        item.extension,
+        item.family,
+        item.size,
+        item.repaired ? 'REPAIRED' : item.status,
+        item.recoveryChance,
+        item.recoveryReason,
+        item.sourceKind,
+        item.isDeleted === false ? 'No' : 'Yes',
+        item.partitionName,
+        item.originalPath || '',
+        `0x${item.offset.toString(16)}`,
+        item.sector,
+        item.discoveryCrc32 !== undefined
+          ? item.discoveryCrc32.toString(16).padStart(8, '0')
+          : item.contentFingerprint || '',
+      ]
+        .map(escapeCsvCell)
+        .join(','),
+    );
+  }
+  return rows.join('\r\n');
+}
+
+export interface RecoverySelfTestCheck {
+  name: string;
+  passed: boolean;
+  detail: string;
+}
+
+export interface RecoverySelfTestResult {
+  passed: boolean;
+  durationMs: number;
+  sha256Hex: string;
+  checks: RecoverySelfTestCheck[];
+}
+
+async function computeSha256Hex(bytes: Uint8Array): Promise<string> {
+  if (typeof globalThis.crypto !== 'undefined' && globalThis.crypto.subtle) {
+    const digest = await globalThis.crypto.subtle.digest('SHA-256', bytes.slice().buffer);
+    return Array.from(new Uint8Array(digest))
+      .map((b) => b.toString(16).padStart(2, '0'))
+      .join('');
+  }
+  const crc = computeCrc32(bytes, 0, bytes.length);
+  return `crc32-${crc.toString(16).padStart(8, '0')}`;
+}
+
+export async function runRecoverySelfTest(): Promise<RecoverySelfTestResult> {
+  const t0 = Date.now();
+  const checks: RecoverySelfTestCheck[] = [];
+  const sample = buildSampleDiskImage();
+
+  // 1. MBR + Lost Partition Detection
+  const analysis = analyzeDiskImage(sample.name, sample.bytes);
+  const lost = analysis.partitions.find((p) => p.status === 'Deleted / Lost');
+  checks.push({
+    name: 'MBR + Lost Partition Rescue',
+    passed: Boolean(analysis.mbrSignatureValid && lost),
+    detail: lost
+      ? `Detected MBR + lost ${lost.detectedFs?.filesystem ?? 'NTFS'} partition at LBA ${lost.startLba}`
+      : 'Failed to locate lost partition',
+  });
+
+  // 2. NTFS $MFT Record + Path + SHA-256 Reconstruction
+  const mft = scanNtfsMftRecordsInBuffer(sample.bytes, analysis.partitions, { includeExisting: true });
+  const tax = mft.find((r) => r.filename === 'Tax_Return_2025_Deleted.txt');
+  const taxHash = tax ? await computeSha256Hex(tax.reconstructedBytes) : '';
+  const taxOk = Boolean(
+    tax &&
+      tax.isDeleted &&
+      tax.reconstructedPath === '\\Finance_2025\\Tax_Return_2025_Deleted.txt' &&
+      taxHash.length >= 16,
+  );
+  checks.push({
+    name: 'NTFS $MFT Deleted Record & Path',
+    passed: taxOk,
+    detail: taxOk
+      ? `${tax!.reconstructedPath} (${tax!.reconstructedBytes.length} B, SHA-256 ${taxHash.slice(0, 12)}...)`
+      : 'Failed to reconstruct deleted NTFS MFT record',
+  });
+
+  // 3. FAT32 LFN Deleted File + Signature Verification
+  const fat = scanFatAndExfatDeletedInBuffer(sample.bytes, analysis.partitions, {
+    includeExisting: true,
+  });
+  const beach = fat.find((f) => f.filename === 'Vacation_Beach_Deleted.jpg');
+  const beachId = beach ? identifyBuffer(beach.reconstructedBytes) : null;
+  const beachOk = Boolean(beach && beach.isDeleted && beachId?.extension === 'jpg' && beachId.status === 'OK');
+  checks.push({
+    name: 'FAT32 LFN Deleted JPEG Recovery',
+    passed: beachOk,
+    detail: beachOk
+      ? `Recovered ${beach!.filename} (${beach!.reconstructedBytes.length} B)`
+      : 'Failed to recover FAT32 LFN JPEG',
+  });
+
+  // 4. Raw Sector Carving + Discovery CRC-32 Checksum Verification
+  const enabled = new Set(FILE_FORMATS.map((f) => f.id));
+  const carved = carveDiskBuffer(sample.bytes, {
+    startByte: 0,
+    endByte: sample.bytes.length,
+    blockSize: 512,
+    paranoid: true,
+    keepCorrupted: true,
+    enabledFormats: enabled,
+  });
+  const crcMatch =
+    carved.length > 0 &&
+    carved.every(
+      (c) =>
+        c.discoveryCrc32 === computeCrc32(c.data, 0, Math.min(65536, c.data.length)),
+    );
+  checks.push({
+    name: 'Raw Signature Carving + Discovery CRC-32',
+    passed: carved.length >= 2 && crcMatch,
+    detail: `Carved ${carved.length} raw streams · CRC-32 ${crcMatch ? 'verified' : 'mismatch'}`,
+  });
+
+  // 5. MP4 moov Atom Synthesis
+  const brokenMp4 = new Uint8Array([
+    0x00, 0x00, 0x00, 0x10, 0x66, 0x74, 0x79, 0x70, 0x69, 0x73, 0x6f, 0x6d, 0x00, 0x00, 0x02, 0x00,
+    0x00, 0x00, 0x00, 0x21, 0x6d, 0x64, 0x61, 0x74,
+    0x00, 0x00, 0x00, 0x01, 0x67, 0x42, 0xc0, 0x1e,
+    0x00, 0x00, 0x00, 0x01, 0x68, 0xce, 0x38, 0x80,
+    0x00, 0x00, 0x00, 0x01, 0x65, 0x88, 0x84, 0x21, 0xa0,
+  ]);
+  const mp4Rep = rebuildMp4WithMoov(brokenMp4);
+  checks.push({
+    name: 'Truncated MP4 moov Synthesis',
+    passed: mp4Rep.repaired,
+    detail: mp4Rep.repaired ? mp4Rep.note : 'MP4 moov synthesis failed',
+  });
+
+  return {
+    passed: checks.every((c) => c.passed),
+    durationMs: Math.max(1, Date.now() - t0),
+    sha256Hex: taxHash,
+    checks,
   };
 }

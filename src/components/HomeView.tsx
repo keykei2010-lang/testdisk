@@ -1,33 +1,41 @@
 import React, { useEffect, useState } from 'react';
 import {
   Check,
+  CheckCircle2,
   CreditCard,
   Disc,
   FileQuestion,
+  FlaskConical,
   Folder,
   FolderInput,
   HardDrive,
   Monitor,
   RefreshCw,
+  Shield,
   ShieldAlert,
   Trash2,
-  Upload,
   Usb,
   Wrench,
 } from 'lucide-react';
 import { formatBytes } from '../engine/crc32';
-import { ScanMode } from '../engine/explorerTypes';
+import { EngineCapabilities, ScanMode } from '../engine/explorerTypes';
+import { RecoverySelfTestResult, runRecoverySelfTest } from '../engine/recoveryHealth';
 import {
   getDesktopBridge,
   WindowsDriveInfo,
   WindowsVolumeInfo,
 } from '../engine/desktopBridge';
+import { MediaRepairLab } from './MediaRepairLab';
 
 export type HomeNavSection = 'hardware' | 'sdcard' | 'repair' | 'partition';
 
 interface HomeViewProps {
   scanMode: ScanMode;
   onChangeScanMode: (mode: ScanMode) => void;
+  unallocatedOnly: boolean;
+  onChangeUnallocatedOnly: (val: boolean) => void;
+  capabilities: EngineCapabilities | null;
+  onRelaunchAsAdmin: () => Promise<void>;
   onScanPhysicalDrive: (drive: WindowsDriveInfo) => Promise<void>;
   onOpenDiskPicker: () => void;
   onScanFolder: () => void;
@@ -42,6 +50,10 @@ interface HomeViewProps {
 export const HomeView: React.FC<HomeViewProps> = ({
   scanMode,
   onChangeScanMode,
+  unallocatedOnly,
+  onChangeUnallocatedOnly,
+  capabilities,
+  onRelaunchAsAdmin,
   onScanPhysicalDrive,
   onOpenDiskPicker,
   onScanFolder,
@@ -62,6 +74,9 @@ export const HomeView: React.FC<HomeViewProps> = ({
     'recycle' | 'desktop' | 'folder' | 'image' | 'unknown' | null
   >(desktop ? null : 'image');
   const [scanningDrivePath, setScanningDrivePath] = useState<string | null>(null);
+  const [elevating, setElevating] = useState<boolean>(false);
+  const [selfTestBusy, setSelfTestBusy] = useState<boolean>(false);
+  const [selfTestResult, setSelfTestResult] = useState<RecoverySelfTestResult | null>(null);
 
   const loadHardware = async () => {
     if (!desktop) return;
@@ -168,6 +183,16 @@ export const HomeView: React.FC<HomeViewProps> = ({
       default:
         onOpenDiskPicker();
         break;
+    }
+  };
+
+  const handleSelfTest = async () => {
+    setSelfTestBusy(true);
+    try {
+      const res = await runRecoverySelfTest();
+      setSelfTestResult(res);
+    } finally {
+      setSelfTestBusy(false);
     }
   };
 
@@ -314,15 +339,28 @@ export const HomeView: React.FC<HomeViewProps> = ({
           </div>
         </div>
 
-        {hasExistingResults && (
+        <div className="space-y-2">
           <button
             type="button"
-            onClick={onReturnToResults}
-            className="w-full px-3 py-2 rounded-md text-xs text-slate-300 bg-[#1E222B] hover:bg-[#262B36] border border-[#2D3342] text-left transition-colors"
+            disabled={selfTestBusy}
+            onClick={() => void handleSelfTest()}
+            className="w-full inline-flex items-center gap-2 px-3 py-2 rounded-md text-xs text-slate-300 bg-[#1B2029] hover:bg-[#232935] border border-[#2D3342] text-left transition-colors disabled:opacity-50"
+            title="Verify MBR, NTFS $MFT, FAT32 LFN, CRC-32 carving & MP4 moov synthesis with a synthetic SHA-256 disk image"
           >
-            Return to Current Scan
+            <FlaskConical className="w-3.5 h-3.5 text-[#4C8DFF] shrink-0" />
+            <span>{selfTestBusy ? 'Running Self-Test...' : 'Run Engine Self-Test'}</span>
           </button>
-        )}
+
+          {hasExistingResults && (
+            <button
+              type="button"
+              onClick={onReturnToResults}
+              className="w-full px-3 py-2 rounded-md text-xs text-slate-300 bg-[#1E222B] hover:bg-[#262B36] border border-[#2D3342] text-left transition-colors"
+            >
+              Return to Current Scan
+            </button>
+          )}
+        </div>
       </aside>
 
       {/* Main Content Area matching Screenshot 4 */}
@@ -330,26 +368,104 @@ export const HomeView: React.FC<HomeViewProps> = ({
         <div className="flex-1 overflow-y-auto px-8 py-6 space-y-6">
           {(section === 'hardware' || section === 'sdcard') && (
             <>
-              <div className="flex items-center gap-2.5">
-                <h1 className="text-[17px] font-semibold text-slate-100 tracking-tight">
-                  {section === 'sdcard'
-                    ? 'Select an SD card or removable drive to scan'
-                    : 'Select a location to search for lost data'}
-                </h1>
-                {desktop && (
-                  <button
-                    type="button"
-                    onClick={() => void loadHardware()}
-                    className="p-1.5 rounded text-slate-400 hover:text-slate-100 hover:bg-[#262B36] transition-colors"
-                    title="Refresh connected drives"
-                    aria-label="Refresh connected drives"
-                  >
-                    <RefreshCw
-                      className={`w-4 h-4 ${loadingDrives ? 'animate-spin' : ''}`}
-                    />
-                  </button>
+              <div className="flex flex-wrap items-center justify-between gap-3">
+                <div className="flex items-center gap-2.5">
+                  <h1 className="text-[17px] font-semibold text-slate-100 tracking-tight">
+                    {section === 'sdcard'
+                      ? 'Select an SD card or removable drive to scan'
+                      : 'Select a location to search for lost data'}
+                  </h1>
+                  {desktop && (
+                    <button
+                      type="button"
+                      onClick={() => void loadHardware()}
+                      className="p-1.5 rounded text-slate-400 hover:text-slate-100 hover:bg-[#262B36] transition-colors"
+                      title="Refresh connected drives"
+                      aria-label="Refresh connected drives"
+                    >
+                      <RefreshCw
+                        className={`w-4 h-4 ${loadingDrives ? 'animate-spin' : ''}`}
+                      />
+                    </button>
+                  )}
+                </div>
+
+                {desktop && capabilities && (
+                  <div className="flex items-center gap-2 text-[11px]">
+                    {capabilities.isAdmin ? (
+                      <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded bg-emerald-500/10 border border-emerald-500/30 text-emerald-300">
+                        <Shield className="w-3 h-3" />
+                        Administrator Mode
+                      </span>
+                    ) : (
+                      <button
+                        type="button"
+                        disabled={elevating}
+                        onClick={async () => {
+                          setElevating(true);
+                          try {
+                            await onRelaunchAsAdmin();
+                          } finally {
+                            setElevating(false);
+                          }
+                        }}
+                        className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded bg-amber-500/15 hover:bg-amber-500/25 border border-amber-500/35 text-amber-200 font-medium transition-colors disabled:opacity-50"
+                      >
+                        <ShieldAlert className="w-3 h-3" />
+                        {elevating ? 'Requesting UAC...' : 'Relaunch as Administrator'}
+                      </button>
+                    )}
+                    <span className="hidden xl:inline text-slate-400 font-mono">
+                      {[
+                        capabilities.sleuthkit && 'Sleuth Kit',
+                        capabilities.fidentify && 'fidentify',
+                        capabilities.ffmpeg && 'FFmpeg',
+                      ]
+                        .filter(Boolean)
+                        .join(' · ') || 'Pure-JS Forensic Engine'}
+                    </span>
+                  </div>
                 )}
               </div>
+
+              {selfTestResult && (
+                <div
+                  className={`p-3.5 rounded-md border text-xs space-y-2 ${
+                    selfTestResult.passed
+                      ? 'bg-emerald-500/10 border-emerald-500/30 text-emerald-200'
+                      : 'bg-rose-500/10 border-rose-500/30 text-rose-200'
+                  }`}
+                >
+                  <div className="flex items-center justify-between gap-2">
+                    <div className="flex items-center gap-2 font-medium">
+                      <CheckCircle2 className="w-4 h-4 shrink-0" />
+                      <span>
+                        Engine Self-Test:{' '}
+                        {selfTestResult.checks.filter((c) => c.passed).length}/
+                        {selfTestResult.checks.length} checks passed in {selfTestResult.durationMs}ms
+                        {selfTestResult.sha256Hex
+                          ? ` · SHA-256 ${selfTestResult.sha256Hex.slice(0, 12)}...`
+                          : ''}
+                      </span>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => setSelfTestResult(null)}
+                      className="text-[11px] opacity-80 hover:opacity-100 underline"
+                    >
+                      Dismiss
+                    </button>
+                  </div>
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-1.5 text-[11px]">
+                    {selfTestResult.checks.map((chk) => (
+                      <div key={chk.name} className="truncate">
+                        <span className="font-semibold">{chk.passed ? '[PASS]' : '[FAIL]'}</span>{' '}
+                        {chk.name} — <span className="opacity-85">{chk.detail}</span>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
 
               {desktop ? (
                 <div className="space-y-5">
@@ -478,33 +594,7 @@ export const HomeView: React.FC<HomeViewProps> = ({
           )}
 
           {section === 'repair' && (
-            <div className="max-w-2xl space-y-5">
-              <div className="space-y-1.5">
-                <h1 className="text-[17px] font-semibold text-slate-100 tracking-tight">
-                  File Repair &amp; Format Identification
-                </h1>
-                <p className="text-xs text-slate-400 leading-relaxed">
-                  Identify extensionless files via magic-byte headers (fidentify) and repair
-                  truncated JPEG EOI markers, PNG IEND footers, ZIP directories, or corrupted
-                  MP4/MOV video <code className="text-slate-300">mdat</code> atoms.
-                </p>
-              </div>
-              <button
-                type="button"
-                onClick={onOpenUnknownFiles}
-                className="w-full p-8 rounded-lg border-2 border-dashed border-[#343B4D] bg-[#181B22] hover:border-[#3A7AFE] hover:bg-[#1E2330] transition-colors flex flex-col items-center gap-3 text-center"
-              >
-                <div className="w-12 h-12 rounded-full bg-[#3A7AFE]/15 flex items-center justify-center">
-                  <Upload className="w-5 h-5 text-[#4C8DFF]" />
-                </div>
-                <div className="text-sm font-medium text-slate-100">
-                  Select Damaged or Unknown Files
-                </div>
-                <div className="text-xs text-slate-400">
-                  Supports .jpg, .png, .mp4, .mov, .m4v, .zip, or raw extensionless captures
-                </div>
-              </button>
-            </div>
+            <MediaRepairLab onOpenUnknownFiles={onOpenUnknownFiles} />
           )}
 
           {section === 'partition' && (
@@ -550,7 +640,38 @@ export const HomeView: React.FC<HomeViewProps> = ({
             Load Saved Session (.tdscan.json)
           </button>
 
-          <div className="flex items-center gap-3">
+          <div className="flex flex-wrap items-center gap-2.5">
+            <div
+              className="hidden sm:inline-flex items-center bg-[#14171D] rounded-md border border-[#2D3342] p-0.5 text-[11px]"
+              role="group"
+              aria-label="Deep scan cluster coverage"
+            >
+              <button
+                type="button"
+                onClick={() => onChangeUnallocatedOnly(false)}
+                className={`px-2.5 py-1.5 rounded transition-colors ${
+                  !unallocatedOnly
+                    ? 'bg-[#2A3244] text-white font-medium'
+                    : 'text-slate-400 hover:text-slate-200'
+                }`}
+                title="Scan every sector including active and deleted clusters"
+              >
+                Whole Volume
+              </button>
+              <button
+                type="button"
+                onClick={() => onChangeUnallocatedOnly(true)}
+                className={`px-2.5 py-1.5 rounded transition-colors ${
+                  unallocatedOnly
+                    ? 'bg-[#2A3244] text-white font-medium'
+                    : 'text-slate-400 hover:text-slate-200'
+                }`}
+                title="Skip allocated NTFS $Bitmap clusters during deep sector carving (faster)"
+              >
+                Unallocated Only
+              </button>
+            </div>
+
             <div
               className="inline-flex items-center bg-[#14171D] rounded-md border border-[#2D3342] p-0.5 text-[11px]"
               role="group"
@@ -589,9 +710,13 @@ export const HomeView: React.FC<HomeViewProps> = ({
                 scanningDrivePath !== null ||
                 (section !== 'repair' && !selectedDrive && !selectedQuickTarget)
               }
-              className="px-7 py-2 rounded-md text-xs font-medium bg-[#3A7AFE] hover:bg-[#2F6EEB] active:scale-[0.98] disabled:opacity-40 text-white transition-all"
+              className="px-7 py-2 rounded-md text-xs font-medium bg-[#3A7AFE] hover:bg-[#2F6EEB] active:scale-[0.98] disabled:opacity-40 text-white transition-all whitespace-nowrap shrink-0"
             >
-              {scanningDrivePath ? 'Starting Scan...' : 'Search for Lost Data'}
+              {scanningDrivePath
+                ? 'Starting Scan...'
+                : section === 'repair'
+                  ? 'Inspect Unknown File'
+                  : 'Search for Lost Data'}
             </button>
           </div>
         </footer>

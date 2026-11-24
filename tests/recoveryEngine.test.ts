@@ -1,19 +1,36 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { createRequire } from 'node:module';
 import { buildSampleDiskImage } from '../src/engine/sampleDisk';
 import { analyzeDiskImage, writeMbrPartitionTable } from '../src/engine/partitions';
 import { scanNtfsMftRecordsInBuffer } from '../src/engine/ntfsMft';
 import { scanFatAndExfatDeletedInBuffer } from '../src/engine/fatExfat';
-import { identifyBuffer } from '../src/engine/signatures';
+import { carveDiskBuffer, FILE_FORMATS, identifyBuffer } from '../src/engine/signatures';
+import { computeCrc32 } from '../src/engine/crc32';
 import {
-  repairFileBuffer,
+  buildCsvReport,
   computeRecoveryLikelihood,
+  diagnoseMediaFile,
+  extractEmbeddedJpegPreview,
   formatCompactCount,
+  repairAviBuffer,
+  repairFileBuffer,
+  repairJpegBuffer,
+  repairPngBuffer,
+  resolvePreferredExtension,
+  runRecoverySelfTest,
 } from '../src/engine/recoveryHealth';
 import { buildFolderTreeForPartition } from '../src/engine/folderTree';
 import { ExplorerFileItem, itemMatchesNode } from '../src/engine/explorerTypes';
 import { parseUsnJournalBuffer, USN_REASON_FILE_DELETE } from '../src/engine/ntfsJournal';
-import { rebuildMp4WithMoov } from '../src/engine/mp4Repair';
+import {
+  inspectMp4Health,
+  parseH264SpsDimensions,
+  rebuildMp4WithMoov,
+} from '../src/engine/mp4Repair';
 
 test('sample disk analyzes MBR + lost NTFS partition + FAT32 LFN + nested NTFS path', () => {
   const sample = buildSampleDiskImage();
@@ -252,3 +269,453 @@ test('buildFolderTreeForPartition & itemMatchesNode build nested hierarchy', () 
     true,
   );
 });
+
+test('resolvePreferredExtension auto-corrects generic/mismatched extensions while keeping OOXML/OLE2', () => {
+  assert.equal(resolvePreferredExtension('unknown_01.bin', 'jpg'), 'unknown_01.jpg');
+  assert.equal(resolvePreferredExtension('noext', 'pdf'), 'noext.pdf');
+  assert.equal(resolvePreferredExtension('wrong.txt', 'png'), 'wrong.png');
+  assert.equal(resolvePreferredExtension('photo.jpeg', 'jpg'), 'photo.jpeg');
+  assert.equal(resolvePreferredExtension('report.docx', 'zip'), 'report.docx');
+  assert.equal(resolvePreferredExtension('ledger.xlsx', 'zip'), 'ledger.xlsx');
+  assert.equal(resolvePreferredExtension('memo.xls', 'doc'), 'memo.xls');
+});
+
+test('buildCsvReport escapes cells and includes discovery CRC-32', () => {
+  const sampleItem: ExplorerFileItem = {
+    id: 'csv-1',
+    filename: 'Quarter, "Q4" Report.pdf',
+    extension: 'pdf',
+    family: 'Documents',
+    mimeType: 'application/pdf',
+    size: 4096,
+    calculatedSize: 4096,
+    status: 'OK',
+    sourceKind: 'carved',
+    isDeleted: true,
+    partitionId: 'part-0',
+    partitionName: 'NTFS (Data)',
+    originalPath: '\\Docs\\Quarter.pdf',
+    offset: 0x2000,
+    sector: 16,
+    matchedOffset: 0,
+    matchedLength: 4,
+    metadata: {},
+    description: 'PDF Document',
+    data: new Uint8Array(0),
+    modifiedAt: 0,
+    recoveryChance: 96,
+    recoveryTier: 'high',
+    recoveryReason: 'Valid header & footer',
+    discoveryCrc32: 0x0a1b2c3d,
+  };
+  const csv = buildCsvReport([sampleItem], 'Disk0');
+  const lines = csv.split('\r\n');
+  assert.equal(lines.length, 2);
+  assert.ok(lines[0].includes('CRC32 Fingerprint'));
+  assert.ok(lines[1].includes('"Quarter, ""Q4"" Report.pdf"'));
+  assert.ok(lines[1].includes('0x2000'));
+  assert.ok(lines[1].includes('0a1b2c3d'));
+});
+
+test('carveDiskBuffer computes discoveryCrc32 and skips allocated offsets when unallocatedOnly is true', () => {
+  const buf = new Uint8Array(4096);
+  // JPEG at offset 512 (allocated) with valid FFE0 length + FFDA + FFD9
+  buf.set([0xff, 0xd8, 0xff, 0xe0, 0x00, 0x06, 0x4a, 0x46, 0x49, 0x46, 0xff, 0xda, 0x00, 0x02, 0xff, 0xd9], 512);
+  // PNG at offset 2048 (unallocated)
+  buf.set([
+    0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a,
+    0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52,
+    0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01,
+    0x08, 0x02, 0x00, 0x00, 0x00, 0x90, 0x77, 0x53, 0xde,
+    0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
+  ], 2048);
+
+  const enabled = new Set(FILE_FORMATS.map((f) => f.id));
+  const whole = carveDiskBuffer(buf, {
+    startByte: 0,
+    endByte: buf.length,
+    blockSize: 512,
+    paranoid: true,
+    keepCorrupted: true,
+    enabledFormats: enabled,
+  });
+  assert.equal(whole.length, 2);
+  for (const c of whole) {
+    assert.equal(c.discoveryCrc32, computeCrc32(c.data, 0, Math.min(65536, c.data.length)));
+  }
+
+  const unalloc = carveDiskBuffer(buf, {
+    startByte: 0,
+    endByte: buf.length,
+    blockSize: 512,
+    paranoid: true,
+    keepCorrupted: true,
+    unallocatedOnly: true,
+    allocatedChecker: (offset) => offset === 512,
+    enabledFormats: enabled,
+  });
+  assert.equal(unalloc.length, 1);
+  assert.equal(unalloc[0].extension, 'png');
+  assert.equal(unalloc[0].offset, 2048);
+});
+
+test('runRecoverySelfTest verifies MBR, MFT, FAT32 LFN, raw carving CRC-32, and MP4 moov synthesis', async () => {
+  const res = await runRecoverySelfTest();
+  assert.equal(res.passed, true);
+  assert.equal(res.checks.length, 5);
+  assert.ok(res.sha256Hex.length >= 16);
+});
+
+test('rebuildMp4WithMoov synthesizes H.265/HEVC hvc1/hvcC moov index and inspectMp4Health diagnoses missing moov', () => {
+  const ftyp = new Uint8Array([
+    0x00, 0x00, 0x00, 0x10, 0x66, 0x74, 0x79, 0x70,
+    0x69, 0x73, 0x6f, 0x6d, 0x00, 0x00, 0x02, 0x00,
+  ]);
+  // Length-prefixed HEVC NALs: VPS (type 32 -> 0x40 0x01), SPS (type 33 -> 0x42 0x01), PPS (type 34 -> 0x44 0x01), IDR_W_RADL (type 19 -> 0x26 0x01)
+  const hvccPayload = new Uint8Array([
+    0x00, 0x00, 0x00, 0x04, 0x40, 0x01, 0x0c, 0x01, // VPS
+    0x00, 0x00, 0x00, 0x04, 0x42, 0x01, 0x01, 0x60, // SPS
+    0x00, 0x00, 0x00, 0x04, 0x44, 0x01, 0xc1, 0x73, // PPS
+    0x00, 0x00, 0x00, 0x05, 0x26, 0x01, 0xaf, 0x12, 0x34, // IDR frame
+  ]);
+  const mdat = new Uint8Array(8 + hvccPayload.length);
+  new DataView(mdat.buffer).setUint32(0, mdat.length, false);
+  mdat.set([0x6d, 0x64, 0x61, 0x74], 4);
+  mdat.set(hvccPayload, 8);
+
+  const brokenHevc = new Uint8Array(ftyp.length + mdat.length);
+  brokenHevc.set(ftyp, 0);
+  brokenHevc.set(mdat, ftyp.length);
+
+  const health = inspectMp4Health(brokenHevc);
+  assert.equal(health.missingMoov, true);
+  assert.equal(health.codec, 'hevc');
+
+  const rep = rebuildMp4WithMoov(brokenHevc);
+  assert.equal(rep.repaired, true);
+  assert.ok(rep.note.includes('H.265/HEVC'));
+  const ascii = Buffer.from(rep.data).toString('latin1');
+  assert.ok(ascii.includes('moov'));
+  assert.ok(ascii.includes('hvc1'));
+  assert.ok(ascii.includes('hvcC'));
+});
+
+test('rebuildMp4WithMoov resynchronizes past corrupt bytes & inline ADTS AAC audio inside mdat', () => {
+  const ftyp = new Uint8Array([
+    0x00, 0x00, 0x00, 0x10, 0x66, 0x74, 0x79, 0x70,
+    0x69, 0x73, 0x6f, 0x6d, 0x00, 0x00, 0x02, 0x00,
+  ]);
+  // H.264 SPS + PPS + IDR, followed by a 10-byte ADTS AAC frame (0xFF 0xF1 ... len=10), corrupt 3 bytes, then IDR frame
+  const payload = new Uint8Array([
+    0x00, 0x00, 0x00, 0x04, 0x67, 0x42, 0xc0, 0x1e, // SPS
+    0x00, 0x00, 0x00, 0x04, 0x68, 0xce, 0x38, 0x80, // PPS
+    0x00, 0x00, 0x00, 0x05, 0x65, 0x88, 0x84, 0x21, 0xa0, // IDR #1
+    0xff, 0xf1, 0x50, 0x80, 0x01, 0x5f, 0xfc, 0x21, 0x00, 0x1a, // ADTS AAC frame (10 B)
+    0xde, 0xad, 0xbe, // corrupt sector gap
+    0x00, 0x00, 0x00, 0x05, 0x65, 0x88, 0x84, 0x22, 0xb0, // IDR #2 after resync
+  ]);
+  const mdat = new Uint8Array(8 + payload.length);
+  new DataView(mdat.buffer).setUint32(0, mdat.length, false);
+  mdat.set([0x6d, 0x64, 0x61, 0x74], 4);
+  mdat.set(payload, 8);
+
+  const broken = new Uint8Array(ftyp.length + mdat.length);
+  broken.set(ftyp, 0);
+  broken.set(mdat, ftyp.length);
+
+  const rep = rebuildMp4WithMoov(broken);
+  assert.equal(rep.repaired, true);
+  assert.ok(rep.note.includes('2 H.264/AVC frames'));
+  assert.ok(rep.note.includes('1 AAC audio frames'));
+  const ascii = Buffer.from(rep.data).toString('latin1');
+  assert.ok(ascii.includes('soun'));
+  assert.ok(ascii.includes('mp4a'));
+  assert.ok(ascii.includes('vide'));
+});
+
+test('repairFileBuffer performs Reference JPEG Header Transplant, Baseline DHT injection, and diagnoseMediaFile', () => {
+  // Healthy reference JPEG: SOI + DQT + SOF0 + DHT + SOS(len=12) + dummy ref scan + EOI
+  const refJpg = new Uint8Array([
+    0xff, 0xd8,
+    0xff, 0xdb, 0x00, 0x04, 0x00, 0x01, // DQT
+    0xff, 0xc0, 0x00, 0x06, 0x08, 0x00, 0x10, 0x00, // SOF0
+    0xff, 0xc4, 0x00, 0x04, 0x00, 0x00, // DHT
+    0xff, 0xda, 0x00, 0x04, 0x01, 0x00, // SOS
+    0xaa, 0xbb, 0xff, 0xd9,
+  ]);
+  // Headerless damaged JPEG (missing SOI/DQT/SOF and missing EOI)
+  const headerlessScan = new Uint8Array(24);
+  headerlessScan.set([0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88], 0);
+
+  const diag = diagnoseMediaFile('jpg', headerlessScan);
+  assert.equal(diag.needsReferenceHint, true);
+
+  const repWithRef = repairFileBuffer('jpg', headerlessScan, refJpg);
+  assert.equal(repWithRef.repaired, true);
+  assert.ok(repWithRef.note.includes('Transplanted healthy reference JPEG header'));
+  assert.equal(repWithRef.data[0], 0xff);
+  assert.equal(repWithRef.data[1], 0xd8);
+  assert.equal(repWithRef.data[repWithRef.data.length - 2], 0xff);
+  assert.equal(repWithRef.data[repWithRef.data.length - 1], 0xd9);
+
+  // Baseline JPEG with SOI + DQT + SOF0 + SOS, missing DHT and EOI
+  const dhtMissing = new Uint8Array([
+    0xff, 0xd8,
+    0xff, 0xdb, 0x00, 0x04, 0x00, 0x01, // DQT
+    0xff, 0xc0, 0x00, 0x06, 0x08, 0x00, 0x10, 0x00, // SOF0
+    0xff, 0xda, 0x00, 0x04, 0x01, 0x00, // SOS
+    0x12, 0x34,
+  ]);
+  const repDht = repairFileBuffer('jpg', dhtMissing);
+  assert.equal(repDht.repaired, true);
+  assert.ok(repDht.note.includes('DHT'));
+  assert.equal(repDht.data[repDht.data.length - 2], 0xff);
+  assert.equal(repDht.data[repDht.data.length - 1], 0xd9);
+});
+
+test('parseH264SpsDimensions & rebuildMp4WithMoov rescue headerless raw Annex-B stream', () => {
+  // Real Baseline H.264 SPS for 1280x720 (profile=66, level=31, seq_param_set_id=0, log2_max_frame_num=4, pic_order_cnt=0, max_num_ref=1, gaps=0, pic_width_in_mbs_minus1=79 (80*16=1280), pic_height_in_map_units_minus1=44 (45*16=720), frame_mbs_only=1)
+  // Exp-Golomb bits: 0(id) 1 -> 01001(4? wait: 4->ue=4 is 00101), let's construct exact bit-packed SPS NALU:
+  const bits: number[] = [];
+  const pushBits = (val: number, len: number) => {
+    for (let i = len - 1; i >= 0; i--) bits.push((val >>> i) & 1);
+  };
+  const pushUe = (v: number) => {
+    const codeNum = v + 1;
+    const len = Math.floor(Math.log2(codeNum)) + 1;
+    for (let i = 0; i < len - 1; i++) bits.push(0);
+    pushBits(codeNum, len);
+  };
+  pushBits(0x67, 8); // NALU header (SPS)
+  pushBits(66, 8); // profile_idc (Baseline)
+  pushBits(0xc0, 8); // constraint flags
+  pushBits(31, 8); // level_idc
+  pushUe(0); // seq_parameter_set_id
+  pushUe(0); // log2_max_frame_num_minus4
+  pushUe(0); // pic_order_cnt_type
+  pushUe(0); // log2_max_pic_order_cnt_lsb_minus4
+  pushUe(1); // max_num_ref_frames
+  pushBits(0, 1); // gaps_in_frame_num_value_allowed_flag
+  pushUe(79); // pic_width_in_mbs_minus1 -> 80 * 16 = 1280
+  pushUe(44); // pic_height_in_map_units_minus1 -> 45 * 16 = 720
+  pushBits(1, 1); // frame_mbs_only_flag
+  pushBits(0, 1); // direct_8x8_inference_flag
+  pushBits(0, 1); // frame_cropping_flag
+  pushBits(0, 1); // vui_parameters_present_flag
+  pushBits(1, 1); // RBSP stop bit
+  while (bits.length % 8 !== 0) bits.push(0);
+  const sps = new Uint8Array(bits.length / 8);
+  for (let i = 0; i < sps.length; i++) {
+    let b = 0;
+    for (let k = 0; k < 8; k++) b = (b << 1) | bits[i * 8 + k];
+    sps[i] = b;
+  }
+
+  const dims = parseH264SpsDimensions(sps);
+  assert.ok(dims);
+  assert.equal(dims.width, 1280);
+  assert.equal(dims.height, 720);
+
+  // Headerless raw Annex-B stream (no ftyp or mdat box header at offset 0!)
+  const pps = new Uint8Array([0x68, 0xce, 0x38, 0x80]);
+  const idr = new Uint8Array([0x65, 0x88, 0x84, 0x21, 0xa0, 0x11, 0x22]);
+  const rawStream = new Uint8Array(12 + 4 + sps.length + 4 + pps.length + 4 + idr.length);
+  // Leading 12 garbage bytes before Annex-B start code
+  let p = 12;
+  rawStream.set([0x00, 0x00, 0x00, 0x01], p);
+  p += 4;
+  rawStream.set(sps, p);
+  p += sps.length;
+  rawStream.set([0x00, 0x00, 0x00, 0x01], p);
+  p += 4;
+  rawStream.set(pps, p);
+  p += pps.length;
+  rawStream.set([0x00, 0x00, 0x00, 0x01], p);
+  p += 4;
+  rawStream.set(idr, p);
+
+  const health = inspectMp4Health(rawStream);
+  assert.equal(health.headerlessStream, true);
+
+  const rep = rebuildMp4WithMoov(rawStream);
+  assert.equal(rep.repaired, true);
+  assert.ok(rep.note.includes('1280×720'));
+  assert.ok(rep.note.includes('headerless stream'));
+  const ascii = Buffer.from(rep.data).toString('latin1');
+  assert.ok(ascii.includes('ftyp'));
+  assert.ok(ascii.includes('mdat'));
+  assert.ok(ascii.includes('moov'));
+  assert.ok(ascii.includes('avcC'));
+});
+
+test('repairJpegBuffer fixes corrupt 0xFF bytes & RSTn markers and extracts embedded EXIF/RAW JPEG preview', () => {
+  // JPEG with embedded EXIF preview JPEG (>=256 B) inside APP1 + corrupt 0xFF 0x33 unstuffed byte and out-of-order RST2/RST5 in entropy scan
+  const thumbBody = new Array(256).fill(0x2a);
+  const thumb = new Uint8Array([0xff, 0xd8, 0xff, 0xdb, 0x00, 0x04, 0x00, 0x01, ...thumbBody, 0xff, 0xd9]);
+  const app1Len = 2 + 6 + thumb.length;
+  const damagedJpg = new Uint8Array([
+    0xff, 0xd8,
+    0xff, 0xe1, (app1Len >>> 8) & 0xff, app1Len & 0xff, 0x45, 0x78, 0x69, 0x66, 0x00, 0x00,
+    ...thumb,
+    0xff, 0xdb, 0x00, 0x04, 0x00, 0x01,
+    0xff, 0xc0, 0x00, 0x06, 0x08, 0x00, 0x10, 0x00,
+    0xff, 0xc4, 0x00, 0x04, 0x00, 0x00,
+    0xff, 0xda, 0x00, 0x04, 0x01, 0x00,
+    0xaa, 0xff, 0x33, // invalid unstuffed 0xFF 0x33 -> must become 0xFF 0x00 0x33
+    0xff, 0xd2, // out-of-order RST2 -> must become RST0 (0xD0)
+    0xff, 0xd5, // out-of-order RST5 -> must become RST1 (0xD1)
+    0xbb, 0x00, 0x00, 0x00, 0x00, // trailing zero slack + missing EOI
+  ]);
+
+  const diag = diagnoseMediaFile('jpg', damagedJpg);
+  assert.equal(diag.canRepair, true);
+  assert.ok(diag.issue.includes('0xFF'));
+
+  const rep = repairJpegBuffer(damagedJpg);
+  assert.equal(rep.repaired, true);
+  assert.ok(rep.note.includes('byte-stuffed 1 corrupt entropy 0xFF'));
+  assert.ok(rep.note.includes('re-sequenced 2 RSTn'));
+  assert.ok(rep.salvagedPreviewBytes);
+  assert.equal(rep.salvagedPreviewBytes[0], 0xff);
+  assert.equal(rep.salvagedPreviewBytes[1], 0xd8);
+  assert.equal(rep.data[rep.data.length - 2], 0xff);
+  assert.equal(rep.data[rep.data.length - 1], 0xd9);
+
+  // Also test Camera RAW (NEF/CR2-style wrapper) embedded JPEG preview extraction
+  const rawWrapper = new Uint8Array(40 + thumb.length + 32);
+  rawWrapper.set([0x49, 0x49, 0x2a, 0x00], 0);
+  rawWrapper.set(thumb, 40);
+  const extracted = extractEmbeddedJpegPreview(rawWrapper);
+  assert.ok(extracted);
+  assert.deepEqual(extracted, thumb);
+});
+
+test('repairPngBuffer fixes bad CRC-32, clamps truncated IDAT, and appends IEND', () => {
+  const sig = [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
+  const ihdrData = new Uint8Array([
+    0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01,
+    0x08, 0x02, 0x00, 0x00, 0x00,
+  ]);
+  const badCrc = [0xde, 0xad, 0xbe, 0xef];
+  // Truncated IDAT claims length 9999, actually only 6 bytes remain
+  const idatPayload = [0x78, 0x9c, 0x63, 0x60, 0x00, 0x00];
+  const brokenPng = new Uint8Array([
+    ...sig,
+    0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52, ...ihdrData, ...badCrc,
+    0x00, 0x00, 0x27, 0x0f, 0x49, 0x44, 0x41, 0x54, ...idatPayload,
+  ]);
+
+  const rep = repairPngBuffer(brokenPng);
+  assert.equal(rep.repaired, true);
+  assert.ok(rep.note.includes('CRC-32'));
+  assert.ok(rep.note.includes('clamped truncated IDAT'));
+  assert.ok(rep.note.includes('IEND'));
+  // Verify fixed IHDR CRC at offset 29
+  const dv = new DataView(rep.data.buffer, rep.data.byteOffset, rep.data.byteLength);
+  assert.equal(dv.getUint32(29, false), computeCrc32(rep.data, 12, 17));
+  // Verify clamped IDAT length at offset 33 === 6
+  assert.equal(dv.getUint32(33, false), 6);
+  // Verify ends with IEND
+  assert.deepEqual(
+    Array.from(rep.data.subarray(rep.data.length - 12)),
+    [0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82],
+  );
+});
+
+test('repairAviBuffer rebuilds LIST movi size, avih.dwTotalFrames, and idx1 seek table', () => {
+  // Construct minimal RIFF AVI with avih (hdrl) + LIST movi containing 2 video frames (00dc) without idx1
+  const frame0 = new Uint8Array([0x11, 0x22, 0x33, 0x44]);
+  const frame1 = new Uint8Array([0x55, 0x66, 0x77, 0x88, 0x99]); // odd length (needs pad in RIFF)
+
+  const avih = new Uint8Array(64);
+  const adv = new DataView(avih.buffer);
+  avih.set(Buffer.from('avih'), 0);
+  adv.setUint32(4, 56, true);
+  adv.setUint32(24, 0, true); // wrong dwTotalFrames = 0
+
+  const hdrl = new Uint8Array(12 + avih.length);
+  const hdv = new DataView(hdrl.buffer);
+  hdrl.set(Buffer.from('LIST'), 0);
+  hdv.setUint32(4, 4 + avih.length, true);
+  hdrl.set(Buffer.from('hdrl'), 8);
+  hdrl.set(avih, 12);
+
+  const c0 = new Uint8Array(8 + frame0.length);
+  c0.set(Buffer.from('00dc'), 0);
+  new DataView(c0.buffer).setUint32(4, frame0.length, true);
+  c0.set(frame0, 8);
+
+  const c1 = new Uint8Array(8 + frame1.length + 1); // padded
+  c1.set(Buffer.from('00dc'), 0);
+  new DataView(c1.buffer).setUint32(4, frame1.length, true);
+  c1.set(frame1, 8);
+
+  const movi = new Uint8Array(12 + c0.length + c1.length);
+  movi.set(Buffer.from('LIST'), 0);
+  new DataView(movi.buffer).setUint32(4, 999999, true); // intentionally corrupt movi size
+  movi.set(Buffer.from('movi'), 8);
+  movi.set(c0, 12);
+  movi.set(c1, 12 + c0.length);
+
+  const avi = new Uint8Array(12 + hdrl.length + movi.length);
+  avi.set(Buffer.from('RIFF'), 0);
+  new DataView(avi.buffer).setUint32(4, 4, true); // wrong RIFF size
+  avi.set(Buffer.from('AVI '), 8);
+  avi.set(hdrl, 12);
+  avi.set(movi, 12 + hdrl.length);
+
+  const rep = repairAviBuffer(avi);
+  assert.equal(rep.repaired, true);
+  assert.ok(rep.note.includes('idx1'));
+  assert.ok(rep.note.includes('2 video frames'));
+  const dv = new DataView(rep.data.buffer, rep.data.byteOffset, rep.data.byteLength);
+  // avih dwTotalFrames is at hdrl offset (12) + 12 + 24 = 48
+  assert.equal(dv.getUint32(48, true), 2);
+  assert.ok(Buffer.from(rep.data).toString('latin1').includes('idx1'));
+});
+
+test('Electron CJS repairMp4StreamingFileCjs streams H.264/ADTS mdat into playable ftyp+mdat+moov', () => {
+  const req = createRequire(import.meta.url);
+  const { repairMp4StreamingFileCjs } = req('../electron/mediaRepairCjs.cjs');
+
+  const tmpDir = os.tmpdir();
+  const srcPath = path.join(tmpDir, `test_stream_${Date.now()}.mp4`);
+  const dstPath = path.join(tmpDir, `test_stream_out_${Date.now()}.mp4`);
+  try {
+    const ftyp = Buffer.from([
+      0x00, 0x00, 0x00, 0x10, 0x66, 0x74, 0x79, 0x70,
+      0x69, 0x73, 0x6f, 0x6d, 0x00, 0x00, 0x02, 0x00,
+    ]);
+    const payload = Buffer.from([
+      0x00, 0x00, 0x00, 0x04, 0x67, 0x42, 0xc0, 0x1e, // SPS
+      0x00, 0x00, 0x00, 0x04, 0x68, 0xce, 0x38, 0x80, // PPS
+      0x00, 0x00, 0x00, 0x05, 0x65, 0x88, 0x84, 0x21, 0xa0, // IDR #1
+      0xff, 0xf1, 0x50, 0x80, 0x01, 0x5f, 0xfc, 0x21, 0x00, 0x1a, // ADTS AAC frame
+      0x00, 0x00, 0x00, 0x05, 0x41, 0x9a, 0x22, 0x11, 0x00, // P-frame
+    ]);
+    const mdatHdr = Buffer.alloc(8);
+    mdatHdr.writeUInt32BE(8 + payload.length, 0);
+    mdatHdr.write('mdat', 4, 'ascii');
+    fs.writeFileSync(srcPath, Buffer.concat([ftyp, mdatHdr, payload]));
+
+    const res = repairMp4StreamingFileCjs(srcPath, dstPath, null);
+    assert.equal(res.ok, true);
+    assert.ok(res.videoSamples === 2);
+    assert.ok(res.audioSamples === 1);
+    const out = fs.readFileSync(dstPath);
+    const ascii = out.toString('latin1');
+    assert.ok(ascii.includes('ftyp'));
+    assert.ok(ascii.includes('mdat'));
+    assert.ok(ascii.includes('moov'));
+    assert.ok(ascii.includes('stsz'));
+    assert.ok(ascii.includes('stco'));
+    assert.ok(ascii.includes('soun'));
+    assert.ok(ascii.includes('mp4a'));
+  } finally {
+    if (fs.existsSync(srcPath)) fs.unlinkSync(srcPath);
+    if (fs.existsSync(dstPath)) fs.unlinkSync(dstPath);
+  }
+});
+
+
+

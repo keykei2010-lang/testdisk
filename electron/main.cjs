@@ -4,9 +4,109 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const { Worker } = require('node:worker_threads');
+const {
+  getEngineCapabilitiesSync,
+  checkWindowsIsAdmin,
+  getCurrentUserWindowsSid,
+  runMmlsPartitions,
+  runTskFlsScan,
+  extractTskInodeToFile,
+  readTskInodeHead,
+  runFidentifyPaths,
+  probeVideoFrameWithFfmpeg,
+  ffmpegRepairVideoFile,
+} = require('./enginesHelper.cjs');
+const {
+  repairMp4StreamingFileCjs,
+  repairJpegBufferCjs,
+  repairPngBufferCjs,
+  repairAviBufferCjs,
+  extractEmbeddedJpegCjs,
+} = require('./mediaRepairCjs.cjs');
 
 const activeScans = new Map();
 const WINDOWS_EPOCH_DIFF_MS = 11644473600000;
+
+const CRC32_TABLE_CJS = new Uint32Array(256);
+for (let n = 0; n < 256; n++) {
+  let c = n;
+  for (let k = 0; k < 8; k++) {
+    c = (c & 1) !== 0 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
+  }
+  CRC32_TABLE_CJS[n] = c >>> 0;
+}
+
+function computeCrc32Cjs(buf, len = 65536) {
+  if (!buf || buf.length === 0) return 0;
+  let crc = 0xffffffff;
+  const end = Math.min(buf.length, len);
+  for (let i = 0; i < end; i++) {
+    crc = CRC32_TABLE_CJS[(crc ^ buf[i]) & 0xff] ^ (crc >>> 8);
+  }
+  return (crc ^ 0xffffffff) >>> 0;
+}
+
+const ZIP_CONTAINER_EXTS_CJS = new Set([
+  'docx',
+  'xlsx',
+  'pptx',
+  'odt',
+  'ods',
+  'odp',
+  'epub',
+  'apk',
+  'jar',
+  'zip',
+]);
+const OLE2_CONTAINER_EXTS_CJS = new Set(['doc', 'xls', 'ppt', 'msi', 'msg']);
+
+function detectMagicExtFromHeadCjs(buf) {
+  if (!buf || buf.length < 4) return null;
+  if (buf[0] === 0xff && buf[1] === 0xd8 && buf[2] === 0xff) return 'jpg';
+  if (buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4e && buf[3] === 0x47) return 'png';
+  if (buf.length >= 6 && buf.toString('ascii', 0, 6).startsWith('GIF8')) return 'gif';
+  if (buf[0] === 0x42 && buf[1] === 0x4d) return 'bmp';
+  if (buf.length >= 5 && buf.toString('ascii', 0, 5) === '%PDF-') return 'pdf';
+  if (buf[0] === 0x50 && buf[1] === 0x4b && buf[2] === 0x03 && buf[3] === 0x04) return 'zip';
+  if (buf[0] === 0xd0 && buf[1] === 0xcf && buf[2] === 0x11 && buf[3] === 0xe0) return 'doc';
+  if (buf.length >= 12 && buf.toString('ascii', 4, 8) === 'ftyp') {
+    const brand = buf.toString('ascii', 8, 12);
+    if (brand === 'crx ') return 'cr3';
+    if (brand.toLowerCase().startsWith('qt')) return 'mov';
+    if (brand === 'heic' || brand === 'mif1') return 'heic';
+    return 'mp4';
+  }
+  if (buf[0] === 0x1a && buf[1] === 0x45 && buf[2] === 0xdf && buf[3] === 0xa3) return 'mkv';
+  if (buf.length >= 12 && buf.toString('ascii', 0, 4) === 'RIFF') {
+    const fc = buf.toString('ascii', 8, 12);
+    if (fc === 'WAVE') return 'wav';
+    if (fc === 'AVI ') return 'avi';
+    if (fc === 'WEBP') return 'webp';
+  }
+  if (buf[0] === 0x49 && buf[1] === 0x44 && buf[2] === 0x33) return 'mp3';
+  if (buf.toString('ascii', 0, 4) === 'fLaC') return 'flac';
+  if (buf.toString('ascii', 0, 4) === 'OggS') return 'ogg';
+  if (buf[0] === 0x52 && buf[1] === 0x61 && buf[2] === 0x72 && buf[3] === 0x21) return 'rar';
+  if (buf.length >= 6 && buf[0] === 0x37 && buf[1] === 0x7a && buf[2] === 0xbc && buf[3] === 0xaf) return '7z';
+  return null;
+}
+
+function resolvePreferredFilenameCjs(filename, detectedExt) {
+  const cleanDetected = String(detectedExt || '').trim().toLowerCase().replace(/^\./, '');
+  if (!cleanDetected || cleanDetected === 'unknown' || cleanDetected === 'bin') return filename;
+  const lastDot = filename.lastIndexOf('.');
+  const curExt = lastDot > 0 ? filename.slice(lastDot + 1).toLowerCase() : '';
+  const stem = lastDot > 0 ? filename.slice(0, lastDot) : filename;
+  if (!curExt || curExt === 'bin' || curExt === 'unknown' || curExt === 'tmp') {
+    return `${stem}.${cleanDetected}`;
+  }
+  if (curExt === cleanDetected) return filename;
+  if ((curExt === 'jpeg' && cleanDetected === 'jpg') || (curExt === 'jpg' && cleanDetected === 'jpeg')) return filename;
+  if ((curExt === 'tiff' && cleanDetected === 'tif') || (curExt === 'tif' && cleanDetected === 'tiff')) return filename;
+  if (cleanDetected === 'zip' && ZIP_CONTAINER_EXTS_CJS.has(curExt)) return filename;
+  if (cleanDetected === 'doc' && OLE2_CONTAINER_EXTS_CJS.has(curExt)) return filename;
+  return `${stem}.${cleanDetected}`;
+}
 
 function runPowerShellJson(script) {
   return new Promise((resolve) => {
@@ -128,6 +228,7 @@ function walkFolderEntries(dirPath, outList, maxFiles = 5000, recycleMeta = null
           offset: 0,
           sector: 0,
           devicePath: full,
+          discoveryCrc32: computeCrc32Cjs(info.sample, info.sample.length),
           headerSample: info.sample,
         });
       } catch {
@@ -137,13 +238,22 @@ function walkFolderEntries(dirPath, outList, maxFiles = 5000, recycleMeta = null
   }
 }
 
-function scanRecycleDir(recycleRoot, outList, maxFiles = 5000) {
+function scanRecycleDir(recycleRoot, outList, maxFiles = 5000, preferredSid = null) {
   if (!fs.existsSync(recycleRoot) || outList.length >= maxFiles) return;
   let sidDirs;
   try {
     sidDirs = fs.readdirSync(recycleRoot, { withFileTypes: true });
   } catch {
     return;
+  }
+
+  // Prioritize active user's SID folder first (Digger per-user SID scoping), then orphaned SIDs
+  if (preferredSid) {
+    sidDirs.sort((a, b) => {
+      const aMatch = a.name.toUpperCase() === preferredSid.toUpperCase() ? 0 : 1;
+      const bMatch = b.name.toUpperCase() === preferredSid.toUpperCase() ? 0 : 1;
+      return aMatch - bMatch;
+    });
   }
 
   for (const sid of sidDirs) {
@@ -200,6 +310,7 @@ function scanRecycleDir(recycleRoot, outList, maxFiles = 5000) {
           offset: 0,
           sector: 0,
           devicePath: fullR,
+          discoveryCrc32: computeCrc32Cjs(info.sample, info.sample.length),
           headerSample: info.sample,
         });
       } catch {
@@ -710,6 +821,7 @@ function scanFat32VolumeFromFd(fd, devicePath, vol, limitBytes, includeExisting 
           mftResident: false,
           mftOverwritten: isDeleted ? overwritten : false,
           mftBitmapIntact: isDeleted ? !overwritten : true,
+          discoveryCrc32: computeCrc32Cjs(hBuf, hRead),
           headerSample: new Uint8Array(hBuf.buffer, hBuf.byteOffset, hRead),
         });
       }
@@ -889,6 +1001,7 @@ function scanExfatVolumeFromFd(fd, devicePath, vol, limitBytes, includeExisting 
           mftResident: false,
           mftOverwritten: isDeleted ? overwritten : false,
           mftBitmapIntact: isDeleted ? (bitmap !== null && !overwritten) : true,
+          discoveryCrc32: computeCrc32Cjs(hBuf, hRead),
           headerSample: new Uint8Array(hBuf.buffer, hBuf.byteOffset, hRead),
         });
       }
@@ -1198,6 +1311,7 @@ function parseMftRecordBuffer(work, absOffset, ntfsParts, fd, limitBytes, dirMap
         sector: Math.floor(absOffset / 512),
         devicePath: '',
         mftResident: true,
+        discoveryCrc32: computeCrc32Cjs(residentPayload, residentPayload.length),
         headerSample: new Uint8Array(residentPayload),
       },
     };
@@ -1245,6 +1359,7 @@ function parseMftRecordBuffer(work, absOffset, ntfsParts, fd, limitBytes, dirMap
       devicePath: '',
       runs: extents,
       mftResident: false,
+      discoveryCrc32: computeCrc32Cjs(hdrBuf, hRead),
       headerSample: new Uint8Array(hdrBuf.buffer, hdrBuf.byteOffset, hRead),
     },
   };
@@ -1505,195 +1620,7 @@ async function huntDeletedInBackingDrive(backing, isRecycleBin, maxEntries = 200
   }
 }
 
-function makeBoxCjs(type, children) {
-  const payloadLen = children.reduce((s, c) => s + c.length, 0);
-  const out = Buffer.allocUnsafe(8 + payloadLen);
-  out.writeUInt32BE(out.length, 0);
-  out.write(type.slice(0, 4), 4, 'ascii');
-  let p = 8;
-  for (const c of children) {
-    c.copy(out, p);
-    p += c.length;
-  }
-  return out;
-}
-
-function fullBoxCjs(type, version, flags, payload) {
-  const vf = Buffer.allocUnsafe(4);
-  vf[0] = version & 0xff;
-  vf[1] = (flags >> 16) & 0xff;
-  vf[2] = (flags >> 8) & 0xff;
-  vf[3] = flags & 0xff;
-  return makeBoxCjs(type, [vf, payload]);
-}
-
-function repairTruncatedMp4BufferCjs(rawBuf) {
-  if (!rawBuf || rawBuf.length < 32) return null;
-  let pos = 0;
-  let ftypSlice = null;
-  let mdatOffset = -1;
-  let mdatDataStart = -1;
-  let mdatDataEnd = -1;
-  let hasMoov = false;
-
-  while (pos + 8 <= rawBuf.length) {
-    let sz = rawBuf.readUInt32BE(pos);
-    const tp = rawBuf.toString('ascii', pos + 4, pos + 8);
-    let hdrSize = 8;
-    if (sz === 1 && pos + 16 <= rawBuf.length) {
-      sz = rawBuf.readUInt32BE(pos + 8) * 4294967296 + rawBuf.readUInt32BE(pos + 12);
-      hdrSize = 16;
-    } else if (sz === 0) {
-      sz = rawBuf.length - pos;
-    }
-    if (!/^[\x20-\x7e]{4}$/.test(tp) || sz < 8) break;
-    const end = Math.min(rawBuf.length, pos + sz);
-    if (tp === 'ftyp') ftypSlice = Buffer.from(rawBuf.subarray(pos, end));
-    if (tp === 'moov') hasMoov = true;
-    if (tp === 'mdat') {
-      mdatOffset = pos;
-      mdatDataStart = pos + hdrSize;
-      mdatDataEnd = end;
-      break;
-    }
-    pos = end;
-  }
-  if (hasMoov || mdatOffset < 0 || mdatDataEnd <= mdatDataStart) return null;
-
-  const payload = rawBuf.subarray(mdatDataStart, mdatDataEnd);
-  let sps = null;
-  let pps = null;
-  const sampleOffsets = [];
-  const sampleSizes = [];
-  const syncSamples = [];
-
-  // Detect AVCC length-prefixed frames or Annex-B start codes inside mdat
-  let p = 0;
-  while (p + 5 <= payload.length && sampleSizes.length < 20000) {
-    const nalLen = payload.readUInt32BE(p);
-    if (nalLen > 0 && p + 4 + nalLen <= payload.length) {
-      const nt = payload[p + 4] & 0x1f;
-      if (nt === 7 && !sps) sps = Buffer.from(payload.subarray(p + 4, p + 4 + nalLen));
-      if (nt === 8 && !pps) pps = Buffer.from(payload.subarray(p + 4, p + 4 + nalLen));
-      if (nt === 1 || nt === 5) {
-        sampleOffsets.push(p);
-        sampleSizes.push(4 + nalLen);
-        if (nt === 5) syncSamples.push(sampleSizes.length);
-      }
-      p += 4 + nalLen;
-      continue;
-    }
-    break;
-  }
-
-  if (sampleSizes.length === 0) {
-    sampleOffsets.push(0);
-    sampleSizes.push(payload.length);
-    syncSamples.push(1);
-  }
-
-  const useSps = sps || Buffer.from([0x67, 0x42, 0xe0, 0x1f, 0xda, 0x01, 0x40, 0x16, 0xe4]);
-  const usePps = pps || Buffer.from([0x68, 0xce, 0x3c, 0x80]);
-
-  const avcC = makeBoxCjs('avcC', [
-    Buffer.from([1, useSps[1] || 0x42, useSps[2] || 0xe0, useSps[3] || 0x1f, 0xff, 0xe1]),
-    Buffer.from([(useSps.length >> 8) & 0xff, useSps.length & 0xff]),
-    useSps,
-    Buffer.from([1, (usePps.length >> 8) & 0xff, usePps.length & 0xff]),
-    usePps,
-  ]);
-
-  const avc1Payload = Buffer.alloc(78);
-  avc1Payload.writeUInt16BE(1, 6);
-  avc1Payload.writeUInt16BE(1280, 24);
-  avc1Payload.writeUInt16BE(720, 26);
-  avc1Payload.writeUInt32BE(0x00480000, 28);
-  avc1Payload.writeUInt32BE(0x00480000, 32);
-  avc1Payload.writeUInt16BE(1, 40);
-  avc1Payload.writeUInt16BE(24, 74);
-  avc1Payload.writeInt16BE(-1, 76);
-
-  const stsdBuf = Buffer.allocUnsafe(4);
-  stsdBuf.writeUInt32BE(1, 0);
-  const stsd = fullBoxCjs('stsd', 0, 0, Buffer.concat([stsdBuf, makeBoxCjs('avc1', [avc1Payload, avcC])]));
-
-  const sttsP = Buffer.alloc(12);
-  sttsP.writeUInt32BE(1, 0);
-  sttsP.writeUInt32BE(sampleSizes.length, 4);
-  sttsP.writeUInt32BE(30, 8);
-  const stts = fullBoxCjs('stts', 0, 0, sttsP);
-
-  const stscP = Buffer.alloc(16);
-  stscP.writeUInt32BE(1, 0);
-  stscP.writeUInt32BE(1, 4);
-  stscP.writeUInt32BE(1, 8);
-  stscP.writeUInt32BE(1, 12);
-  const stsc = fullBoxCjs('stsc', 0, 0, stscP);
-
-  const stszP = Buffer.alloc(8 + sampleSizes.length * 4);
-  stszP.writeUInt32BE(0, 0);
-  stszP.writeUInt32BE(sampleSizes.length, 4);
-  for (let i = 0; i < sampleSizes.length; i++) stszP.writeUInt32BE(sampleSizes[i], 8 + i * 4);
-  const stsz = fullBoxCjs('stsz', 0, 0, stszP);
-
-  const stssIdx = syncSamples.length > 0 ? syncSamples : [1];
-  const stssP = Buffer.alloc(4 + stssIdx.length * 4);
-  stssP.writeUInt32BE(stssIdx.length, 0);
-  for (let i = 0; i < stssIdx.length; i++) stssP.writeUInt32BE(stssIdx[i], 4 + i * 4);
-  const stss = fullBoxCjs('stss', 0, 0, stssP);
-
-  const stcoP = Buffer.alloc(4 + sampleOffsets.length * 4);
-  stcoP.writeUInt32BE(sampleOffsets.length, 0);
-  const ftyp = ftypSlice || Buffer.from([0, 0, 0, 20, 0x66, 0x74, 0x79, 0x70, 0x6d, 0x70, 0x34, 0x32, 0, 0, 0, 0, 0x69, 0x73, 0x6f, 0x6d]);
-  const newMdat = makeBoxCjs('mdat', [payload]);
-  const mdatPayloadBase = ftyp.length + 8;
-
-  for (let i = 0; i < sampleOffsets.length; i++) {
-    stcoP.writeUInt32BE(mdatPayloadBase + sampleOffsets[i], 4 + i * 4);
-  }
-  const stco = fullBoxCjs('stco', 0, 0, stcoP);
-
-  const timescale = 900;
-  const duration = sampleSizes.length * 30;
-  const mvhdP = Buffer.alloc(96);
-  mvhdP.writeUInt32BE(timescale, 8);
-  mvhdP.writeUInt32BE(duration, 12);
-  mvhdP.writeUInt32BE(0x00010000, 16);
-  mvhdP.writeUInt16BE(0x0100, 20);
-  mvhdP.writeUInt32BE(0x00010000, 32);
-  mvhdP.writeUInt32BE(0x00010000, 48);
-  mvhdP.writeUInt32BE(0x40000000, 64);
-  mvhdP.writeUInt32BE(2, 92);
-
-  const tkhdP = Buffer.alloc(80);
-  tkhdP.writeUInt32BE(1, 8);
-  tkhdP.writeUInt32BE(duration, 16);
-  tkhdP.writeUInt32BE(0x00010000, 36);
-  tkhdP.writeUInt32BE(0x00010000, 52);
-  tkhdP.writeUInt32BE(0x40000000, 68);
-  tkhdP.writeUInt32BE(1280 << 16, 72);
-  tkhdP.writeUInt32BE(720 << 16, 76);
-
-  const mdhdP = Buffer.alloc(20);
-  mdhdP.writeUInt32BE(timescale, 8);
-  mdhdP.writeUInt32BE(duration, 12);
-  mdhdP.writeUInt16BE(0x55c4, 16);
-
-  const hdlrP = Buffer.alloc(24);
-  hdlrP.write('vide', 4, 'ascii');
-  const drefP = Buffer.alloc(4);
-  drefP.writeUInt32BE(1, 0);
-  const urlBox = fullBoxCjs('url ', 0, 1, Buffer.alloc(0));
-  const dinf = makeBoxCjs('dinf', [fullBoxCjs('dref', 0, 0, Buffer.concat([drefP, urlBox]))]);
-  const vmhd = fullBoxCjs('vmhd', 0, 1, Buffer.alloc(8));
-  const stbl = makeBoxCjs('stbl', [stsd, stts, stsc, stsz, stco, stss]);
-  const minf = makeBoxCjs('minf', [vmhd, dinf, stbl]);
-  const mdia = makeBoxCjs('mdia', [fullBoxCjs('mdhd', 0, 0, mdhdP), fullBoxCjs('hdlr', 0, 0, hdlrP), minf]);
-  const trak = makeBoxCjs('trak', [fullBoxCjs('tkhd', 0, 3, tkhdP), mdia]);
-  const moov = makeBoxCjs('moov', [fullBoxCjs('mvhd', 0, 0, mvhdP), trak]);
-
-  return Buffer.concat([ftyp, newMdat, moov]);
-}
+// Structural media repair functions live in ./mediaRepairCjs.cjs for multi-GB streaming support.
 
 function createWindow() {
   const win = new BrowserWindow({
@@ -1761,31 +1688,314 @@ app.whenReady().then(() => {
     });
   });
 
-  ipcMain.handle('win:read-disk-bytes', async (_event, { devicePath, startByte = 0, maxBytes = 64 * 1024 * 1024 }) => {
-    const alignedStart = Math.floor(startByte / 512) * 512;
-    const alignedLen = Math.max(512, Math.floor(maxBytes / 512) * 512);
-    const fd = fs.openSync(devicePath, 'r');
-    try {
-      const chunkSize = 1024 * 1024;
-      const buffers = [];
-      let totalRead = 0;
+  ipcMain.handle('win:get-engine-capabilities', async () => {
+    const caps = getEngineCapabilitiesSync();
+    const isAdmin = await checkWindowsIsAdmin();
+    return { ...caps, isAdmin };
+  });
 
-      while (totalRead < alignedLen) {
-        const toRead = Math.min(chunkSize, alignedLen - totalRead);
-        const buf = Buffer.allocUnsafe(toRead);
-        const bytesRead = fs.readSync(fd, buf, 0, toRead, alignedStart + totalRead);
-        if (bytesRead <= 0) break;
-        buffers.push(bytesRead === toRead ? buf : buf.subarray(0, bytesRead));
-        totalRead += bytesRead;
-        if (bytesRead < toRead) break;
+  ipcMain.handle('win:relaunch-admin', async () => {
+    if (process.platform !== 'win32') return { ok: false, error: 'Only supported on Windows.' };
+    return await new Promise((resolve) => {
+      const child = execFile(
+        'powershell.exe',
+        ['-NoProfile', '-NonInteractive', '-Command', 'Start-Process -FilePath $env:TD_RELAUNCH_EXE -Verb RunAs'],
+        {
+          windowsHide: true,
+          env: { ...process.env, TD_RELAUNCH_EXE: process.execPath },
+        },
+        (err, _stdout, stderr) => {
+          if (err) {
+            resolve({ ok: false, error: (stderr || err.message || 'UAC elevation was cancelled.').trim() });
+            return;
+          }
+          resolve({ ok: true });
+          setTimeout(() => app.quit(), 250);
+        },
+      );
+      child.on('error', (err) => resolve({ ok: false, error: err.message }));
+    });
+  });
+
+  ipcMain.handle('win:probe-video-preview', async (_event, params = {}) => {
+    let source = { filePath: params.filePath, buffer: params.buffer };
+    if (
+      !source.filePath &&
+      (!source.buffer || source.buffer.length === 0) &&
+      params.tskInode &&
+      params.devicePath
+    ) {
+      const head = await readTskInodeHead(
+        params.devicePath,
+        params.tskOffset || 0,
+        params.tskInode,
+        4 * 1024 * 1024,
+      );
+      if (head) source = { buffer: head };
+    }
+    return await probeVideoFrameWithFfmpeg(source);
+  });
+
+  ipcMain.handle('win:repair-media-file', async (_event, params = {}) => {
+    const ext = String(params.extension || path.extname(params.filename || '').replace(/^\./, '') || 'mp4')
+      .toLowerCase()
+      .replace(/^\./, '');
+    const tmpBase = path.join(os.tmpdir(), `td_med_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`);
+    const tmpSrc = `${tmpBase}.src.${ext}`;
+    const tmpStruct = `${tmpBase}.struct.${ext}`;
+    const tmpOut = `${tmpBase}.out.${ext}`;
+    const cleanup = (p) => {
+      try {
+        if (p && fs.existsSync(p)) fs.unlinkSync(p);
+      } catch {
+        // ignore cleanup
+      }
+    };
+
+    let workPath = tmpSrc;
+    try {
+      // Materialize source file into tmpSrc (or read directly from native filePath when not overwritten)
+      if (params.buffer && params.buffer.length > 0) {
+        fs.writeFileSync(tmpSrc, Buffer.from(params.buffer));
+      } else if (params.filePath && fs.existsSync(params.filePath)) {
+        workPath = params.filePath;
+      } else if (params.sourceKind === 'native-tsk' && params.devicePath && params.tskInode) {
+        const tskRes = await extractTskInodeToFile(params.devicePath, params.tskOffset || 0, params.tskInode, tmpSrc);
+        if (!tskRes.ok) return { ok: false, tier: 'none', repairedSize: 0, note: tskRes.error || 'TSK extraction failed' };
+      } else if (params.devicePath) {
+        const srcFd = fs.openSync(params.devicePath, 'r');
+        const dstFd = fs.openSync(tmpSrc, 'w');
+        const copyChunk = Buffer.allocUnsafe(4 * 1024 * 1024);
+        const ranges =
+          params.sourceKind === 'native-runs' && Array.isArray(params.runs) && params.runs.length > 0
+            ? params.runs
+            : [{ offset: params.offset || 0, length: params.size || 0 }];
+        try {
+          for (const run of ranges) {
+            let rem = run.length;
+            let rPos = run.offset;
+            while (rem > 0) {
+              const alignedStart = Math.floor(rPos / 512) * 512;
+              const trim = rPos - alignedStart;
+              const need = Math.min(copyChunk.length - 512, rem);
+              const alignedRead = Math.ceil((trim + need) / 512) * 512;
+              const n = fs.readSync(srcFd, copyChunk, 0, Math.min(copyChunk.length, alignedRead), alignedStart);
+              if (n <= trim) break;
+              const take = Math.min(rem, n - trim);
+              fs.writeSync(dstFd, copyChunk, trim, take);
+              rPos += take;
+              rem -= take;
+            }
+          }
+        } finally {
+          fs.closeSync(srcFd);
+          fs.closeSync(dstFd);
+        }
+      } else {
+        return { ok: false, tier: 'none', repairedSize: 0, note: 'No readable media source supplied.' };
       }
 
-      const combined = Buffer.concat(buffers, totalRead);
-      return new Uint8Array(combined.buffer, combined.byteOffset, combined.byteLength);
+      const srcSize = fs.statSync(workPath).size;
+      const refBuf = params.referenceBuffer ? Buffer.from(params.referenceBuffer) : null;
+      let structuralTier = '';
+      let structuralNote = '';
+      let salvagedPreviewBuf = null;
+      let stagePath = workPath;
+
+      // Phase 1A: Multi-GB Streaming ISO BMFF MP4/MOV/M4V/3GP Structural Rebuild (Zero RAM limit!)
+      if (['mp4', 'mov', 'm4v', '3gp'].includes(ext)) {
+        const mp4Res = repairMp4StreamingFileCjs(workPath, tmpStruct, refBuf);
+        if (mp4Res && mp4Res.ok && fs.existsSync(tmpStruct)) {
+          stagePath = tmpStruct;
+          structuralTier = mp4Res.tier || 'structural-moov';
+          structuralNote = mp4Res.note;
+        }
+      } else if (srcSize <= 256 * 1024 * 1024) {
+        // Phase 1B: Deep Image, JPEG Bitstream, PNG CRC/IDAT, AVI idx1, MKV & RAW Preview Structural Repair
+        const rawBuf = fs.readFileSync(workPath);
+        if (ext === 'jpg' || ext === 'jpeg') {
+          const jpgRes = repairJpegBufferCjs(rawBuf, refBuf);
+          if (jpgRes) {
+            if (jpgRes.salvagedPreview) salvagedPreviewBuf = jpgRes.salvagedPreview;
+            if (jpgRes.data) {
+              fs.writeFileSync(tmpStruct, jpgRes.data);
+              stagePath = tmpStruct;
+              structuralTier = 'structural-jpeg';
+              structuralNote = jpgRes.note;
+            }
+          }
+        } else if (ext === 'png') {
+          const pngRes = repairPngBufferCjs(rawBuf);
+          if (pngRes && pngRes.data) {
+            fs.writeFileSync(tmpStruct, pngRes.data);
+            stagePath = tmpStruct;
+            structuralTier = 'structural-png';
+            structuralNote = pngRes.note;
+          }
+        } else if (ext === 'avi') {
+          const aviRes = repairAviBufferCjs(rawBuf);
+          if (aviRes && aviRes.data) {
+            fs.writeFileSync(tmpStruct, aviRes.data);
+            stagePath = tmpStruct;
+            structuralTier = 'structural-avi';
+            structuralNote = aviRes.note;
+          }
+        } else if (['cr2', 'cr3', 'nef', 'arw', 'dng', 'orf', 'rw2', 'tif', 'tiff'].includes(ext)) {
+          const emb = extractEmbeddedJpegCjs(rawBuf, false);
+          if (emb) {
+            salvagedPreviewBuf = emb;
+            structuralTier = 'raw-preview';
+            structuralNote = `Extracted intact embedded JPEG preview (${emb.length} B) from ${ext.toUpperCase()} Camera RAW.`;
+          }
+        } else if ((ext === 'mkv' || ext === 'webm') && rawBuf.length >= 64) {
+          let trimEnd = rawBuf.length;
+          while (trimEnd > 64 && rawBuf[trimEnd - 1] === 0x00) trimEnd--;
+          if (rawBuf.length - trimEnd >= 16) {
+            fs.writeFileSync(tmpStruct, rawBuf.subarray(0, trimEnd));
+            stagePath = tmpStruct;
+            structuralTier = 'structural-ebml';
+            structuralNote = `Trimmed ${rawBuf.length - trimEnd} B trailing null slack from ${ext.toUpperCase()}.`;
+          }
+        } else if ((ext === 'wav' || ext === 'webp') && rawBuf.length >= 12) {
+          const copy = Buffer.from(rawBuf);
+          copy.writeUInt32LE(Math.max(4, copy.length - 8) >>> 0, 4);
+          if (ext === 'wav' && copy.length >= 44) copy.writeUInt32LE(Math.max(0, copy.length - 44) >>> 0, 40);
+          fs.writeFileSync(tmpStruct, copy);
+          stagePath = tmpStruct;
+          structuralTier = 'structural-riff';
+          structuralNote = `Recalculated ${ext.toUpperCase()} RIFF payload length.`;
+        } else if (ext === 'gif' && rawBuf.length >= 14 && rawBuf[rawBuf.length - 1] !== 0x3b) {
+          fs.writeFileSync(tmpStruct, Buffer.concat([rawBuf, Buffer.from([0x3b])]));
+          stagePath = tmpStruct;
+          structuralTier = 'structural-gif';
+          structuralNote = 'Appended missing GIF89a/87a trailer (0x3B).';
+        }
+      }
+
+      // Phase 2: Multi-tier FFmpeg escalation when FFmpeg is bundled (skip slow copy on huge already-repaired >1 GiB MP4 unless needed)
+      let finalPath = stagePath;
+      let finalTier = structuralTier || 'none';
+      let finalNote = structuralNote;
+
+      const stageSize = fs.statSync(stagePath).size;
+      const skipRedundantFfmpegCopy = Boolean(structuralTier === 'structural-moov' && stageSize > 1024 * 1024 * 1024);
+
+      if (getEngineCapabilitiesSync().ffmpeg && !skipRedundantFfmpegCopy) {
+        const ffRes = await ffmpegRepairVideoFile(stagePath, tmpOut, {
+          extension: ext,
+          allowTranscode: Boolean(params.allowTranscodeFallback),
+        });
+        if (ffRes.ok) {
+          finalPath = tmpOut;
+          finalTier = structuralTier ? `${structuralTier}+${ffRes.tier}` : ffRes.tier;
+          finalNote = structuralNote ? `${structuralNote} ${ffRes.note}` : ffRes.note;
+        }
+      }
+
+      if (finalTier === 'none') {
+        return {
+          ok: false,
+          tier: 'none',
+          repairedSize: srcSize,
+          salvagedPreviewBytes: salvagedPreviewBuf ? new Uint8Array(salvagedPreviewBuf) : undefined,
+          note: 'Container could not be repaired automatically. Enable salvage re-encode or supply a healthy reference clip/photo.',
+        };
+      }
+
+      // Visual verification thumbnail via FFmpeg (video) or data URL (small image / RAW preview)
+      let previewDataUrl;
+      if (['mp4', 'mov', 'm4v', '3gp', 'mkv', 'avi'].includes(ext)) {
+        const probe = await probeVideoFrameWithFfmpeg({ filePath: finalPath });
+        previewDataUrl = probe?.thumbnailDataUrl;
+      } else if (salvagedPreviewBuf) {
+        previewDataUrl = `data:image/jpeg;base64,${salvagedPreviewBuf.toString('base64')}`;
+      } else if (['jpg', 'jpeg', 'png', 'webp', 'bmp', 'gif'].includes(ext) && fs.statSync(finalPath).size <= 16 * 1024 * 1024) {
+        const mime = ext === 'png' ? 'image/png' : ext === 'webp' ? 'image/webp' : ext === 'bmp' ? 'image/bmp' : ext === 'gif' ? 'image/gif' : 'image/jpeg';
+        previewDataUrl = `data:${mime};base64,${fs.readFileSync(finalPath).toString('base64')}`;
+      }
+
+      const finalSize = fs.statSync(finalPath).size;
+      let outputPath;
+      if (params.saveWithDialog) {
+        const cleanName = sanitizeWinFilename(params.filename || `repaired.${ext}`).replace(/(\.[^.]+)?$/, `_repaired.${ext}`);
+        const res = await dialog.showSaveDialog({
+          title: 'Save Repaired Media File',
+          defaultPath: cleanName,
+          filters: [{ name: `${ext.toUpperCase()} File`, extensions: [ext] }, { name: 'All Files', extensions: ['*'] }],
+        });
+        if (res.canceled || !res.filePath) {
+          return { ok: true, canceled: true, tier: finalTier, repairedSize: finalSize, note: finalNote, previewDataUrl };
+        }
+        fs.copyFileSync(finalPath, res.filePath);
+        outputPath = res.filePath;
+      }
+
+      const repairedBytes =
+        !params.saveWithDialog && finalSize <= 128 * 1024 * 1024
+          ? new Uint8Array(fs.readFileSync(finalPath))
+          : undefined;
+
+      return {
+        ok: true,
+        tier: finalTier,
+        repairedSize: finalSize,
+        note: finalNote,
+        previewDataUrl,
+        outputPath,
+        repairedBytes,
+        salvagedPreviewBytes: salvagedPreviewBuf ? new Uint8Array(salvagedPreviewBuf) : undefined,
+      };
+    } catch (err) {
+      return { ok: false, tier: 'none', repairedSize: 0, note: 'Repair error', error: err?.message || 'Unknown error' };
     } finally {
-      fs.closeSync(fd);
+      if (workPath === tmpSrc) cleanup(tmpSrc);
+      cleanup(tmpStruct);
+      cleanup(tmpOut);
     }
   });
+
+  ipcMain.handle('win:identify-files', async (_event, filePaths) => {
+    return await runFidentifyPaths(filePaths);
+  });
+
+  ipcMain.handle(
+    'win:read-disk-bytes',
+    async (_event, { devicePath, startByte = 0, maxBytes = 64 * 1024 * 1024, tskInode, tskOffset = 0 }) => {
+      if (tskInode) {
+        const head = await readTskInodeHead(
+          devicePath,
+          tskOffset || 0,
+          tskInode,
+          Math.min(maxBytes || 256 * 1024, 16 * 1024 * 1024),
+        );
+        return head ? new Uint8Array(head.buffer, head.byteOffset, head.byteLength) : new Uint8Array(0);
+      }
+
+      const alignedStart = Math.floor(startByte / 512) * 512;
+      const alignedLen = Math.max(512, Math.floor(maxBytes / 512) * 512);
+      const fd = fs.openSync(devicePath, 'r');
+      try {
+        const chunkSize = 1024 * 1024;
+        const buffers = [];
+        let totalRead = 0;
+
+        while (totalRead < alignedLen) {
+          const toRead = Math.min(chunkSize, alignedLen - totalRead);
+          const buf = Buffer.allocUnsafe(toRead);
+          const bytesRead = fs.readSync(fd, buf, 0, toRead, alignedStart + totalRead);
+          if (bytesRead <= 0) break;
+          buffers.push(bytesRead === toRead ? buf : buf.subarray(0, bytesRead));
+          totalRead += bytesRead;
+          if (bytesRead < toRead) break;
+        }
+
+        const combined = Buffer.concat(buffers, totalRead);
+        return new Uint8Array(combined.buffer, combined.byteOffset, combined.byteLength);
+      } finally {
+        fs.closeSync(fd);
+      }
+    },
+  );
 
   ipcMain.handle('win:pick-disk-image', async () => {
     const res = await dialog.showOpenDialog({
@@ -1856,12 +2066,13 @@ app.whenReady().then(() => {
     const existingSet = new Set();
 
     if (isRecycleBin && process.platform === 'win32') {
-      const roots = await runPowerShellJson(
-        'Get-PSDrive -PSProvider FileSystem | Select-Object Root | ConvertTo-Json -Compress',
-      );
+      const [roots, currentSid] = await Promise.all([
+        runPowerShellJson('Get-PSDrive -PSProvider FileSystem | Select-Object Root | ConvertTo-Json -Compress'),
+        getCurrentUserWindowsSid(),
+      ]);
       for (const r of roots) {
         if (r && r.Root) {
-          scanRecycleDir(path.join(String(r.Root), '$Recycle.Bin'), out, 5000);
+          scanRecycleDir(path.join(String(r.Root), '$Recycle.Bin'), out, 5000, currentSid);
         }
       }
     } else if (targetPath) {
@@ -1944,6 +2155,7 @@ app.whenReady().then(() => {
         resumeOffset = 0,
         scanMode = 'full',
         startPhase = 'quick',
+        unallocatedOnly = false,
         includeExisting = true,
       },
     ) => {
@@ -1955,6 +2167,7 @@ app.whenReady().then(() => {
       const step = Math.max(512, Math.floor(blockSize / 512) * 512);
       const results = [];
       const seenOffsets = new Set();
+      let allocatedBitmaps = [];
       let foundBytes = 0;
 
       const fd = fs.openSync(devicePath, 'r');
@@ -1964,7 +2177,7 @@ app.whenReady().then(() => {
         limitBytes = totalBytes > 0 ? totalBytes : fs.fstatSync(fd).size;
         volumes = detectVolumesFromDisk(fd, limitBytes);
 
-        // Stage 1: Fast Filesystem Metadata Scan (Contiguous NTFS $MFT + $UsnJrnl:$J + FAT32 + exFAT + VSS)
+        // Stage 1: Fast Filesystem Metadata Scan (Contiguous NTFS $MFT + $UsnJrnl:$J + FAT32 + exFAT + Sleuth Kit ext/HFS+ fallback)
         if (startPhase !== 'deep' && resumeOffset === 0 && !state.cancelled) {
           event.sender.send('win:drive-scan-progress', {
             scanId,
@@ -1980,6 +2193,17 @@ app.whenReady().then(() => {
           const ntfsParts = volumes.filter((v) => v.fsType === 'ntfs');
           if (ntfsParts.length > 0) {
             const ntfsQuick = scanNtfsMftContiguous(fd, devicePath, ntfsParts, limitBytes, includeExisting);
+            for (const part of ntfsParts) {
+              const bm = ntfsQuick.bitmapByVol.get(part.volStart);
+              if (bm && bm.length > 0) {
+                allocatedBitmaps.push({
+                  volStart: part.volStart,
+                  volEnd: part.volEnd,
+                  clusterBytes: part.clusterBytes,
+                  bitmap: bm,
+                });
+              }
+            }
             for (const item of ntfsQuick.entries) {
               results.push(item);
               quickBatch.push(item);
@@ -2001,6 +2225,64 @@ app.whenReady().then(() => {
               quickBatch.push(item);
               foundBytes += item.size;
               if (item.offset > 0) seenOffsets.add(item.offset);
+            }
+          }
+
+          // Sleuth Kit (`mmls` + `fls`) enrichment for Linux ext2/3/4, HFS+, or fallback partitions
+          if (!state.cancelled && getEngineCapabilitiesSync().sleuthkit) {
+            const tskSeenKeys = new Set(
+              results.map((r) => `${String(r.originalPath || '').toLowerCase()}:${r.size}`),
+            );
+            const mmlsParts = await runMmlsPartitions(devicePath, 512);
+            const knownStarts = new Set(volumes.map((v) => v.volStart));
+            const targetOffsets = [];
+
+            for (const mp of mmlsParts) {
+              if (!knownStarts.has(mp.startByte) || results.length === 0) {
+                targetOffsets.push({ startByte: mp.startByte, label: mp.description || 'Volume' });
+              }
+            }
+            if (mmlsParts.length === 0 && results.length === 0) {
+              targetOffsets.push({ startByte: 0, label: 'Auto' });
+            }
+
+            for (const target of targetOffsets.slice(0, 6)) {
+              if (state.cancelled) break;
+              const tskRows = await runTskFlsScan(
+                devicePath,
+                target.startByte,
+                target.label,
+                includeExisting,
+                4000,
+              );
+              for (const row of tskRows) {
+                const key = `${String(row.originalPath || '').toLowerCase()}:${row.size}`;
+                if (tskSeenKeys.has(key)) continue;
+                tskSeenKeys.add(key);
+                const mapped = {
+                  id: row.id,
+                  filename: row.filename,
+                  originalPath: row.originalPath,
+                  extensionHint: row.extension,
+                  size: row.size,
+                  calculatedSize: row.size,
+                  modifiedAt: row.modifiedAtMs,
+                  sourceKind: 'ntfs-mft',
+                  isDeleted: row.isDeleted,
+                  scanPhase: 'quick',
+                  offset: row.offset,
+                  sector: Math.floor((row.offset || 0) / 512),
+                  devicePath,
+                  tskInode: row.tskInode,
+                  tskOffset: row.tskOffset,
+                  partitionName: row.partitionName,
+                  details: row.details,
+                  headerSample: new Uint8Array(0),
+                };
+                results.push(mapped);
+                quickBatch.push(mapped);
+                foundBytes += mapped.size;
+              }
             }
           }
 
@@ -2031,7 +2313,7 @@ app.whenReady().then(() => {
         return results;
       }
 
-      // Stage 2: Parallel Deep Sector Carving across Node worker_threads (with 64-bit zero skip)
+      // Stage 2: Parallel Deep Sector Carving across Node worker_threads (with 64-bit zero skip & optional NTFS $Bitmap unallocated-only mask)
       const cursorStart = Math.max(0, Math.floor(resumeOffset / 512) * 512);
       const remainingBytes = Math.max(0, limitBytes - cursorStart);
       const workerCount =
@@ -2067,6 +2349,8 @@ app.whenReady().then(() => {
               step,
               workerIndex: w,
               ctrlBuffer: ctrlSab,
+              unallocatedOnly: Boolean(unallocatedOnly),
+              allocatedBitmaps,
             },
           });
 
@@ -2124,7 +2408,7 @@ app.whenReady().then(() => {
     },
   );
 
-  ipcMain.handle('win:recover-files', async (_event, { destinationDir, items }) => {
+  ipcMain.handle('win:recover-files', async (_event, { destinationDir, items, scannedDevicePath }) => {
     let targetRoot = destinationDir;
     if (!targetRoot) {
       const pick = await dialog.showOpenDialog({
@@ -2132,12 +2416,32 @@ app.whenReady().then(() => {
         properties: ['openDirectory', 'createDirectory'],
       });
       if (pick.canceled || pick.filePaths.length === 0) {
-        return { canceled: true, savedCount: 0, destinationDir: '', repairedCount: 0 };
+        return { canceled: true, savedCount: 0, verifiedCount: 0, destinationDir: '', repairedCount: 0 };
       }
       targetRoot = pick.filePaths[0];
     }
 
-    // Source-drive self-overwrite & free space pre-flight guard (WinDirStat ValidateDestination)
+    // Source-drive self-overwrite pre-flight guard for raw physical drives
+    const rawSourcePath = scannedDevicePath || items.find((i) => i.devicePath && i.devicePath.startsWith('\\\\.\\'))?.devicePath;
+    if (process.platform === 'win32' && rawSourcePath && rawSourcePath.startsWith('\\\\.\\PhysicalDrive')) {
+      try {
+        const destBacking = await resolveBackingPhysicalDrive(targetRoot);
+        if (destBacking && destBacking.devicePath.toLowerCase() === rawSourcePath.toLowerCase()) {
+          return {
+            canceled: false,
+            savedCount: 0,
+            verifiedCount: 0,
+            destinationDir: targetRoot,
+            repairedCount: 0,
+            error: `Safety block: "${targetRoot}" resides on the same physical disk (${rawSourcePath}) being recovered. Choose a different drive to prevent overwriting deleted clusters.`,
+          };
+        }
+      } catch {
+        // continue if drive resolution is unavailable
+      }
+    }
+
+    // Free space pre-flight guard
     const totalRequested = items.reduce((s, i) => s + (i.size || 0), 0);
     if (typeof fs.statfsSync === 'function') {
       try {
@@ -2147,6 +2451,7 @@ app.whenReady().then(() => {
           return {
             canceled: false,
             savedCount: 0,
+            verifiedCount: 0,
             destinationDir: targetRoot,
             repairedCount: 0,
             error: `Insufficient free space on destination drive (${Math.round(freeBytes / (1024 * 1024))} MiB free).`,
@@ -2159,11 +2464,16 @@ app.whenReady().then(() => {
 
     const copyBuf = Buffer.allocUnsafe(4 * 1024 * 1024); // 4 MiB streaming copy buffer
     let savedCount = 0;
+    let verifiedCount = 0;
     let repairedCount = 0;
+    const failures = [];
+    const reportLines = [];
+    const createdDirs = new Set();
 
-    const streamExtent = (srcFd, dstFd, offset, length, isRawDev, lastTwoRef) => {
+    const streamExtent = (srcFd, dstFd, offset, length, isRawDev, lastTwoRef, headChunks) => {
       let remaining = length;
       let readPos = offset;
+      let headCaptured = 0;
       while (remaining > 0) {
         if (isRawDev) {
           const alignedStart = Math.floor(readPos / 512) * 512;
@@ -2174,6 +2484,11 @@ app.whenReady().then(() => {
           if (n <= headTrim) break;
           const validLen = Math.min(remaining, n - headTrim);
           fs.writeSync(dstFd, copyBuf, headTrim, validLen);
+          if (headCaptured < 65536) {
+            const take = Math.min(validLen, 65536 - headCaptured);
+            headChunks.push(Buffer.from(copyBuf.subarray(headTrim, headTrim + take)));
+            headCaptured += take;
+          }
           if (validLen >= 2) {
             lastTwoRef[0] = copyBuf[headTrim + validLen - 2];
             lastTwoRef[1] = copyBuf[headTrim + validLen - 1];
@@ -2185,6 +2500,11 @@ app.whenReady().then(() => {
           const n = fs.readSync(srcFd, copyBuf, 0, toRead, readPos);
           if (n <= 0) break;
           fs.writeSync(dstFd, copyBuf, 0, n);
+          if (headCaptured < 65536) {
+            const take = Math.min(n, 65536 - headCaptured);
+            headChunks.push(Buffer.from(copyBuf.subarray(0, take)));
+            headCaptured += take;
+          }
           if (n >= 2) {
             lastTwoRef[0] = copyBuf[n - 2];
             lastTwoRef[1] = copyBuf[n - 1];
@@ -2195,6 +2515,19 @@ app.whenReady().then(() => {
       }
     };
 
+    const resolveUniqueDestPath = (dir, rawFilename) => {
+      let candidate = path.join(dir, rawFilename);
+      if (!fs.existsSync(candidate)) return candidate;
+      const ext = path.extname(rawFilename);
+      const stem = ext ? rawFilename.slice(0, -ext.length) : rawFilename;
+      let idx = 2;
+      while (fs.existsSync(candidate) && idx < 10000) {
+        candidate = path.join(dir, `${stem}_${idx}${ext}`);
+        idx++;
+      }
+      return candidate;
+    };
+
     for (const item of items) {
       const safeFolder = String(item.folder || 'Recovered')
         .split(/[\\/]/)
@@ -2202,63 +2535,220 @@ app.whenReady().then(() => {
         .map(sanitizeWinFilename)
         .join(path.sep);
       const destDir = path.join(targetRoot, safeFolder);
-      fs.mkdirSync(destDir, { recursive: true });
+      if (!fs.existsSync(destDir)) {
+        fs.mkdirSync(destDir, { recursive: true });
+        createdDirs.add(destDir);
+      }
 
-      const cleanName = sanitizeWinFilename(item.filename);
-      const destPath = path.join(destDir, cleanName);
+      const rawCleanName = sanitizeWinFilename(item.filename);
+      let correctedName = resolvePreferredFilenameCjs(rawCleanName, item.extension);
+      let destPath = resolveUniqueDestPath(destDir, correctedName);
 
       // Guard against overwriting an active source file in-place
       if (item.devicePath && path.resolve(item.devicePath).toLowerCase() === path.resolve(destPath).toLowerCase()) {
+        failures.push({ filename: item.filename, reason: 'Skipped to prevent overwriting active source file.' });
         continue;
       }
 
       const partialPath = `${destPath}.partial`;
 
       if (item.sourceKind === 'memory' && item.memoryBytes) {
-        fs.writeFileSync(partialPath, Buffer.from(item.memoryBytes));
-        if (item.modifiedAtMs) {
-          const dt = new Date(item.modifiedAtMs);
-          try {
-            fs.utimesSync(partialPath, dt, dt);
-          } catch {
-            // ignore timestamp error
+        try {
+          const memBuf = Buffer.from(item.memoryBytes);
+          const magicExt = detectMagicExtFromHeadCjs(memBuf);
+          if (magicExt) {
+            correctedName = resolvePreferredFilenameCjs(correctedName, magicExt);
+            destPath = resolveUniqueDestPath(destDir, correctedName);
           }
+          fs.writeFileSync(partialPath, memBuf);
+          if (item.modifiedAtMs) {
+            const dt = new Date(item.modifiedAtMs);
+            try {
+              fs.utimesSync(partialPath, dt, dt);
+            } catch {
+              // ignore timestamp error
+            }
+          }
+          fs.renameSync(partialPath, destPath);
+          savedCount++;
+          verifiedCount++;
+          reportLines.push(`OK\t${memBuf.length}\tMEM\t${correctedName}\t${destPath}`);
+        } catch (err) {
+          failures.push({ filename: item.filename, reason: err?.message || 'Memory write failed' });
         }
-        fs.renameSync(partialPath, destPath);
-        savedCount++;
         continue;
       }
 
-      if (!item.devicePath) continue;
-      const srcFd = fs.openSync(item.devicePath, 'r');
-      const dstFd = fs.openSync(partialPath, 'w');
+      if (!item.devicePath) {
+        failures.push({ filename: item.filename, reason: 'Missing source device path.' });
+        continue;
+      }
+
+      if (item.sourceKind === 'native-tsk' && item.tskInode) {
+        try {
+          const tskRes = await extractTskInodeToFile(item.devicePath, item.tskOffset || 0, item.tskInode, partialPath);
+          if (!tskRes.ok) {
+            try {
+              if (fs.existsSync(partialPath)) fs.unlinkSync(partialPath);
+            } catch {
+              // ignore cleanup
+            }
+            failures.push({ filename: item.filename, reason: tskRes.error || 'Sleuth Kit icat returned 0 bytes' });
+            continue;
+          }
+          const headFd = fs.openSync(partialPath, 'r');
+          try {
+            const headBuf = Buffer.allocUnsafe(Math.min(65536, tskRes.bytesWritten));
+            const hRead = fs.readSync(headFd, headBuf, 0, headBuf.length, 0);
+            const magicExt = detectMagicExtFromHeadCjs(headBuf.subarray(0, hRead));
+            if (magicExt) {
+              correctedName = resolvePreferredFilenameCjs(correctedName, magicExt);
+              destPath = resolveUniqueDestPath(destDir, correctedName);
+            }
+          } finally {
+            fs.closeSync(headFd);
+          }
+          if (item.modifiedAtMs) {
+            const dt = new Date(item.modifiedAtMs);
+            try {
+              fs.utimesSync(partialPath, dt, dt);
+            } catch {
+              // ignore timestamp error
+            }
+          }
+          fs.renameSync(partialPath, destPath);
+          savedCount++;
+          verifiedCount++;
+          reportLines.push(`OK(TSK)\t${tskRes.bytesWritten}\tINODE:${item.tskInode}\t${correctedName}\t${destPath}`);
+        } catch (err) {
+          failures.push({ filename: item.filename, reason: err?.message || 'TSK extraction failed' });
+        }
+        continue;
+      }
+
+      let srcFd;
+      let dstFd;
       let committed = false;
       try {
+        srcFd = fs.openSync(item.devicePath, 'r');
+        dstFd = fs.openSync(partialPath, 'w');
         const lastTwo = [0, 0];
+        const headChunks = [];
         if (item.sourceKind === 'native-runs' && Array.isArray(item.runs) && item.runs.length > 0) {
           for (const run of item.runs) {
-            streamExtent(srcFd, dstFd, run.offset, run.length, true, lastTwo);
+            streamExtent(srcFd, dstFd, run.offset, run.length, true, lastTwo, headChunks);
           }
         } else {
-          streamExtent(srcFd, dstFd, item.offset || 0, item.size || 0, item.sourceKind === 'native-device', lastTwo);
+          streamExtent(
+            srcFd,
+            dstFd,
+            item.offset || 0,
+            item.size || 0,
+            item.sourceKind === 'native-device',
+            lastTwo,
+            headChunks,
+          );
         }
 
-        if (item.repairIfTruncated && (item.extension === 'jpg' || item.extension === 'jpeg')) {
-          if (lastTwo[0] !== 0xff || lastTwo[1] !== 0xd9) {
+        const headMerged = headChunks.length > 0 ? Buffer.concat(headChunks) : Buffer.alloc(0);
+        const magicExt = detectMagicExtFromHeadCjs(headMerged);
+        if (magicExt) {
+          const nextName = resolvePreferredFilenameCjs(correctedName, magicExt);
+          if (nextName !== correctedName) {
+            correctedName = nextName;
+            destPath = resolveUniqueDestPath(destDir, correctedName);
+          }
+        }
+
+        let crcStatus = 'N/A';
+        if (item.discoveryCrc32 && headMerged.length > 0) {
+          const liveCrc = computeCrc32Cjs(headMerged, 65536);
+          if (liveCrc === item.discoveryCrc32) {
+            verifiedCount++;
+            crcStatus = `MATCH:${liveCrc.toString(16).padStart(8, '0')}`;
+          } else {
+            crcStatus = `MISMATCH:${liveCrc.toString(16).padStart(8, '0')}`;
+            failures.push({
+              filename: correctedName,
+              reason: 'Discovery CRC-32 mismatch (source sectors changed between scan and recovery).',
+            });
+          }
+        } else {
+          verifiedCount++;
+        }
+
+        const effectiveExt = path.extname(correctedName).replace(/^\./, '').toLowerCase() || String(item.extension || '').toLowerCase();
+        if (item.repairIfTruncated && (effectiveExt === 'jpg' || effectiveExt === 'jpeg')) {
+          if (fs.statSync(partialPath).size <= 64 * 1024 * 1024) {
+            fs.closeSync(dstFd);
+            const jRes = repairJpegBufferCjs(fs.readFileSync(partialPath));
+            if (jRes && jRes.data) {
+              fs.writeFileSync(partialPath, jRes.data);
+              repairedCount++;
+            }
+            dstFd = fs.openSync(partialPath, 'r+');
+          } else if (lastTwo[0] !== 0xff || lastTwo[1] !== 0xd9) {
             fs.writeSync(dstFd, Buffer.from([0xff, 0xd9]));
             repairedCount++;
           }
+        } else if (item.repairIfTruncated && effectiveExt === 'png' && fs.statSync(partialPath).size <= 64 * 1024 * 1024) {
+          fs.closeSync(dstFd);
+          const pRes = repairPngBufferCjs(fs.readFileSync(partialPath));
+          if (pRes && pRes.data) {
+            fs.writeFileSync(partialPath, pRes.data);
+            repairedCount++;
+          }
+          dstFd = fs.openSync(partialPath, 'r+');
         } else if (
           item.repairIfTruncated &&
-          ['mp4', 'mov', 'm4v'].includes(String(item.extension || '').toLowerCase()) &&
-          item.size <= 128 * 1024 * 1024
+          ['mp4', 'mov', 'm4v', '3gp', 'mkv', 'avi'].includes(effectiveExt)
         ) {
           fs.closeSync(dstFd);
-          const rawBuf = fs.readFileSync(partialPath);
-          const rebuilt = repairTruncatedMp4BufferCjs(rawBuf);
-          if (rebuilt) {
-            fs.writeFileSync(partialPath, rebuilt);
-            repairedCount++;
+          let didRepair = false;
+          if (['mp4', 'mov', 'm4v', '3gp'].includes(effectiveExt)) {
+            const streamTmp = `${partialPath}.moov.${effectiveExt}`;
+            const sRes = repairMp4StreamingFileCjs(partialPath, streamTmp);
+            if (sRes && sRes.ok && fs.existsSync(streamTmp)) {
+              try {
+                fs.unlinkSync(partialPath);
+              } catch {
+                // ignore
+              }
+              fs.renameSync(streamTmp, partialPath);
+              repairedCount++;
+              didRepair = true;
+            } else if (fs.existsSync(streamTmp)) {
+              try { fs.unlinkSync(streamTmp); } catch { /* ignore */ }
+            }
+          } else if (effectiveExt === 'avi' && fs.statSync(partialPath).size <= 192 * 1024 * 1024) {
+            const aRes = repairAviBufferCjs(fs.readFileSync(partialPath));
+            if (aRes && aRes.data) {
+              fs.writeFileSync(partialPath, aRes.data);
+              repairedCount++;
+              didRepair = true;
+            }
+          }
+          if (!didRepair && getEngineCapabilitiesSync().ffmpeg) {
+            const remuxTmp = `${partialPath}.remux.${effectiveExt}`;
+            const ffRes = await ffmpegRepairVideoFile(partialPath, remuxTmp, {
+              extension: effectiveExt,
+              allowTranscode: true,
+            });
+            if (ffRes && ffRes.ok) {
+              try {
+                fs.unlinkSync(partialPath);
+              } catch {
+                // ignore
+              }
+              fs.renameSync(remuxTmp, partialPath);
+              repairedCount++;
+            } else if (fs.existsSync(remuxTmp)) {
+              try {
+                fs.unlinkSync(remuxTmp);
+              } catch {
+                // ignore
+              }
+            }
           }
           if (item.modifiedAtMs) {
             const dt = new Date(item.modifiedAtMs);
@@ -2271,6 +2761,7 @@ app.whenReady().then(() => {
           fs.renameSync(partialPath, destPath);
           committed = true;
           savedCount++;
+          reportLines.push(`OK\t${item.size}\t${crcStatus}\t${correctedName}\t${destPath}`);
           continue;
         }
 
@@ -2287,13 +2778,24 @@ app.whenReady().then(() => {
         fs.renameSync(partialPath, destPath);
         committed = true;
         savedCount++;
+        reportLines.push(`OK\t${item.size}\t${crcStatus}\t${correctedName}\t${destPath}`);
+      } catch (err) {
+        failures.push({ filename: item.filename, reason: err?.message || 'Read/write failure' });
       } finally {
-        fs.closeSync(srcFd);
-        if (!committed) {
+        if (srcFd !== undefined) {
           try {
-            fs.closeSync(dstFd);
+            fs.closeSync(srcFd);
           } catch {
-            // already closed
+            // ignore
+          }
+        }
+        if (!committed) {
+          if (dstFd !== undefined) {
+            try {
+              fs.closeSync(dstFd);
+            } catch {
+              // already closed
+            }
           }
           try {
             if (fs.existsSync(partialPath)) fs.unlinkSync(partialPath);
@@ -2304,7 +2806,50 @@ app.whenReady().then(() => {
       }
     }
 
-    return { canceled: false, savedCount, destinationDir: targetRoot, repairedCount };
+    let reportPath;
+    if (savedCount > 0) {
+      reportPath = path.join(targetRoot, 'TestDisk-Recovery-Report.txt');
+      const header = [
+        'TestDisk & PhotoRec Recovery Suite — Audit Report',
+        `Generated: ${new Date().toISOString()}`,
+        `Destination: ${targetRoot}`,
+        `Saved: ${savedCount} | Verified: ${verifiedCount} | Repaired: ${repairedCount} | Warnings/Failures: ${failures.length}`,
+        '',
+        'STATUS\tSIZE_BYTES\tVERIFICATION\tFILENAME\tSAVED_PATH',
+        ...reportLines,
+      ];
+      if (failures.length > 0) {
+        header.push('', 'WARNINGS / FAILURES:');
+        for (const f of failures) header.push(`- ${f.filename}: ${f.reason}`);
+      }
+      try {
+        fs.writeFileSync(reportPath, header.join(os.EOL), 'utf8');
+      } catch {
+        reportPath = undefined;
+      }
+    } else {
+      // Zero-byte / failed recovery cleanup: remove any empty directories we created
+      const sortedDirs = [...createdDirs].sort((a, b) => b.length - a.length);
+      for (const dir of sortedDirs) {
+        try {
+          if (fs.existsSync(dir) && fs.readdirSync(dir).length === 0) {
+            fs.rmdirSync(dir);
+          }
+        } catch {
+          // ignore cleanup errors
+        }
+      }
+    }
+
+    return {
+      canceled: false,
+      savedCount,
+      verifiedCount,
+      destinationDir: targetRoot,
+      repairedCount,
+      reportPath,
+      failures,
+    };
   });
 
   ipcMain.handle('win:save-text-report', async (_event, { defaultName, title, filters, content }) => {

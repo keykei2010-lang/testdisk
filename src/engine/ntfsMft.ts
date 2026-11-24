@@ -486,3 +486,63 @@ export function scanNtfsMftRecordsInBuffer(
 
   return results;
 }
+
+export function extractNtfsAllocatedChecker(
+  diskBytes: Uint8Array,
+  partitions: PartitionEntry[],
+): ((offset: number) => boolean) | undefined {
+  const regions: { volStart: number; volEnd: number; clusterBytes: number; bitmap: Uint8Array }[] = [];
+
+  for (let off = 0; off + 1024 <= diskBytes.length; off += 512) {
+    if (
+      diskBytes[off] !== 0x46 ||
+      diskBytes[off + 1] !== 0x49 ||
+      diskBytes[off + 2] !== 0x4c ||
+      diskBytes[off + 3] !== 0x45
+    ) {
+      continue;
+    }
+    const parsed = parseSingleMftRecord(diskBytes.subarray(off, off + 1024), true);
+    if (!parsed || !parsed.usaValid) continue;
+    if (parsed.recordNumber !== 6 || parsed.filename !== '$Bitmap') continue;
+
+    const lba = Math.floor(off / 512);
+    const part = partitions.find((p) => lba >= p.startLba && lba <= p.endLba);
+    if (!part) continue;
+    const volStart = part.startOffset;
+    const volEnd = part.startOffset + part.sizeBytes;
+    const clusterBytes = readNtfsBootClusterSize(diskBytes, volStart);
+
+    if (parsed.residentData && parsed.residentData.length > 0) {
+      regions.push({ volStart, volEnd, clusterBytes, bitmap: parsed.residentData });
+    } else if (parsed.runs.length > 0 && parsed.fileSize > 0) {
+      const bmSize = Math.min(parsed.fileSize, 4 * 1024 * 1024);
+      const bm = new Uint8Array(bmSize);
+      let cursor = 0;
+      for (const r of parsed.runs) {
+        if (cursor >= bm.length) break;
+        const take = Math.min(r.clusterCount * clusterBytes, bm.length - cursor);
+        if (r.lcn >= 0) {
+          const byteStart = volStart + r.lcn * clusterBytes;
+          if (byteStart + take <= diskBytes.length) {
+            bm.set(diskBytes.subarray(byteStart, byteStart + take), cursor);
+          }
+        }
+        cursor += take;
+      }
+      regions.push({ volStart, volEnd, clusterBytes, bitmap: bm });
+    }
+  }
+
+  if (regions.length === 0) return undefined;
+  return (offset: number) => {
+    for (const r of regions) {
+      if (offset >= r.volStart && offset < r.volEnd) {
+        const lcn = Math.floor((offset - r.volStart) / r.clusterBytes);
+        const bIdx = lcn >>> 3;
+        return bIdx < r.bitmap.length && (r.bitmap[bIdx] & (1 << (lcn & 7))) !== 0;
+      }
+    }
+    return false;
+  };
+}

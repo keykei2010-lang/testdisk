@@ -9,9 +9,44 @@ const {
   step = 512,
   workerIndex = 0,
   ctrlBuffer,
+  unallocatedOnly = false,
+  allocatedBitmaps = [],
 } = workerData;
 
 const ctrl = ctrlBuffer ? new Int32Array(ctrlBuffer) : null;
+
+const CRC32_TABLE = new Uint32Array(256);
+for (let n = 0; n < 256; n++) {
+  let c = n;
+  for (let k = 0; k < 8; k++) {
+    c = (c & 1) !== 0 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
+  }
+  CRC32_TABLE[n] = c >>> 0;
+}
+
+function computeCrc32Buf(buf, len) {
+  let crc = 0xffffffff;
+  const end = Math.min(buf.length, len);
+  for (let i = 0; i < end; i++) {
+    crc = CRC32_TABLE[(crc ^ buf[i]) & 0xff] ^ (crc >>> 8);
+  }
+  return (crc ^ 0xffffffff) >>> 0;
+}
+
+function isOffsetAllocated(absOffset) {
+  if (!unallocatedOnly || !allocatedBitmaps || allocatedBitmaps.length === 0) return false;
+  for (const bmInfo of allocatedBitmaps) {
+    if (absOffset >= bmInfo.volStart && absOffset < bmInfo.volEnd) {
+      const lcn = Math.floor((absOffset - bmInfo.volStart) / bmInfo.clusterBytes);
+      const bIdx = lcn >>> 3;
+      if (bIdx < bmInfo.bitmap.length) {
+        return (bmInfo.bitmap[bIdx] & (1 << (lcn & 7))) !== 0;
+      }
+      return false;
+    }
+  }
+  return false;
+}
 
 function isSectorAllZero(buf, offset) {
   // Fast 64-bit check: bail out immediately on first non-zero 8-byte lane
@@ -283,6 +318,12 @@ async function runWorker() {
 
       while (local + 16 <= n) {
         if (ctrl && Atomics.load(ctrl, 0) === 2) break;
+        const absOffset = cursor + local;
+
+        if (unallocatedOnly && isOffsetAllocated(absOffset)) {
+          local += step;
+          continue;
+        }
 
         // 64-bit zero-sector skip for multi-TB throughput
         if (step >= 512 && local + 512 <= n && isSectorAllZero(chunkBuf, local)) {
@@ -295,7 +336,6 @@ async function runWorker() {
         const b2 = chunkBuf[local + 2];
         const b3 = chunkBuf[local + 3];
         const b4 = chunkBuf[local + 4];
-        const absOffset = cursor + local;
 
         let matchedExt = null;
         let measured = null;
@@ -410,6 +450,7 @@ async function runWorker() {
           const headerLen = Math.min(65536, measured.size);
           const hdrSample = Buffer.allocUnsafe(headerLen);
           const hRead = fs.readSync(fd, hdrSample, 0, headerLen, absOffset);
+          const discoveryCrc32 = computeCrc32Buf(hdrSample, hRead);
 
           batch.push({
             id: `drv-${absOffset}-${matchedExt}`,
@@ -426,6 +467,7 @@ async function runWorker() {
             offset: absOffset,
             sector: Math.floor(absOffset / 512),
             devicePath,
+            discoveryCrc32,
             headerSample: new Uint8Array(hdrSample.buffer, hdrSample.byteOffset, hRead),
           });
           fileSeq++;

@@ -3,12 +3,17 @@ const { contextBridge, ipcRenderer } = require('electron');
 contextBridge.exposeInMainWorld('desktopBridge', {
   isDesktop: true,
   platform: process.platform,
+  getEngineCapabilities: () => ipcRenderer.invoke('win:get-engine-capabilities'),
+  relaunchAsAdmin: () => ipcRenderer.invoke('win:relaunch-admin'),
   listWindowsDrives: () => ipcRenderer.invoke('win:list-drives'),
   listWindowsVolumes: () => ipcRenderer.invoke('win:list-volumes'),
   listBitLockerVolumes: () => ipcRenderer.invoke('win:list-bitlocker'),
   unlockBitLocker: (params) => ipcRenderer.invoke('win:unlock-bitlocker', params),
-  readDiskBytes: (devicePath, startByte, maxBytes) =>
-    ipcRenderer.invoke('win:read-disk-bytes', { devicePath, startByte, maxBytes }),
+  readDiskBytes: (devicePath, startByte, maxBytes, tskInode, tskOffset) =>
+    ipcRenderer.invoke('win:read-disk-bytes', { devicePath, startByte, maxBytes, tskInode, tskOffset }),
+  probeVideoPreview: (params) => ipcRenderer.invoke('win:probe-video-preview', params),
+  repairMediaFile: (params) => ipcRenderer.invoke('win:repair-media-file', params),
+  identifyFilesNative: (filePaths) => ipcRenderer.invoke('win:identify-files', filePaths),
   pickDiskImage: () => ipcRenderer.invoke('win:pick-disk-image'),
   pickFolder: () => ipcRenderer.invoke('win:pick-folder'),
   scanFolder: (folderPath) => ipcRenderer.invoke('win:scan-folder', folderPath),

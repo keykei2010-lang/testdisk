@@ -2,6 +2,7 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
   Archive,
   ArrowLeft,
+  ArrowRight,
   ArrowUp,
   Check,
   CheckCircle2,
@@ -11,6 +12,7 @@ import {
   Eye,
   FileCode,
   FileQuestion,
+  FileSpreadsheet,
   FileText,
   Film,
   Filter,
@@ -28,6 +30,7 @@ import {
   RotateCcw,
   Save,
   Search,
+  Shield,
   ShieldAlert,
   Square,
   Upload,
@@ -49,7 +52,9 @@ import {
 } from './engine/signatures';
 import {
   DeletedFilter,
+  EngineCapabilities,
   ExplorerFileItem,
+  GridThumbSize,
   GroupByKey,
   itemMatchesNode,
   RecoveryLikelihoodTier,
@@ -63,14 +68,16 @@ import {
   treeNodeKey,
 } from './engine/explorerTypes';
 import {
+  buildCsvReport,
   computeContentFingerprint,
   computeRecoveryLikelihood,
   deriveCarvedTimestamp,
   formatShortDate,
   repairFileBuffer,
+  resolvePreferredExtension,
 } from './engine/recoveryHealth';
 import { formatBytes } from './engine/crc32';
-import { scanNtfsMftRecordsInBuffer } from './engine/ntfsMft';
+import { extractNtfsAllocatedChecker, scanNtfsMftRecordsInBuffer } from './engine/ntfsMft';
 import { scanFatAndExfatDeletedInBuffer } from './engine/fatExfat';
 import { buildDfxmlReport } from './engine/dfxml';
 import { useMediaUrl } from './utils/useMediaUrl';
@@ -168,7 +175,7 @@ function inferFallbackFromExt(ext: string): {
 
 interface ThumbnailProps {
   item: ExplorerFileItem;
-  size?: 'sm' | 'lg';
+  size?: 'sm' | 'md' | 'lg' | 'xl';
 }
 
 const FileThumbnail: React.FC<ThumbnailProps> = ({ item, size = 'sm' }) => {
@@ -185,8 +192,22 @@ const FileThumbnail: React.FC<ThumbnailProps> = ({ item, size = 'sm' }) => {
   });
   const [failedUrl, setFailedUrl] = useState<string | null>(null);
 
-  const boxClass = size === 'lg' ? 'w-16 h-16' : 'w-7 h-7';
-  const iconClass = size === 'lg' ? 'w-7 h-7' : 'w-4 h-4';
+  const boxClass =
+    size === 'xl'
+      ? 'w-24 h-24'
+      : size === 'lg'
+        ? 'w-16 h-16'
+        : size === 'md'
+          ? 'w-12 h-12'
+          : 'w-7 h-7';
+  const iconClass =
+    size === 'xl'
+      ? 'w-9 h-9'
+      : size === 'lg'
+        ? 'w-7 h-7'
+        : size === 'md'
+          ? 'w-5 h-5'
+          : 'w-4 h-4';
 
   if (isPicture && imgUrl && failedUrl !== imgUrl) {
     return (
@@ -319,6 +340,10 @@ export const App: React.FC = () => {
   const [likelihoodFilter, setLikelihoodFilter] = useState<'all' | RecoveryLikelihoodTier>('all');
   const [sizeFilter, setSizeFilter] = useState<'all' | 'small' | 'medium' | 'large'>('all');
   const [hideDuplicates, setHideDuplicates] = useState<boolean>(false);
+  const [unallocatedOnly, setUnallocatedOnly] = useState<boolean>(false);
+  const [gridThumbSize, setGridThumbSize] = useState<GridThumbSize>('md');
+  const [capabilities, setCapabilities] = useState<EngineCapabilities | null>(null);
+  const [scannedDevicePath, setScannedDevicePath] = useState<string | null>(null);
   const [enabledFormats, setEnabledFormats] = useState<Set<string>>(
     () => new Set(FILE_FORMATS.filter((f) => f.enableByDefault).map((f) => f.id)),
   );
@@ -368,6 +393,31 @@ export const App: React.FC = () => {
   const unknownInputRef = useRef<HTMLInputElement>(null);
   const folderInputRef = useRef<HTMLInputElement>(null);
   const sessionInputRef = useRef<HTMLInputElement>(null);
+  const searchInputRef = useRef<HTMLInputElement>(null);
+
+  useEffect(() => {
+    const bridge = getDesktopBridge();
+    if (!bridge) return;
+    let active = true;
+    bridge
+      .getEngineCapabilities()
+      .then((caps) => {
+        if (active) setCapabilities(caps);
+      })
+      .catch(() => {});
+    return () => {
+      active = false;
+    };
+  }, []);
+
+  const handleRelaunchAsAdmin = useCallback(async () => {
+    const bridge = getDesktopBridge();
+    if (!bridge) return;
+    const res = await bridge.relaunchAsAdmin();
+    if (!res.ok && res.error) {
+      setLoadError(res.error);
+    }
+  }, []);
 
   const analysis = useMemo(
     () => analyzeDiskImage(diskName, diskBytes),
@@ -466,6 +516,7 @@ export const App: React.FC = () => {
         recoveryTier: assessment.tier,
         recoveryReason: assessment.reason,
         contentFingerprint: computeContentFingerprint(c.size, c.data),
+        discoveryCrc32: c.discoveryCrc32,
       };
     };
 
@@ -649,6 +700,9 @@ export const App: React.FC = () => {
       setScanPhase('deep');
       const stage1Offsets = new Set(stage1Items.map((i) => i.offset).filter((o) => o > 0));
       const stage1Bytes = stage1Items.reduce((s, x) => s + x.size, 0);
+      const allocatedChecker = unallocatedOnly
+        ? extractNtfsAllocatedChecker(diskBytes, analysis.partitions)
+        : undefined;
 
       const results = await carveDiskBufferAsync(
         diskBytes,
@@ -658,6 +712,8 @@ export const App: React.FC = () => {
           blockSize,
           paranoid,
           keepCorrupted,
+          unallocatedOnly,
+          allocatedChecker,
           enabledFormats,
         },
         (prog) => {
@@ -714,6 +770,7 @@ export const App: React.FC = () => {
     blockSize,
     paranoid,
     keepCorrupted,
+    unallocatedOnly,
     enabledFormats,
     scanNonce,
     scanMode,
@@ -757,7 +814,7 @@ export const App: React.FC = () => {
     }
   };
 
-  const handleNavBack = () => {
+  const handleNavBack = useCallback(() => {
     if (navIndex <= 0) return;
     const nextIdx = navIndex - 1;
     const target = navHistory[nextIdx];
@@ -768,7 +825,20 @@ export const App: React.FC = () => {
     } else {
       setTreeMode('path');
     }
-  };
+  }, [navIndex, navHistory]);
+
+  const handleNavForward = useCallback(() => {
+    if (navIndex >= navHistory.length - 1) return;
+    const nextIdx = navIndex + 1;
+    const target = navHistory[nextIdx];
+    setNavIndex(nextIdx);
+    setSelectedNode(target);
+    if (target.kind === 'all-types' || target.kind === 'family' || target.kind === 'ext') {
+      setTreeMode('type');
+    } else {
+      setTreeMode('path');
+    }
+  }, [navIndex, navHistory]);
 
   const handleNavUp = () => {
     if (selectedNode.kind === 'ext') {
@@ -803,6 +873,7 @@ export const App: React.FC = () => {
     if (bytes.length === 0) return;
     setActiveScreen('explorer');
     setUseNativeScan(false);
+    setScannedDevicePath(null);
     nativeDriveTargetRef.current = null;
     isPausedRef.current = false;
     setIsPaused(false);
@@ -921,25 +992,30 @@ export const App: React.FC = () => {
         description,
         data: sample,
         sourceRef: {
-          kind: isMftItem
-            ? entry.runs && entry.runs.length > 0
-              ? 'native-runs'
-              : entry.mftResident
-                ? 'memory'
-                : 'native-device'
-            : entry.sourceKind === 'carved'
-              ? 'native-device'
-              : 'native-file',
+          kind: entry.tskInode
+            ? 'native-tsk'
+            : isMftItem
+              ? entry.runs && entry.runs.length > 0
+                ? 'native-runs'
+                : entry.mftResident
+                  ? 'memory'
+                  : 'native-device'
+              : entry.sourceKind === 'carved'
+                ? 'native-device'
+                : 'native-file',
           devicePath: entry.devicePath,
           offset: entry.offset,
           size: entry.size,
           runs: entry.runs,
+          tskInode: entry.tskInode,
+          tskOffset: entry.tskOffset,
         },
         modifiedAt: res?.metadata.takenAtMs ?? (entry.modifiedAt || Date.now()),
         recoveryChance: assessment.chance,
         recoveryTier: assessment.tier,
         recoveryReason: assessment.reason,
         contentFingerprint: computeContentFingerprint(entry.size, sample),
+        discoveryCrc32: entry.discoveryCrc32,
       };
     },
     [mapOffsetToPartition],
@@ -984,6 +1060,7 @@ export const App: React.FC = () => {
     const scanId = `scan-${Date.now()}`;
     activeNativeScanIdRef.current = scanId;
     nativeDriveTargetRef.current = { devicePath, totalBytes, label };
+    setScannedDevicePath(devicePath);
 
     setActiveScreen('explorer');
     setUseNativeScan(true);
@@ -1049,6 +1126,7 @@ export const App: React.FC = () => {
         blockSize,
         scanMode: effectiveMode,
         startPhase: effectiveStartPhase,
+        unallocatedOnly,
         includeExisting: true,
       });
       if (activeNativeScanIdRef.current !== scanId) return;
@@ -1398,13 +1476,39 @@ export const App: React.FC = () => {
   const handleInspectUnknownFiles = async (files: FileList | File[]) => {
     const list = Array.from(files);
     if (list.length === 0) return;
+    const bridge = getDesktopBridge();
+    const unknownPaths: string[] = [];
+    const staged: { file: File; buf: Uint8Array; res: ReturnType<typeof identifyBuffer>; nativePath?: string }[] = [];
+
+    for (const file of list) {
+      const readCap = Math.min(file.size, 32 * 1024 * 1024);
+      const buf = new Uint8Array(await file.slice(0, readCap).arrayBuffer());
+      const res = identifyBuffer(buf);
+      const nativePath = (file as File & { path?: string }).path;
+      if (!res && bridge && nativePath) {
+        unknownPaths.push(nativePath);
+      }
+      staged.push({ file, buf, res, nativePath });
+    }
+
+    let nativeIdMap: Record<string, string> = {};
+    if (bridge && unknownPaths.length > 0) {
+      nativeIdMap = await bridge.identifyFilesNative(unknownPaths).catch(() => ({}));
+    }
 
     const added: ExplorerFileItem[] = [];
-    for (const file of list) {
-      const buf = new Uint8Array(await file.slice(0, 65536).arrayBuffer());
-      const res = identifyBuffer(buf);
+    for (const { file, buf, res, nativePath } of staged) {
+      const nativeExt = nativePath ? nativeIdMap[nativePath] : undefined;
+      const detectedExt = res?.extension || (nativeExt && nativeExt !== 'unknown' ? nativeExt : undefined);
+      const fallback = detectedExt ? inferFallbackFromExt(detectedExt) : null;
       const sampledFull = file.size <= buf.length;
-      const status = res ? (sampledFull ? res.status : 'OK') : 'UNKNOWN';
+      const status = res
+        ? sampledFull
+          ? res.status
+          : 'OK'
+        : detectedExt
+          ? 'OK'
+          : 'UNKNOWN';
       const calculatedSize = sampledFull ? (res?.calculatedSize ?? null) : file.size;
       const assessment = computeRecoveryLikelihood({
         status,
@@ -1412,15 +1516,20 @@ export const App: React.FC = () => {
         calculatedSize,
         partitionId: 'fidentify',
         metadata: res?.metadata ?? {},
-        extension: res?.extension ?? 'unknown',
+        extension: detectedExt ?? 'unknown',
         data: buf,
       });
+      const resolvedExt = detectedExt ?? 'unknown';
+      const preferredName =
+        resolvedExt !== 'unknown'
+          ? resolvePreferredExtension(file.name, resolvedExt)
+          : file.name;
       added.push({
         id: `fid-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
-        filename: file.name,
-        extension: res?.extension ?? 'unknown',
-        family: res?.family ?? 'Others',
-        mimeType: res?.mimeType ?? 'application/octet-stream',
+        filename: preferredName,
+        extension: resolvedExt,
+        family: res?.family ?? fallback?.family ?? 'Others',
+        mimeType: res?.mimeType ?? fallback?.mimeType ?? 'application/octet-stream',
         size: file.size,
         calculatedSize,
         status,
@@ -1431,8 +1540,15 @@ export const App: React.FC = () => {
         sector: 0,
         matchedOffset: res?.matchedOffset ?? 0,
         matchedLength: res?.matchedLength ?? 0,
-        metadata: res?.metadata ?? { details: 'Unrecognized binary header' },
-        description: res?.description ?? 'Unrecognized binary signature',
+        metadata: res?.metadata ?? {
+          details: detectedExt
+            ? `Identified via bundled PhotoRec fidentify (.${detectedExt})`
+            : 'Unrecognized binary header',
+        },
+        description:
+          res?.description ??
+          fallback?.description ??
+          'Unrecognized binary signature',
         data: buf,
         sourceRef: {
           kind: 'browser-file',
@@ -1443,7 +1559,9 @@ export const App: React.FC = () => {
         modifiedAt: res?.metadata.takenAtMs ?? (file.lastModified || Date.now()),
         recoveryChance: assessment.chance,
         recoveryTier: assessment.tier,
-        recoveryReason: assessment.reason,
+        recoveryReason: detectedExt && !res
+          ? `Identified via PhotoRec fidentify (.${detectedExt})`
+          : assessment.reason,
         contentFingerprint: computeContentFingerprint(file.size, buf),
       });
     }
@@ -1472,17 +1590,73 @@ export const App: React.FC = () => {
     );
   };
 
-  const handleRepairFile = (target: ExplorerFileItem, referenceBytes?: Uint8Array) => {
-    const res = repairFileBuffer(target.extension, target.data, referenceBytes);
-    if (!res.repaired) return;
+  const handleRepairFile = async (
+    target: ExplorerFileItem,
+    referenceBytes?: Uint8Array,
+  ): Promise<void> => {
+    let sourceBytes = target.data;
+    if (
+      target.sourceRef?.browserFile &&
+      sourceBytes.length < target.sourceRef.browserFile.size
+    ) {
+      sourceBytes = new Uint8Array(await target.sourceRef.browserFile.arrayBuffer());
+    }
+
+    const bridge = getDesktopBridge();
+    let repairedData: Uint8Array | null = null;
+    let repairNote = '';
+
+    if (bridge) {
+      const isNative =
+        target.sourceRef &&
+        ['native-device', 'native-runs', 'native-file', 'native-tsk'].includes(
+          target.sourceRef.kind,
+        );
+      const ipcRes = await bridge
+        .repairMediaFile({
+          filename: target.filename,
+          extension: target.extension,
+          sourceKind: isNative ? (target.sourceRef?.kind as 'native-file') : 'memory',
+          filePath:
+            target.sourceRef?.kind === 'native-file'
+              ? target.sourceRef.devicePath
+              : undefined,
+          devicePath: target.sourceRef?.devicePath,
+          offset: target.sourceRef?.offset,
+          size: target.sourceRef?.size,
+          runs: target.sourceRef?.runs,
+          tskInode: target.sourceRef?.tskInode,
+          tskOffset: target.sourceRef?.tskOffset,
+          buffer: isNative ? undefined : sourceBytes,
+          referenceBuffer: referenceBytes,
+          allowTranscodeFallback: true,
+        })
+        .catch(() => null);
+
+      if (ipcRes?.ok && ipcRes.repairedBytes) {
+        repairedData =
+          ipcRes.repairedBytes instanceof Uint8Array
+            ? ipcRes.repairedBytes
+            : new Uint8Array(ipcRes.repairedBytes);
+        repairNote = ipcRes.note;
+      }
+    }
+
+    if (!repairedData) {
+      const rep = repairFileBuffer(target.extension, sourceBytes, referenceBytes);
+      if (!rep.repaired) return;
+      repairedData = rep.data;
+      repairNote = rep.note;
+    }
+
     const assessment = computeRecoveryLikelihood({
       status: 'OK',
-      size: res.data.length,
-      calculatedSize: res.data.length,
+      size: repairedData.length,
+      calculatedSize: repairedData.length,
       partitionId: target.partitionId,
       metadata: target.metadata,
       extension: target.extension,
-      data: res.data,
+      data: repairedData,
       repaired: true,
     });
     const updater = (list: ExplorerFileItem[]) =>
@@ -1490,14 +1664,19 @@ export const App: React.FC = () => {
         item.id === target.id
           ? {
               ...item,
-              data: res.data,
-              size: res.data.length,
-              calculatedSize: res.data.length,
+              data: repairedData!,
+              size: repairedData!.length,
+              calculatedSize: repairedData!.length,
               status: 'OK' as const,
               repaired: true,
+              sourceRef: {
+                kind: 'memory' as const,
+                offset: 0,
+                size: repairedData!.length,
+              },
               recoveryChance: assessment.chance,
               recoveryTier: assessment.tier,
-              recoveryReason: res.note,
+              recoveryReason: repairNote,
             }
           : item,
       );
@@ -1519,24 +1698,31 @@ export const App: React.FC = () => {
 
   const handleDownloadSingleFile = async (item: ExplorerFileItem) => {
     const bridge = getDesktopBridge();
+    const outName = resolvePreferredExtension(item.filename, item.extension);
     if (
+      !item.repaired &&
       bridge &&
       item.sourceRef &&
       (item.sourceRef.kind === 'native-device' ||
         item.sourceRef.kind === 'native-runs' ||
-        item.sourceRef.kind === 'native-file')
+        item.sourceRef.kind === 'native-file' ||
+        item.sourceRef.kind === 'native-tsk')
     ) {
       await bridge.recoverFilesToFolder({
         destinationDir: null,
+        scannedDevicePath: scannedDevicePath ?? undefined,
         items: [
           {
-            filename: item.filename,
+            filename: outName,
             folder: item.family,
             sourceKind: item.sourceRef.kind,
             devicePath: item.sourceRef.devicePath,
             offset: item.sourceRef.offset,
             size: item.sourceRef.size,
             runs: item.sourceRef.runs,
+            tskInode: item.sourceRef.tskInode,
+            tskOffset: item.sourceRef.tskOffset,
+            discoveryCrc32: item.discoveryCrc32,
             extension: item.extension,
             repairIfTruncated: item.status === 'OK_TRUNCATED',
             modifiedAtMs: item.modifiedAt,
@@ -1546,13 +1732,14 @@ export const App: React.FC = () => {
       return;
     }
 
-    const blob = item.sourceRef?.browserFile
-      ? item.sourceRef.browserFile
-      : new Blob([item.data.slice().buffer], { type: item.mimeType });
+    const blob =
+      item.repaired || !item.sourceRef?.browserFile
+        ? new Blob([item.data.slice().buffer], { type: item.mimeType })
+        : item.sourceRef.browserFile;
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;
-    a.download = item.filename;
+    a.download = outName;
     a.click();
     URL.revokeObjectURL(url);
   };
@@ -1627,6 +1814,34 @@ export const App: React.FC = () => {
     sortKey,
     sortDir,
   ]);
+
+  const handleExportCsv = async () => {
+    const exportItems = visibleItems.length > 0 ? visibleItems : allItems;
+    if (exportItems.length === 0) return;
+    const csv = buildCsvReport(exportItems, diskName || 'Disk');
+    const baseName = diskName.replace(/[^a-zA-Z0-9._-]+/g, '_').replace(/\.[^.]+$/, '');
+    const defaultName = `${baseName || 'recovery'}_inventory.csv`;
+    const bridge = getDesktopBridge();
+    if (bridge) {
+      const res = await bridge.saveTextReport({
+        defaultName,
+        title: 'Export Recovery Inventory CSV',
+        filters: [{ name: 'CSV Spreadsheet', extensions: ['csv'] }],
+        content: csv,
+      });
+      if (!res.canceled && res.filePath) {
+        setMbrActionNotice(`CSV inventory exported to ${res.filePath}`);
+      }
+      return;
+    }
+    const blob = new Blob([csv], { type: 'text/csv;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = defaultName;
+    a.click();
+    URL.revokeObjectURL(url);
+  };
 
   const handleExportDfxml = async () => {
     const exportItems = visibleItems.length > 0 ? visibleItems : allItems;
@@ -1867,9 +2082,26 @@ export const App: React.FC = () => {
     [allItems, focusedFileId],
   );
 
-  // Keyboard navigation across visible file items (ArrowUp/Down, Space, Enter)
+  // Keyboard navigation + global Ctrl+F search focus + Alt+Arrow history + mouse back/forward buttons
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
+      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'f' && activeScreen === 'explorer') {
+        e.preventDefault();
+        searchInputRef.current?.focus();
+        searchInputRef.current?.select();
+        return;
+      }
+      if (e.altKey && e.key === 'ArrowLeft' && activeScreen === 'explorer') {
+        e.preventDefault();
+        handleNavBack();
+        return;
+      }
+      if (e.altKey && e.key === 'ArrowRight' && activeScreen === 'explorer') {
+        e.preventDefault();
+        handleNavForward();
+        return;
+      }
+
       const tag = (e.target as HTMLElement)?.tagName;
       if (tag === 'INPUT' || tag === 'SELECT' || tag === 'TEXTAREA') return;
       if (filterOpen || recoveryOpen || driveHubOpen || lightboxOpen) return;
@@ -1893,9 +2125,33 @@ export const App: React.FC = () => {
         setLightboxOpen(true);
       }
     };
+    const onMouseUp = (e: MouseEvent) => {
+      if (activeScreen !== 'explorer') return;
+      if (e.button === 3) {
+        e.preventDefault();
+        handleNavBack();
+      } else if (e.button === 4) {
+        e.preventDefault();
+        handleNavForward();
+      }
+    };
     window.addEventListener('keydown', onKeyDown);
-    return () => window.removeEventListener('keydown', onKeyDown);
-  }, [visibleItems, focusedFileId, filterOpen, recoveryOpen, driveHubOpen, lightboxOpen]);
+    window.addEventListener('mouseup', onMouseUp);
+    return () => {
+      window.removeEventListener('keydown', onKeyDown);
+      window.removeEventListener('mouseup', onMouseUp);
+    };
+  }, [
+    activeScreen,
+    visibleItems,
+    focusedFileId,
+    filterOpen,
+    recoveryOpen,
+    driveHubOpen,
+    lightboxOpen,
+    handleNavBack,
+    handleNavForward,
+  ]);
 
   const focusedPartition = useMemo(() => {
     if (selectedNode.kind === 'partition') {
@@ -1985,6 +2241,7 @@ export const App: React.FC = () => {
     blockSize !== 512 ||
     !paranoid ||
     !keepCorrupted ||
+    unallocatedOnly ||
     hideDuplicates ||
     groupBy !== 'none' ||
     deletedFilter !== 'all' ||
@@ -2091,6 +2348,17 @@ export const App: React.FC = () => {
               {allItems.length > 0 && (
                 <button
                   type="button"
+                  onClick={() => void handleExportCsv()}
+                  className="hidden md:inline-flex items-center gap-1.5 px-2.5 py-1 text-[11px] font-medium rounded bg-[#222630] text-slate-200 border border-[#303542] hover:bg-[#2B303C] transition-all whitespace-nowrap shrink-0"
+                  title="Export discovered file inventory as CSV spreadsheet"
+                >
+                  <FileSpreadsheet className="w-3.5 h-3.5 text-emerald-400" />
+                  CSV
+                </button>
+              )}
+              {allItems.length > 0 && (
+                <button
+                  type="button"
                   onClick={() => void handleExportDfxml()}
                   className="hidden lg:inline-flex items-center gap-1.5 px-2.5 py-1 text-[11px] font-medium rounded bg-[#222630] text-slate-200 border border-[#303542] hover:bg-[#2B303C] transition-all whitespace-nowrap shrink-0"
                   title="Export forensic inventory & byte runs as DFXML XML"
@@ -2173,14 +2441,30 @@ export const App: React.FC = () => {
           {loadError && (
             <div className="mx-6 mt-3 px-3.5 py-2 rounded-md bg-rose-500/10 border border-rose-500/30 text-rose-300 text-xs flex items-center justify-between gap-3">
               <span>{loadError}</span>
-              <button type="button" onClick={() => setLoadError(null)} className="text-rose-200">
-                <X className="w-3.5 h-3.5" />
-              </button>
+              <div className="flex items-center gap-2 shrink-0">
+                {loadError.includes('Administrator') && capabilities && !capabilities.isAdmin && (
+                  <button
+                    type="button"
+                    onClick={() => void handleRelaunchAsAdmin()}
+                    className="inline-flex items-center gap-1 px-2.5 py-1 rounded bg-amber-500/20 border border-amber-400/40 text-amber-100 hover:bg-amber-500/30 font-medium"
+                  >
+                    <Shield className="w-3 h-3" />
+                    Relaunch as Administrator
+                  </button>
+                )}
+                <button type="button" onClick={() => setLoadError(null)} className="text-rose-200">
+                  <X className="w-3.5 h-3.5" />
+                </button>
+              </div>
             </div>
           )}
           <HomeView
             scanMode={scanMode}
             onChangeScanMode={setScanMode}
+            unallocatedOnly={unallocatedOnly}
+            onChangeUnallocatedOnly={setUnallocatedOnly}
+            capabilities={capabilities}
+            onRelaunchAsAdmin={handleRelaunchAsAdmin}
             onScanPhysicalDrive={handleOpenPhysicalDrive}
             onOpenDiskPicker={() => void handleOpenDiskPicker()}
             onScanFolder={() => void handleScanFolder()}
@@ -2217,10 +2501,20 @@ export const App: React.FC = () => {
                   onClick={handleNavBack}
                   disabled={navIndex <= 0}
                   className="p-1.5 rounded text-slate-300 hover:text-white hover:bg-[#262B36] disabled:opacity-35 transition-colors"
-                  title="Back"
+                  title="Back (Alt+Left)"
                   aria-label="Back"
                 >
                   <ArrowLeft className="w-3.5 h-3.5" />
+                </button>
+                <button
+                  type="button"
+                  onClick={handleNavForward}
+                  disabled={navIndex >= navHistory.length - 1}
+                  className="p-1.5 rounded text-slate-300 hover:text-white hover:bg-[#262B36] disabled:opacity-35 transition-colors"
+                  title="Forward (Alt+Right)"
+                  aria-label="Forward"
+                >
+                  <ArrowRight className="w-3.5 h-3.5" />
                 </button>
                 <button
                   type="button"
@@ -2320,6 +2614,30 @@ export const App: React.FC = () => {
                 </button>
               </div>
 
+              {viewMode === 'grid' && (
+                <div
+                  className="hidden sm:flex items-center bg-[#262B36] rounded border border-[#343A48] p-0.5 text-[10px] font-mono"
+                  role="group"
+                  aria-label="Grid thumbnail size"
+                >
+                  {(['sm', 'md', 'lg'] as const).map((sz) => (
+                    <button
+                      key={sz}
+                      type="button"
+                      onClick={() => setGridThumbSize(sz)}
+                      className={`px-1.5 py-0.5 rounded-xs uppercase transition-colors ${
+                        gridThumbSize === sz
+                          ? 'bg-[#3A7AFE] text-white'
+                          : 'text-slate-400 hover:text-slate-200'
+                      }`}
+                      title={`Grid size: ${sz.toUpperCase()}`}
+                    >
+                      {sz[0]}
+                    </button>
+                  ))}
+                </div>
+              )}
+
               <button
                 type="button"
                 onClick={() => setFilterOpen(true)}
@@ -2335,10 +2653,11 @@ export const App: React.FC = () => {
 
               <div className="relative w-52 lg:w-60">
                 <input
+                  ref={searchInputRef}
                   type="text"
                   value={searchQuery}
                   onChange={(e) => setSearchQuery(e.target.value)}
-                  placeholder="Search files or folders"
+                  placeholder="Search files (Ctrl+F)"
                   className="w-full pl-3 pr-8 py-1 rounded bg-[#262B36] border border-[#343A48] text-xs text-slate-100 placeholder:text-slate-400 focus:outline-none focus:border-[#3A7AFE]"
                 />
                 {searchQuery ? (
@@ -2390,9 +2709,21 @@ export const App: React.FC = () => {
           {loadError && (
             <div className="mx-3 mt-2.5 px-3.5 py-2 rounded-md bg-rose-500/10 border border-rose-500/30 text-rose-300 text-xs flex items-center justify-between gap-3 animate-slide-down">
               <span>{loadError}</span>
-              <button type="button" onClick={() => setLoadError(null)} className="text-rose-200">
-                <X className="w-3.5 h-3.5" />
-              </button>
+              <div className="flex items-center gap-2 shrink-0">
+                {loadError.includes('Administrator') && capabilities && !capabilities.isAdmin && (
+                  <button
+                    type="button"
+                    onClick={() => void handleRelaunchAsAdmin()}
+                    className="inline-flex items-center gap-1 px-2.5 py-1 rounded bg-amber-500/20 border border-amber-400/40 text-amber-100 hover:bg-amber-500/30 font-medium"
+                  >
+                    <Shield className="w-3 h-3" />
+                    Relaunch as Administrator
+                  </button>
+                )}
+                <button type="button" onClick={() => setLoadError(null)} className="text-rose-200">
+                  <X className="w-3.5 h-3.5" />
+                </button>
+              </div>
             </div>
           )}
 
@@ -2403,6 +2734,16 @@ export const App: React.FC = () => {
                 <span>{mbrActionNotice}</span>
               </div>
               <div className="flex items-center gap-2 shrink-0">
+                {mbrActionNotice.includes('Administrator') && capabilities && !capabilities.isAdmin && (
+                  <button
+                    type="button"
+                    onClick={() => void handleRelaunchAsAdmin()}
+                    className="inline-flex items-center gap-1 px-2.5 py-1 rounded bg-amber-500/20 border border-amber-400/40 text-amber-100 hover:bg-amber-500/30 font-medium"
+                  >
+                    <Shield className="w-3 h-3" />
+                    Relaunch as Administrator
+                  </button>
+                )}
                 {repairedDiskBytes && (
                   <button
                     type="button"
@@ -2671,11 +3012,21 @@ export const App: React.FC = () => {
                       )}
 
                       {!isCollapsed && (
-                        <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 gap-3">
+                        <div
+                          className={`grid gap-3 ${
+                            gridThumbSize === 'sm'
+                              ? 'grid-cols-3 sm:grid-cols-4 lg:grid-cols-6'
+                              : gridThumbSize === 'lg'
+                                ? 'grid-cols-1 sm:grid-cols-2 lg:grid-cols-3'
+                                : 'grid-cols-2 sm:grid-cols-3 lg:grid-cols-4'
+                          }`}
+                        >
                           {section.items.map((item) => {
                             const isFocused = focusedFileId === item.id;
                             const isChecked = checkedIds.has(item.id);
                             const lbc = likelihoodBadgeClasses(item.recoveryTier);
+                            const thumbSize =
+                              gridThumbSize === 'sm' ? 'md' : gridThumbSize === 'lg' ? 'xl' : 'lg';
                             return (
                               <div
                                 key={item.id}
@@ -2710,7 +3061,7 @@ export const App: React.FC = () => {
                                 </span>
 
                                 <div className="flex justify-center py-4 relative">
-                                  <FileThumbnail item={item} size="lg" />
+                                  <FileThumbnail item={item} size={thumbSize} />
                                   {(item.family === 'Pictures' || item.family === 'Videos') && (
                                     <button
                                       type="button"
@@ -3080,7 +3431,7 @@ export const App: React.FC = () => {
             <button
               type="button"
               onClick={() => {
-                handleRepairFile(contextMenu.item);
+                void handleRepairFile(contextMenu.item);
                 setContextMenu(null);
               }}
               className="w-full px-3 py-1.5 flex items-center gap-2 text-left text-amber-300 hover:bg-[#2C3444]"
@@ -3115,6 +3466,8 @@ export const App: React.FC = () => {
           likelihoodFilter={likelihoodFilter}
           sizeFilter={sizeFilter}
           hideDuplicates={hideDuplicates}
+          unallocatedOnly={unallocatedOnly}
+          gridThumbSize={gridThumbSize}
           sortKey={sortKey}
           sortDir={sortDir}
           groupBy={groupBy}
@@ -3127,6 +3480,8 @@ export const App: React.FC = () => {
           onChangeLikelihoodFilter={setLikelihoodFilter}
           onChangeSizeFilter={setSizeFilter}
           onChangeHideDuplicates={setHideDuplicates}
+          onChangeUnallocatedOnly={setUnallocatedOnly}
+          onChangeGridThumbSize={setGridThumbSize}
           onChangeSortKey={setSortKey}
           onChangeSortDir={setSortDir}
           onChangeGroupBy={(val) => {
@@ -3149,6 +3504,7 @@ export const App: React.FC = () => {
         <RecoveryModal
           items={recoveryPayload}
           diskName={diskName}
+          scannedDevicePath={scannedDevicePath}
           repairedDiskBytes={repairedDiskBytes}
           onClose={() => setRecoveryOpen(false)}
         />
@@ -3158,6 +3514,8 @@ export const App: React.FC = () => {
         <DriveHubModal
           analysis={analysis}
           activePartitionScope={scanPartitionScope}
+          capabilities={capabilities}
+          onRelaunchAsAdmin={handleRelaunchAsAdmin}
           onStartTargetedScan={(part) => startFreshScanState(diskBytes, part ? part.id : null)}
           onOpenPhysicalDrive={handleOpenPhysicalDrive}
           onScanFolder={() => void handleScanFolder()}

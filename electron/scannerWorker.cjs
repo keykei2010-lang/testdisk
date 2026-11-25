@@ -266,7 +266,8 @@ function detectTiffRawFlavor(buf, offset, availLen) {
       if (tag === 0x010f) {
         const valOff = le ? buf.readUInt32LE(eOff + 8) : buf.readUInt32BE(eOff + 8);
         if (valOff > 0 && valOff + 12 <= availLen) {
-          make = buf.toString('ascii', offset + valOff, offset + valOff + 16).toUpperCase();
+          const sliceEnd = Math.min(offset + valOff + 16, offset + availLen);
+          make = buf.toString('ascii', offset + valOff, sliceEnd).toUpperCase();
         }
       }
     }

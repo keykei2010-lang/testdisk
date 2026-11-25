@@ -142,7 +142,8 @@ export function parseUsnJournalBuffer(
       const isDelete = (reason & (USN_REASON_FILE_DELETE | USN_REASON_RENAME_OLD_NAME)) !== 0;
       if (!onlyDeletes || isDelete) {
         const filename = decodeUtf16Le(buf, pos + fnOff, fnLen);
-        if (filename && !filename.startsWith('$') && !isDir) {
+        const isRecycleName = /^\$[RI][A-Za-z0-9]{4,}/i.test(filename);
+        if (filename && (!filename.startsWith('$') || isRecycleName) && !isDir) {
           const dedupeKey = `${fileRef}:${filename}`;
           if (!seen.has(dedupeKey)) {
             seen.add(dedupeKey);

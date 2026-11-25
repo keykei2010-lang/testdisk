@@ -462,12 +462,13 @@ async function ffmpegRepairVideoFile(srcPath, dstPath, options = {}) {
     .toLowerCase()
     .replace(/^\./, '');
   const isMp4Family = ['mp4', 'mov', 'm4v', '3gp'].includes(ext);
-  const isImage = ['jpg', 'jpeg', 'png', 'webp', 'bmp', 'gif', 'tif', 'tiff', 'cr2', 'cr3', 'nef', 'arw', 'dng'].includes(ext);
+  const isImage = ['jpg', 'jpeg', 'png', 'webp', 'bmp', 'gif', 'tif', 'tiff'].includes(ext);
+  const isRawImage = ['cr2', 'cr3', 'nef', 'arw', 'dng', 'orf', 'rw2'].includes(ext);
   const isAudio = ['mp3', 'wav', 'aac', 'm4a', 'flac', 'ogg'].includes(ext);
 
   const validOut = (p) => fs.existsSync(p) && fs.statSync(p).size > 0;
 
-  if (!isImage) {
+  if (!isImage && !isRawImage) {
     // Tier 1: Stream copy with timestamp/PTS repair & corrupt packet discard
     const tier1Args = [
       '-y',

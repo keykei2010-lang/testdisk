@@ -66,13 +66,20 @@ export interface NativeScanBatchEvent {
 export interface LocationScanResponse {
   entries: NativeScannedEntry[];
   path?: string;
-  deletedLookupStatus?: 'scanned' | 'needs-admin' | 'unsupported';
-  backingDrive?: {
-    devicePath: string;
-    totalBytes: number;
-    label: string;
-    relPrefix?: string;
-  };
+  deletedLookupStatus?: 'scanned' | 'partial' | 'needs-admin' | 'unsupported';
+  backingDrive?:
+    | string
+    | {
+        devicePath: string;
+        totalBytes: number;
+        label: string;
+        relPrefix?: string;
+      };
+  scannedVolumes?: string[];
+  needsAdminVolumes?: string[];
+  liveCount?: number;
+  vssCount?: number;
+  emptiedCount?: number;
 }
 
 export interface BitLockerVolumeInfo {

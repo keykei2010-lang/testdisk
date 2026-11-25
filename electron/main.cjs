@@ -23,6 +23,12 @@ const {
   repairAviBufferCjs,
   extractEmbeddedJpegCjs,
 } = require('./mediaRepairCjs.cjs');
+const {
+  buildNtfsVolumeScanPlanCjs,
+  filterAndTagEmptiedRecycleEntriesCjs,
+  isRecycleBinEntryName,
+  rePairDeletedRecycleRecordsCjs,
+} = require('./recycleBinCjs.cjs');
 
 const activeScans = new Map();
 const WINDOWS_EPOCH_DIFF_MS = 11644473600000;
@@ -589,6 +595,9 @@ function detectVolumesFromDisk(fd, limitBytes) {
   };
 
   try {
+    // Also detect partitionless logical volume handles (e.g. \\.\C:, \\.\D:, or raw partition .img)
+    inspectBoot(0, limitBytes);
+
     const mbr = Buffer.allocUnsafe(512);
     if (fs.readSync(fd, mbr, 0, 512, 0) === 512 && mbr[510] === 0x55 && mbr[511] === 0xaa) {
       let hasGptPmbr = false;
@@ -1092,7 +1101,7 @@ function parseUsnJournalBufferCjs(buf, dirMap, volKey, maxEntries = 1000) {
 
     if (isDelete && !isDir && nameLen >= 2 && pos + nameOffset + nameLen <= pos + recLen) {
       const filename = buf.toString('utf16le', pos + nameOffset, pos + nameOffset + nameLen).split('\0')[0];
-      if (filename && !filename.startsWith('$')) {
+      if (filename && (!filename.startsWith('$') || isRecycleBinEntryName(filename))) {
         const parts = [filename];
         let cur = parentRefLow;
         const visited = new Set();
@@ -1286,7 +1295,13 @@ function parseMftRecordBuffer(work, absOffset, ntfsParts, fd, limitBytes, dirMap
   }
 
   const isDeleted = !inUse;
-  if ((!isDeleted && !includeExisting) || filename.startsWith('$') || fileSize === 0) return null;
+  if (
+    (!isDeleted && !includeExisting) ||
+    (filename.startsWith('$') && !isRecycleBinEntryName(filename)) ||
+    fileSize === 0
+  ) {
+    return null;
+  }
   const ext = path.extname(filename).replace(/^\./, '').toLowerCase();
 
   if (residentPayload) {
@@ -1328,14 +1343,25 @@ function parseMftRecordBuffer(work, absOffset, ntfsParts, fd, limitBytes, dirMap
       if (byteOff + runBytes <= limitBytes) {
         extents.push({ offset: byteOff, length: runBytes });
       }
+    } else {
+      extents.push({ offset: -1, length: runBytes });
     }
     rem -= runBytes;
   }
-  if (extents.length === 0) return null;
+  const firstRealExtent = extents.find((e) => e.offset >= 0);
+  if (!firstRealExtent) return null;
 
-  const sampleLen = Math.min(65536, extents[0].length);
-  const hdrBuf = Buffer.allocUnsafe(sampleLen);
-  const hRead = fs.readSync(fd, hdrBuf, 0, sampleLen, extents[0].offset);
+  const sampleTargetLen = Math.min(65536, fileSize || firstRealExtent.length);
+  const hdrBuf = Buffer.alloc(sampleTargetLen);
+  let hdrCursor = 0;
+  for (const extRun of extents) {
+    if (hdrCursor >= sampleTargetLen) break;
+    const take = Math.min(extRun.length, sampleTargetLen - hdrCursor);
+    if (extRun.offset >= 0) {
+      fs.readSync(fd, hdrBuf, hdrCursor, take, extRun.offset);
+    }
+    hdrCursor += take;
+  }
 
   return {
     consumed: true,
@@ -1354,13 +1380,13 @@ function parseMftRecordBuffer(work, absOffset, ntfsParts, fd, limitBytes, dirMap
       sourceKind: 'ntfs-mft',
       isDeleted,
       scanPhase: 'quick',
-      offset: extents[0].offset,
+      offset: firstRealExtent.offset,
       sector: Math.floor(absOffset / 512),
       devicePath: '',
       runs: extents,
       mftResident: false,
-      discoveryCrc32: computeCrc32Cjs(hdrBuf, hRead),
-      headerSample: new Uint8Array(hdrBuf.buffer, hdrBuf.byteOffset, hRead),
+      discoveryCrc32: computeCrc32Cjs(hdrBuf, hdrCursor),
+      headerSample: new Uint8Array(hdrBuf.buffer, hdrBuf.byteOffset, hdrCursor),
     },
   };
 }
@@ -1462,6 +1488,11 @@ function scanNtfsMftContiguous(fd, devicePath, ntfsParts, limitBytes, includeExi
   }
 
   finalizeNtfsMftMetadata(candidates, dirMap, bitmapByVol);
+  const pairedCandidates = rePairDeletedRecycleRecordsCjs(candidates);
+  entries.length = 0;
+  for (const c of pairedCandidates) {
+    if (c?.entry) entries.push(c.entry);
+  }
 
   // Parse recent $UsnJrnl:$J deleted entries
   for (const src of usnSources) {
@@ -1531,70 +1562,137 @@ async function resolveBackingPhysicalDrive(winPath) {
   if (process.platform !== 'win32' || !winPath || !/^[A-Za-z]:/.test(winPath)) return null;
   const letter = winPath[0].toUpperCase();
   const rows = await runPowerShellJson(
-    `Get-Partition -DriveLetter '${letter}' -ErrorAction SilentlyContinue | Select-Object DiskNumber | ConvertTo-Json -Compress`,
+    `Get-Partition -DriveLetter '${letter}' -ErrorAction SilentlyContinue | Select-Object DiskNumber,Offset,Size | ConvertTo-Json -Compress`,
   );
   if (!rows || rows.length === 0 || rows[0].DiskNumber === undefined) return null;
   return {
     driveLetter: `${letter}:`,
     devicePath: `\\\\.\\PhysicalDrive${Number(rows[0].DiskNumber)}`,
+    volumeDevicePath: `\\\\.\\${letter}:`,
+    partOffset: Number(rows[0].Offset || 0),
+    partSize: Number(rows[0].Size || 0),
     relPrefix: winPath.slice(2).replace(/^\\+/, ''),
   };
 }
 
-async function scanVssSnapshotsForPrefix(relPrefix, existingPathsSet, outList, maxFiles = 1500) {
+async function scanVssSnapshotsForPrefix(relPrefix, existingPathsSet, outList, maxFiles = 1500, options = {}) {
   if (process.platform !== 'win32' || outList.length >= maxFiles) return;
   const shadows = await runPowerShellJson(
-    'Get-CimInstance Win32_ShadowCopy -ErrorAction SilentlyContinue | Select-Object DeviceObject,InstallDate | ConvertTo-Json -Compress',
+    'Get-CimInstance Win32_ShadowCopy -ErrorAction SilentlyContinue | Select-Object DeviceObject,VolumeName,InstallDate | ConvertTo-Json -Compress',
   );
   if (!shadows || shadows.length === 0) return;
+
+  const volLetterByGuid = options.volLetterByGuid || new Map();
 
   for (const sh of shadows.slice(-3)) {
     if (outList.length >= maxFiles || !sh?.DeviceObject) continue;
     const baseObj = String(sh.DeviceObject).replace(/\\+$/, '');
     const targetDir = relPrefix ? `${baseObj}\\${relPrefix}` : `${baseObj}\\`;
+    const volKey = String(sh.VolumeName || '').replace(/\\+$/, '').toLowerCase();
+    const resolvedLetter = volLetterByGuid.get(volKey) || options.driveLetter || '';
     const temp = [];
-    walkFolderEntries(targetDir, temp, Math.min(600, maxFiles - outList.length), null, '');
+    if (options.isRecycleBin) {
+      scanRecycleDir(targetDir, temp, Math.min(800, maxFiles - outList.length), options.preferredSid || null);
+    } else {
+      walkFolderEntries(targetDir, temp, Math.min(600, maxFiles - outList.length), null, '');
+    }
     for (const item of temp) {
-      const normKey = `${relPrefix ? relPrefix.toLowerCase() + '\\' : ''}${item.filename.toLowerCase()}`;
+      if (item.filename && item.filename.toLowerCase() === 'desktop.ini') continue;
+      const origNorm = String(item.originalPath || item.filename).toLowerCase();
+      const normKey = options.isRecycleBin
+        ? `${origNorm}|${item.size}`
+        : `${relPrefix ? relPrefix.toLowerCase() + '\\' : ''}${item.filename.toLowerCase()}`;
       if (existingPathsSet.has(normKey)) continue;
       existingPathsSet.add(normKey);
       item.id = `vss-${sh.DeviceObject}-${item.devicePath}`;
       item.isDeleted = true;
       item.scanPhase = 'vss';
-      item.originalPath = relPrefix ? `\\${relPrefix}\\${item.filename}` : `\\${item.filename}`;
+      if (options.isRecycleBin) {
+        item.sourceKind = 'recycle-bin';
+        item.partitionName = resolvedLetter
+          ? `Shadow Copy $Recycle.Bin (${resolvedLetter} · VSS)`
+          : 'Shadow Copy $Recycle.Bin (VSS)';
+        if (!item.originalPath || item.originalPath.startsWith('\\\\?\\GLOBALROOT')) {
+          item.originalPath = `${resolvedLetter}\\$Recycle.Bin\\${item.filename}`;
+        }
+      } else {
+        item.originalPath = relPrefix ? `\\${relPrefix}\\${item.filename}` : `\\${item.filename}`;
+      }
       outList.push(item);
     }
   }
 }
 
+function scopeNtfsPartsForTarget(volumes, target, isVolumeHandle) {
+  let ntfsParts = volumes.filter((v) => v.fsType === 'ntfs');
+  if (!isVolumeHandle && target.partOffset > 0 && target.partSize > 0) {
+    const end = target.partOffset + target.partSize;
+    const exact = ntfsParts.filter(
+      (p) => Math.abs(p.volStart - target.partOffset) <= 1024 * 1024 || (p.volStart >= target.partOffset && p.volStart < end),
+    );
+    if (exact.length > 0) ntfsParts = exact;
+  }
+  return ntfsParts;
+}
+
 async function huntDeletedInBackingDrive(backing, isRecycleBin, maxEntries = 2000) {
-  let fd;
-  try {
-    fd = fs.openSync(backing.devicePath, 'r');
-  } catch {
+  const candidatesToOpen = [];
+  if (backing.volumeDevicePath) {
+    candidatesToOpen.push({ path: backing.volumeDevicePath, isVol: true });
+  }
+  if (backing.devicePath) {
+    candidatesToOpen.push({ path: backing.devicePath, isVol: false });
+  }
+
+  let fd = null;
+  let openedSpec = null;
+  for (const spec of candidatesToOpen) {
+    try {
+      fd = fs.openSync(spec.path, 'r');
+      openedSpec = spec;
+      break;
+    } catch {
+      // try fallback handle
+    }
+  }
+  if (fd === null || !openedSpec) {
     return { status: 'needs-admin', entries: [] };
   }
 
   try {
-    const disks = await runPowerShellJson(
-      `Get-Disk | Where-Object { $_.Number -eq ${Number(backing.devicePath.replace(/\D+/g, '') || 0)} } | Select-Object Size | ConvertTo-Json -Compress`,
-    );
-    const diskSize = Number(disks?.[0]?.Size || 0);
-    const limitBytes = diskSize > 0 ? diskSize : 512 * 1024 * 1024 * 1024;
+    let limitBytes = backing.partSize > 0 && openedSpec.isVol ? backing.partSize : 0;
+    if (!openedSpec.isVol) {
+      const disks = await runPowerShellJson(
+        `Get-Disk | Where-Object { $_.Number -eq ${Number(openedSpec.path.replace(/\D+/g, '') || 0)} } | Select-Object Size | ConvertTo-Json -Compress`,
+      );
+      const diskSize = Number(disks?.[0]?.Size || 0);
+      if (diskSize > 0) limitBytes = diskSize;
+    }
+    if (limitBytes <= 0) limitBytes = 512 * 1024 * 1024 * 1024;
+
     const volumes = detectVolumesFromDisk(fd, limitBytes);
-    const ntfsParts = volumes.filter((v) => v.fsType === 'ntfs');
+    const ntfsParts = scopeNtfsPartsForTarget(volumes, backing, openedSpec.isVol);
 
     const candidates = [];
     if (ntfsParts.length > 0) {
-      const mftRes = scanNtfsMftContiguous(fd, backing.devicePath, ntfsParts, limitBytes, false, 160000);
+      const mftRes = scanNtfsMftContiguous(fd, openedSpec.path, ntfsParts, limitBytes, false, 180000);
       candidates.push(...mftRes.entries);
     }
-    for (const vol of volumes) {
-      if (vol.fsType === 'fat32') {
-        candidates.push(...scanFat32VolumeFromFd(fd, backing.devicePath, vol, limitBytes, false));
-      } else if (vol.fsType === 'exfat') {
-        candidates.push(...scanExfatVolumeFromFd(fd, backing.devicePath, vol, limitBytes, false));
+    if (!isRecycleBin) {
+      for (const vol of volumes) {
+        if (vol.fsType === 'fat32') {
+          candidates.push(...scanFat32VolumeFromFd(fd, openedSpec.path, vol, limitBytes, false));
+        } else if (vol.fsType === 'exfat') {
+          candidates.push(...scanExfatVolumeFromFd(fd, openedSpec.path, vol, limitBytes, false));
+        }
       }
+    }
+
+    if (isRecycleBin) {
+      const filtered = filterAndTagEmptiedRecycleEntriesCjs(candidates, {
+        driveLetter: backing.driveLetter || '',
+      }).slice(0, maxEntries);
+      return { status: 'scanned', entries: filtered };
     }
 
     const normPrefix = (backing.relPrefix || '').toLowerCase().replace(/^\\+|\\+$/g, '');
@@ -1602,11 +1700,7 @@ async function huntDeletedInBackingDrive(backing, isRecycleBin, maxEntries = 200
     for (const item of candidates) {
       if (filtered.length >= maxEntries) break;
       const itemPath = String(item.originalPath || '').toLowerCase();
-      if (isRecycleBin) {
-        if (itemPath.includes('$recycle.bin') || item.scanPhase === 'usn') {
-          filtered.push(item);
-        }
-      } else if (normPrefix) {
+      if (normPrefix) {
         if (itemPath.includes(normPrefix)) {
           filtered.push(item);
         }
@@ -1614,7 +1708,7 @@ async function huntDeletedInBackingDrive(backing, isRecycleBin, maxEntries = 200
         filtered.push(item);
       }
     }
-    return { status: 'ok', entries: filtered };
+    return { status: 'scanned', entries: filtered };
   } finally {
     fs.closeSync(fd);
   }
@@ -1737,9 +1831,11 @@ app.whenReady().then(() => {
   });
 
   ipcMain.handle('win:repair-media-file', async (_event, params = {}) => {
-    const ext = String(params.extension || path.extname(params.filename || '').replace(/^\./, '') || 'mp4')
-      .toLowerCase()
-      .replace(/^\./, '');
+    const ext =
+      String(params.extension || path.extname(params.filename || '') || 'mp4')
+        .toLowerCase()
+        .replace(/[^a-z0-9]/g, '')
+        .slice(0, 12) || 'bin';
     const tmpBase = path.join(os.tmpdir(), `td_med_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`);
     const tmpSrc = `${tmpBase}.src.${ext}`;
     const tmpStruct = `${tmpBase}.struct.${ext}`;
@@ -1766,14 +1862,26 @@ app.whenReady().then(() => {
         const srcFd = fs.openSync(params.devicePath, 'r');
         const dstFd = fs.openSync(tmpSrc, 'w');
         const copyChunk = Buffer.allocUnsafe(4 * 1024 * 1024);
-        const ranges =
+        const zeroChunk = Buffer.alloc(1024 * 1024);
+        const rawRanges =
           params.sourceKind === 'native-runs' && Array.isArray(params.runs) && params.runs.length > 0
             ? params.runs
             : [{ offset: params.offset || 0, length: params.size || 0 }];
         try {
-          for (const run of ranges) {
-            let rem = run.length;
-            let rPos = run.offset;
+          for (const run of rawRanges) {
+            const runLen = Number.isFinite(Number(run?.length)) ? Math.max(0, Math.floor(Number(run.length))) : 0;
+            const runOffset = Number.isFinite(Number(run?.offset)) ? Math.floor(Number(run.offset)) : -1;
+            if (runLen <= 0) continue;
+            let rem = runLen;
+            if (runOffset < 0) {
+              while (rem > 0) {
+                const zLen = Math.min(zeroChunk.length, rem);
+                fs.writeSync(dstFd, zeroChunk, 0, zLen);
+                rem -= zLen;
+              }
+              continue;
+            }
+            let rPos = runOffset;
             while (rem > 0) {
               const alignedStart = Math.floor(rPos / 512) * 512;
               const trim = rPos - alignedStart;
@@ -1960,19 +2068,28 @@ app.whenReady().then(() => {
 
   ipcMain.handle(
     'win:read-disk-bytes',
-    async (_event, { devicePath, startByte = 0, maxBytes = 64 * 1024 * 1024, tskInode, tskOffset = 0 }) => {
+    async (_event, { devicePath, startByte = 0, maxBytes = 64 * 1024 * 1024, tskInode, tskOffset = 0 } = {}) => {
+      if (typeof devicePath !== 'string' || !devicePath.trim()) {
+        return new Uint8Array(0);
+      }
+      const safeStart = Number.isFinite(Number(startByte)) ? Math.max(0, Math.floor(Number(startByte))) : 0;
+      const safeMax = Number.isFinite(Number(maxBytes))
+        ? Math.max(0, Math.min(128 * 1024 * 1024, Math.floor(Number(maxBytes))))
+        : 64 * 1024 * 1024;
+      if (safeMax === 0) return new Uint8Array(0);
+
       if (tskInode) {
         const head = await readTskInodeHead(
           devicePath,
           tskOffset || 0,
           tskInode,
-          Math.min(maxBytes || 256 * 1024, 16 * 1024 * 1024),
+          Math.min(safeMax, 16 * 1024 * 1024),
         );
         return head ? new Uint8Array(head.buffer, head.byteOffset, head.byteLength) : new Uint8Array(0);
       }
 
-      const alignedStart = Math.floor(startByte / 512) * 512;
-      const alignedLen = Math.max(512, Math.floor(maxBytes / 512) * 512);
+      const alignedStart = Math.floor(safeStart / 512) * 512;
+      const alignedLen = Math.max(512, Math.floor(safeMax / 512) * 512);
       const fd = fs.openSync(devicePath, 'r');
       try {
         const chunkSize = 1024 * 1024;
@@ -2061,21 +2178,11 @@ app.whenReady().then(() => {
     });
   });
 
-  async function scanLocationAndDeleted(targetPath, isRecycleBin) {
+  async function scanLocationAndDeleted(targetPath) {
     const out = [];
     const existingSet = new Set();
 
-    if (isRecycleBin && process.platform === 'win32') {
-      const [roots, currentSid] = await Promise.all([
-        runPowerShellJson('Get-PSDrive -PSProvider FileSystem | Select-Object Root | ConvertTo-Json -Compress'),
-        getCurrentUserWindowsSid(),
-      ]);
-      for (const r of roots) {
-        if (r && r.Root) {
-          scanRecycleDir(path.join(String(r.Root), '$Recycle.Bin'), out, 5000, currentSid);
-        }
-      }
-    } else if (targetPath) {
+    if (targetPath) {
       walkFolderEntries(targetPath, out, 5000);
       for (const item of out) {
         existingSet.add(item.filename.toLowerCase());
@@ -2090,7 +2197,7 @@ app.whenReady().then(() => {
       if (backing) {
         backingDrive = backing.devicePath;
         await scanVssSnapshotsForPrefix(backing.relPrefix, existingSet, out, 1500);
-        const delRes = await huntDeletedInBackingDrive(backing, isRecycleBin, 2000);
+        const delRes = await huntDeletedInBackingDrive(backing, false, 2000);
         deletedLookupStatus = delRes.status;
         if (delRes.entries.length > 0) {
           out.push(...delRes.entries);
@@ -2106,17 +2213,168 @@ app.whenReady().then(() => {
     };
   }
 
+  /**
+   * Dedicated Windows Recycle Bin + Emptied NTFS Lookup:
+   * 1. Scans live $Recycle.Bin across ALL filesystem drives (resolving active-SID $I+$R metadata)
+   * 2. Checks VSS Shadow Copies for prior $Recycle.Bin states
+   * 3. Enumerates ALL readable NTFS volumes (logical \\.\X: first, fallback PhysicalDriveN partition)
+   *    to locate emptied $MFT & $UsnJrnl:$J Recycle Bin records and re-pair deleted $I+$R stubs.
+   */
+  async function scanAllRecycleBinsAndEmptiedNtfs() {
+    const out = [];
+    const existingLiveOrVssKeys = new Set();
+
+    if (process.platform !== 'win32') {
+      return {
+        entries: out,
+        path: 'Windows $Recycle.Bin',
+        deletedLookupStatus: 'unsupported',
+        liveCount: 0,
+        vssCount: 0,
+        emptiedCount: 0,
+        scannedVolumes: [],
+        needsAdminVolumes: [],
+      };
+    }
+
+    const [volsPs, partsPs, rootsPs, currentSid] = await Promise.all([
+      runPowerShellJson(
+        'Get-Volume | Where-Object { $_.DriveLetter -and $_.Size -gt 0 } | Select-Object DriveLetter,FileSystem,FileSystemLabel,Size | ConvertTo-Json -Compress',
+      ),
+      runPowerShellJson(
+        'Get-Partition | Where-Object { $_.DriveLetter } | Select-Object DriveLetter,DiskNumber,Offset,Size | ConvertTo-Json -Compress',
+      ),
+      runPowerShellJson('Get-PSDrive -PSProvider FileSystem | Select-Object Root | ConvertTo-Json -Compress'),
+      getCurrentUserWindowsSid(),
+    ]);
+
+    // 1. Scan live $Recycle.Bin folders across all drives
+    const rootSet = new Set();
+    for (const v of volsPs) {
+      if (v && v.DriveLetter) rootSet.add(`${String(v.DriveLetter).trim().toUpperCase()}:\\`);
+    }
+    for (const r of rootsPs) {
+      if (r && r.Root) rootSet.add(String(r.Root));
+    }
+    if (rootSet.size === 0) {
+      rootSet.add(`${(process.env.SystemDrive || 'C:').replace(/:$/, '')}:\\`);
+    }
+
+    for (const rootDir of rootSet) {
+      scanRecycleDir(path.join(rootDir, '$Recycle.Bin'), out, 5000, currentSid);
+    }
+    for (const item of out) {
+      existingLiveOrVssKeys.add(`${String(item.originalPath || item.filename).toLowerCase()}|${item.size}`);
+    }
+    const liveCount = out.length;
+
+    const winVolumes = await runPowerShellJson(
+      'Get-CimInstance Win32_Volume -ErrorAction SilentlyContinue | Select-Object DeviceID,DriveLetter | ConvertTo-Json -Compress',
+    );
+    const volLetterByGuid = new Map();
+    for (const wv of winVolumes) {
+      if (wv && wv.DeviceID && wv.DriveLetter) {
+        const key = String(wv.DeviceID).replace(/\\+$/, '').toLowerCase();
+        const letter = String(wv.DriveLetter).trim().replace(/:$/, '').toUpperCase();
+        if (/^[A-Z]$/.test(letter)) volLetterByGuid.set(key, `${letter}:`);
+      }
+    }
+
+    // 2. Scan VSS Shadow Copies for $Recycle.Bin
+    await scanVssSnapshotsForPrefix('$Recycle.Bin', existingLiveOrVssKeys, out, 2500, {
+      isRecycleBin: true,
+      preferredSid: currentSid,
+      volLetterByGuid,
+    });
+    const vssCount = out.length - liveCount;
+
+    // 3. Scan ALL readable NTFS volumes for emptied $MFT / $UsnJrnl Recycle Bin records
+    let ntfsPlan = buildNtfsVolumeScanPlanCjs(volsPs, partsPs);
+    if (ntfsPlan.length === 0) {
+      const sysLetter = (process.env.SystemDrive || 'C:').replace(/:$/, '').toUpperCase();
+      ntfsPlan = buildNtfsVolumeScanPlanCjs(
+        [{ DriveLetter: sysLetter, FileSystem: 'NTFS', FileSystemLabel: 'System', Size: 0 }],
+        [],
+      );
+    }
+
+    const scannedVolumes = [];
+    const needsAdminVolumes = [];
+    const seenEmptiedKeys = new Set();
+    let emptiedCount = 0;
+
+    for (const vol of ntfsPlan) {
+      if (emptiedCount >= 4000) break;
+      const res = await huntDeletedInBackingDrive(
+        {
+          driveLetter: vol.driveLetter,
+          volumeDevicePath: vol.volumeDevicePath,
+          devicePath: vol.physicalDevicePath,
+          partOffset: vol.partOffset,
+          partSize: vol.partSize,
+        },
+        true,
+        Math.max(200, 4000 - emptiedCount),
+      );
+
+      if (res.status === 'needs-admin') {
+        needsAdminVolumes.push(vol.driveLetter);
+        continue;
+      }
+
+      scannedVolumes.push(vol.driveLetter);
+      const deduped = filterAndTagEmptiedRecycleEntriesCjs(res.entries, {
+        driveLetter: vol.driveLetter,
+        seenKeys: seenEmptiedKeys,
+      });
+      for (const item of deduped) {
+        const liveKey = `${String(item.originalPath || item.filename).toLowerCase()}|${item.size}`;
+        if (existingLiveOrVssKeys.has(liveKey)) continue;
+        existingLiveOrVssKeys.add(liveKey);
+        out.push(item);
+        emptiedCount++;
+      }
+    }
+
+    let deletedLookupStatus = 'unsupported';
+    if (scannedVolumes.length > 0 && needsAdminVolumes.length === 0) {
+      deletedLookupStatus = 'scanned';
+    } else if (scannedVolumes.length > 0 && needsAdminVolumes.length > 0) {
+      deletedLookupStatus = 'partial';
+    } else if (needsAdminVolumes.length > 0) {
+      deletedLookupStatus = 'needs-admin';
+    }
+
+    return {
+      entries: out,
+      path:
+        scannedVolumes.length > 0
+          ? `$Recycle.Bin + NTFS MFT (${scannedVolumes.join(', ')})`
+          : 'Windows $Recycle.Bin',
+      deletedLookupStatus,
+      backingDrive:
+        scannedVolumes.length > 0
+          ? scannedVolumes.join(', ')
+          : needsAdminVolumes.join(', ') || undefined,
+      scannedVolumes,
+      needsAdminVolumes,
+      liveCount,
+      vssCount,
+      emptiedCount,
+    };
+  }
+
   ipcMain.handle('win:scan-folder', async (_event, folderPath) => {
-    return await scanLocationAndDeleted(folderPath, false);
+    return await scanLocationAndDeleted(folderPath);
   });
 
   ipcMain.handle('win:scan-recycle-bin', async () => {
-    return await scanLocationAndDeleted('$Recycle.Bin', true);
+    return await scanAllRecycleBinsAndEmptiedNtfs();
   });
 
   ipcMain.handle('win:scan-desktop', async () => {
     const desktopPath = app.getPath('desktop');
-    return await scanLocationAndDeleted(desktopPath, false);
+    return await scanLocationAndDeleted(desktopPath);
   });
 
   ipcMain.handle('win:pause-drive-scan', async (_event, scanId) => {
@@ -2421,23 +2679,37 @@ app.whenReady().then(() => {
       targetRoot = pick.filePaths[0];
     }
 
-    // Source-drive self-overwrite pre-flight guard for raw physical drives
+    // Source-drive self-overwrite pre-flight guard for raw physical drives or logical volume handles
     const rawSourcePath = scannedDevicePath || items.find((i) => i.devicePath && i.devicePath.startsWith('\\\\.\\'))?.devicePath;
-    if (process.platform === 'win32' && rawSourcePath && rawSourcePath.startsWith('\\\\.\\PhysicalDrive')) {
-      try {
-        const destBacking = await resolveBackingPhysicalDrive(targetRoot);
-        if (destBacking && destBacking.devicePath.toLowerCase() === rawSourcePath.toLowerCase()) {
+    if (process.platform === 'win32' && rawSourcePath && rawSourcePath.startsWith('\\\\.\\')) {
+      if (/^\\\\\.\\[A-Za-z]:$/i.test(rawSourcePath)) {
+        const srcVolPrefix = rawSourcePath.slice(4, 6).toUpperCase();
+        if (targetRoot.toUpperCase().startsWith(srcVolPrefix)) {
           return {
             canceled: false,
             savedCount: 0,
             verifiedCount: 0,
             destinationDir: targetRoot,
             repairedCount: 0,
-            error: `Safety block: "${targetRoot}" resides on the same physical disk (${rawSourcePath}) being recovered. Choose a different drive to prevent overwriting deleted clusters.`,
+            error: `Safety block: "${targetRoot}" resides on the same NTFS volume (${srcVolPrefix}) being recovered. Choose a different drive to prevent overwriting deleted clusters.`,
           };
         }
-      } catch {
-        // continue if drive resolution is unavailable
+      } else if (rawSourcePath.startsWith('\\\\.\\PhysicalDrive')) {
+        try {
+          const destBacking = await resolveBackingPhysicalDrive(targetRoot);
+          if (destBacking && destBacking.devicePath.toLowerCase() === rawSourcePath.toLowerCase()) {
+            return {
+              canceled: false,
+              savedCount: 0,
+              verifiedCount: 0,
+              destinationDir: targetRoot,
+              repairedCount: 0,
+              error: `Safety block: "${targetRoot}" resides on the same physical disk (${rawSourcePath}) being recovered. Choose a different drive to prevent overwriting deleted clusters.`,
+            };
+          }
+        } catch {
+          // continue if drive resolution is unavailable
+        }
       }
     }
 
@@ -2463,17 +2735,42 @@ app.whenReady().then(() => {
     }
 
     const copyBuf = Buffer.allocUnsafe(4 * 1024 * 1024); // 4 MiB streaming copy buffer
+    const zeroBuf = Buffer.alloc(1024 * 1024); // 1 MiB zero buffer for sparse NTFS runs
     let savedCount = 0;
     let verifiedCount = 0;
     let repairedCount = 0;
     const failures = [];
     const reportLines = [];
     const createdDirs = new Set();
+    const resolvedRoot = path.resolve(targetRoot);
 
     const streamExtent = (srcFd, dstFd, offset, length, isRawDev, lastTwoRef, headChunks) => {
-      let remaining = length;
+      let remaining = Number.isFinite(Number(length)) ? Math.max(0, Math.floor(Number(length))) : 0;
+      if (remaining <= 0) return;
+      let headCaptured = headChunks.reduce((sum, c) => sum + c.length, 0);
+
+      if (offset < 0) {
+        while (remaining > 0) {
+          const zLen = Math.min(zeroBuf.length, remaining);
+          fs.writeSync(dstFd, zeroBuf, 0, zLen);
+          if (headCaptured < 65536) {
+            const take = Math.min(zLen, 65536 - headCaptured);
+            headChunks.push(Buffer.alloc(take));
+            headCaptured += take;
+          }
+          if (zLen >= 2) {
+            lastTwoRef[0] = 0;
+            lastTwoRef[1] = 0;
+          } else if (zLen === 1) {
+            lastTwoRef[0] = lastTwoRef[1];
+            lastTwoRef[1] = 0;
+          }
+          remaining -= zLen;
+        }
+        return;
+      }
+
       let readPos = offset;
-      let headCaptured = 0;
       while (remaining > 0) {
         if (isRawDev) {
           const alignedStart = Math.floor(readPos / 512) * 512;
@@ -2529,12 +2826,17 @@ app.whenReady().then(() => {
     };
 
     for (const item of items) {
-      const safeFolder = String(item.folder || 'Recovered')
+      const folderSegs = String(item.folder || 'Recovered')
         .split(/[\\/]/)
-        .filter(Boolean)
-        .map(sanitizeWinFilename)
-        .join(path.sep);
-      const destDir = path.join(targetRoot, safeFolder);
+        .map((seg) => seg.trim())
+        .filter((seg) => seg && seg !== '.' && seg !== '..')
+        .map(sanitizeWinFilename);
+      const safeFolder = folderSegs.length > 0 ? folderSegs.join(path.sep) : 'Recovered';
+      const destDir = path.resolve(resolvedRoot, safeFolder);
+      if (destDir !== resolvedRoot && !destDir.startsWith(resolvedRoot + path.sep)) {
+        failures.push({ filename: item.filename, reason: 'Blocked invalid destination folder path.' });
+        continue;
+      }
       if (!fs.existsSync(destDir)) {
         fs.mkdirSync(destDir, { recursive: true });
         createdDirs.add(destDir);
@@ -2543,6 +2845,10 @@ app.whenReady().then(() => {
       const rawCleanName = sanitizeWinFilename(item.filename);
       let correctedName = resolvePreferredFilenameCjs(rawCleanName, item.extension);
       let destPath = resolveUniqueDestPath(destDir, correctedName);
+      if (!path.resolve(destPath).startsWith(destDir + path.sep)) {
+        failures.push({ filename: item.filename, reason: 'Blocked invalid destination filename.' });
+        continue;
+      }
 
       // Guard against overwriting an active source file in-place
       if (item.devicePath && path.resolve(item.devicePath).toLowerCase() === path.resolve(destPath).toLowerCase()) {

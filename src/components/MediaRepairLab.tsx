@@ -449,7 +449,13 @@ export const MediaRepairLab: React.FC<MediaRepairLabProps> = ({ onOpenUnknownFil
           {items.length > 0 && (
             <button
               type="button"
-              onClick={() => setItems([])}
+              onClick={() => {
+                for (const u of createdUrlsRef.current) {
+                  if (u.startsWith('blob:')) URL.revokeObjectURL(u);
+                }
+                createdUrlsRef.current = [];
+                setItems([]);
+              }}
               disabled={runningBatch}
               className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded text-xs text-slate-400 hover:text-slate-200 disabled:opacity-40 whitespace-nowrap shrink-0"
             >

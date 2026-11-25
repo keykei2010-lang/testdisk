@@ -892,14 +892,14 @@ function validateAndMeasureMp4(
   }
 
   if (pos > start + firstSize || boxNames.length >= 1) {
-    const missingIndex = hasMdat && !hasMoov && boxNames.length >= 2;
+    const missingIndex = (hasMdat && !hasMoov) || (!hasMdat && boxNames.length === 1 && brand !== 'heic');
     return {
       size: pos - start,
       truncated: missingIndex,
       meta: {
         subExtension: brand === 'qt' ? 'mov' : brand === 'heic' ? 'heic' : 'mp4',
         details: missingIndex
-          ? `ISO BMFF (${brand}) · ${boxNames.join(' → ')} (missing moov index atom)`
+          ? `ISO BMFF (${brand}) · ${boxNames.join(' → ')} (${hasMdat ? 'missing moov index atom' : 'missing mdat payload'})`
           : `ISO BMFF (${brand}) · ${boxNames.join(' → ')}`,
       },
     };

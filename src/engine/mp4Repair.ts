@@ -254,7 +254,7 @@ export function parseH264SpsDimensions(sps: Uint8Array): { width: number; height
   return { width, height, fps };
 }
 
-export function parseHevcSpsDimensions(sps: Uint8Array): { width: number; height: number } | null {
+export function parseHevcSpsDimensions(sps: Uint8Array): { width: number; height: number; fps?: number } | null {
   if (!sps || sps.length < 6 || ((sps[0] >> 1) & 0x3f) !== 33) return null;
   const rbsp = stripEmulationBytes(sps.subarray(2));
   if (rbsp.length < 4) return null;
@@ -1388,7 +1388,7 @@ export function rebuildMp4WithMoov(
   const height = parsedDims?.height ?? refVideo?.height ?? (codec === 'hevc' ? 1080 : 720);
   const timescale = refVideo?.timescale ?? 30000;
   const spsDelta =
-    parsedDims && 'fps' in parsedDims && typeof parsedDims.fps === 'number' && parsedDims.fps > 0
+    parsedDims?.fps && parsedDims.fps > 0
       ? Math.max(1, Math.round(timescale / parsedDims.fps))
       : undefined;
   const sampleDelta = refVideo?.sampleDelta ?? spsDelta ?? 1000;

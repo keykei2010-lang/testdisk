@@ -125,6 +125,19 @@ export const HomeView: React.FC<HomeViewProps> = ({
     (d) => !/^(USB|SD|MMC|1394|iSCSI)$/i.test(d.busType),
   );
 
+  const selectSection = (nextSection: HomeNavSection) => {
+    setSection(nextSection);
+    if (nextSection === 'sdcard') {
+      if (selectedDevicePath && !externalDrives.some((d) => d.devicePath === selectedDevicePath)) {
+        setSelectedDevicePath(externalDrives[0]?.devicePath ?? null);
+      }
+    } else if (nextSection === 'hardware') {
+      if (!selectedDevicePath && !selectedQuickTarget && drives.length > 0) {
+        setSelectedDevicePath(drives[0].devicePath);
+      }
+    }
+  };
+
   const selectedDrive = drives.find((d) => d.devicePath === selectedDevicePath) ?? null;
 
   const getVolumeUsage = (drv: WindowsDriveInfo) => {
@@ -291,7 +304,7 @@ export const HomeView: React.FC<HomeViewProps> = ({
                     <button
                       key={item.id}
                       type="button"
-                      onClick={() => setSection(item.id)}
+                      onClick={() => selectSection(item.id)}
                       className={`w-full flex items-center gap-3 px-3 py-2.5 rounded-md text-xs transition-colors ${
                         active
                           ? 'bg-[#262B36] text-white font-medium'
@@ -321,7 +334,7 @@ export const HomeView: React.FC<HomeViewProps> = ({
                     <button
                       key={item.id}
                       type="button"
-                      onClick={() => setSection(item.id)}
+                      onClick={() => selectSection(item.id)}
                       className={`w-full flex items-center gap-3 px-3 py-2.5 rounded-md text-xs transition-colors ${
                         active
                           ? 'bg-[#262B36] text-white font-medium'

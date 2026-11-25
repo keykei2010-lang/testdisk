@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { AlertTriangle, Archive, CheckCircle2, Folder, HardDrive, X } from 'lucide-react';
 import { createZipArchive, formatBytes } from '../engine/crc32';
 import {
@@ -8,7 +8,6 @@ import {
 } from '../engine/desktopBridge';
 import { FileSourceRef } from '../engine/explorerTypes';
 import { repairFileBuffer, resolvePreferredExtension } from '../engine/recoveryHealth';
-import { identifyBuffer } from '../engine/signatures';
 
 export interface RecoverableItem {
   id: string;
@@ -134,6 +133,8 @@ export const RecoveryModal: React.FC<RecoveryModalProps> = ({
     return () => window.removeEventListener('keydown', onKeyDown);
   }, [onClose, saving]);
 
+  const didInitDefaultRef = useRef(false);
+
   useEffect(() => {
     if (!desktop) return;
     let active = true;
@@ -142,18 +143,22 @@ export const RecoveryModal: React.FC<RecoveryModalProps> = ({
       .then((list) => {
         if (!active) return;
         setVolumes(list);
-        if (list.length > 0 && selectedRootDir === null) {
-          const safeVol =
-            list.find((v) => !sourceDriveLetters.has(v.driveLetter.slice(0, 1).toUpperCase())) ??
-            list[0];
-          setSelectedRootDir(`${safeVol.rootPath}Recovered_Files`);
+        if (list.length > 0 && !didInitDefaultRef.current) {
+          didInitDefaultRef.current = true;
+          setSelectedRootDir((cur) => {
+            if (cur !== null) return cur;
+            const safeVol =
+              list.find((v) => !sourceDriveLetters.has(v.driveLetter.slice(0, 1).toUpperCase())) ??
+              list[0];
+            return `${safeVol.rootPath}Recovered_Files`;
+          });
         }
       })
       .catch(() => {});
     return () => {
       active = false;
     };
-  }, [desktop, selectedRootDir, sourceDriveLetters]);
+  }, [desktop, sourceDriveLetters]);
 
   const truncatedCount = items.filter((i) => i.status === 'OK_TRUNCATED').length;
   const hasBrokenVideo = items.some(
@@ -198,8 +203,7 @@ export const RecoveryModal: React.FC<RecoveryModalProps> = ({
     try {
       const filteredItems = items.filter((item) => {
         if (item.status === 'UNKNOWN') return !enableFileRepair;
-        if (item.sourceRef && item.sourceRef.kind !== 'memory') return true;
-        return identifyBuffer(item.data) !== null;
+        return true;
       });
 
       if (filteredItems.length === 0) {
@@ -393,6 +397,27 @@ export const RecoveryModal: React.FC<RecoveryModalProps> = ({
             item.sourceRef.tskInode,
             item.sourceRef.tskOffset,
           );
+        } else if (
+          desktop &&
+          item.sourceRef?.kind === 'native-runs' &&
+          item.sourceRef.devicePath &&
+          item.sourceRef.runs &&
+          item.sourceRef.runs.length > 0
+        ) {
+          const targetLen = Math.min(item.size, MAX_IN_MEMORY_ZIP_BYTES);
+          const assembled = new Uint8Array(targetLen);
+          let cursor = 0;
+          for (const run of item.sourceRef.runs) {
+            if (cursor >= targetLen) break;
+            const want = Math.min(run.length, targetLen - cursor);
+            if (want <= 0) continue;
+            if (run.offset >= 0) {
+              const part = await desktop.readDiskBytes(item.sourceRef.devicePath, run.offset, want);
+              assembled.set(part.subarray(0, want), cursor);
+            }
+            cursor += want;
+          }
+          payload = assembled.subarray(0, cursor);
         } else if (
           desktop &&
           item.sourceRef?.kind === 'native-device' &&

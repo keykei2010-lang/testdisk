@@ -717,5 +717,375 @@ test('Electron CJS repairMp4StreamingFileCjs streams H.264/ADTS mdat into playab
   }
 });
 
+test('scanNtfsMftRecordsInBuffer recovers emptied $I/$R Recycle Bin pair with original name and path', () => {
+  const bytesPerSector = 512;
+  const clusterSize = 4096;
+  const partStartLba = 2048;
+  const partByteOffset = partStartLba * bytesPerSector;
+  const mftStartCluster = 4;
+  const mftByteOffset = partByteOffset + mftStartCluster * clusterSize;
+  const disk = new Uint8Array(partByteOffset + 16 * clusterSize);
+
+  // MBR partition 0 -> NTFS starting at LBA 2048 (128 sectors)
+  const mbrView = new DataView(disk.buffer);
+  disk[510] = 0x55;
+  disk[511] = 0xaa;
+  disk[446 + 4] = 0x07;
+  mbrView.setUint32(446 + 8, partStartLba, true);
+  mbrView.setUint32(446 + 12, 128, true);
+
+  // NTFS Boot Sector at LBA 2048
+  const oem = 'NTFS    ';
+  for (let i = 0; i < oem.length; i++) {
+    disk[partByteOffset + 3 + i] = oem.charCodeAt(i);
+  }
+  const bsView = new DataView(disk.buffer, partByteOffset, 512);
+  bsView.setUint16(11, bytesPerSector, true);
+  disk[partByteOffset + 13] = clusterSize / bytesPerSector; // sectors per cluster = 8
+  bsView.setBigUint64(40, 128n, true);
+  bsView.setBigUint64(48, BigInt(mftStartCluster), true); // $MFT LCN
+  disk[partByteOffset + 64] = 0xf6; // -10 => 1024-byte MFT records
+  disk[partByteOffset + 510] = 0x55;
+  disk[partByteOffset + 511] = 0xaa;
+
+  const writeMftRecord = (
+    recIndex: number,
+    flags: number,
+    parentRecNum: number,
+    filename: string,
+    residentBytes?: Uint8Array,
+    nonResidentCluster?: { lcn: number; clusterCount: number; fileSize: number },
+  ) => {
+    const recOff = mftByteOffset + recIndex * 1024;
+    const rec = disk.subarray(recOff, recOff + 1024);
+    const v = new DataView(disk.buffer, recOff, 1024);
+    rec[0] = 0x46; // F
+    rec[1] = 0x49; // I
+    rec[2] = 0x4c; // L
+    rec[3] = 0x45; // E
+    v.setUint16(4, 48, true); // USA offset
+    v.setUint16(6, 3, true); // USA count (USN + 2 sectors)
+    v.setUint16(20, 56, true); // first attr offset
+    v.setUint16(22, flags, true); // 0x00 deleted file, 0x01 active file, 0x02 deleted dir, 0x03 active dir
+    v.setUint32(44, recIndex, true); // recordNumber
+    v.setUint16(48, 1, true); // USN value = 1
+    v.setUint16(510, 1, true); // Sector 1 end fixup = USN
+    v.setUint16(1022, 1, true); // Sector 2 end fixup = USN
+
+    let cur = 56;
+    // $FILE_NAME (0x30)
+    const fnPayloadLen = 66 + filename.length * 2;
+    const fnAttrLen = Math.ceil((24 + fnPayloadLen) / 8) * 8;
+    v.setUint32(cur, 0x30, true);
+    v.setUint32(cur + 4, fnAttrLen, true);
+    rec[cur + 8] = 0; // resident
+    v.setUint32(cur + 16, fnPayloadLen, true);
+    v.setUint16(cur + 20, 24, true);
+    const fnStart = cur + 24;
+    v.setUint32(fnStart, parentRecNum, true);
+    v.setUint16(fnStart + 4, 0, true);
+    rec[fnStart + 64] = filename.length;
+    rec[fnStart + 65] = 3; // Win32 + DOS
+    for (let i = 0; i < filename.length; i++) {
+      v.setUint16(fnStart + 66 + i * 2, filename.charCodeAt(i), true);
+    }
+    cur += fnAttrLen;
+
+    // $DATA (0x80)
+    if (residentBytes) {
+      const dataAttrLen = Math.ceil((24 + residentBytes.length) / 8) * 8;
+      v.setUint32(cur, 0x80, true);
+      v.setUint32(cur + 4, dataAttrLen, true);
+      rec[cur + 8] = 0; // resident
+      v.setUint32(cur + 16, residentBytes.length, true);
+      v.setUint16(cur + 20, 24, true);
+      rec.set(residentBytes, cur + 24);
+      cur += dataAttrLen;
+    } else if (nonResidentCluster) {
+      v.setUint32(cur, 0x80, true);
+      v.setUint32(cur + 4, 72, true);
+      rec[cur + 8] = 1; // non-resident
+      v.setUint16(cur + 32, 64, true); // data runs offset
+      v.setBigUint64(cur + 48, BigInt(nonResidentCluster.fileSize), true); // real size
+      // Data run header: 1 byte len + 1 byte LCN
+      rec[cur + 64] = 0x11;
+      rec[cur + 65] = nonResidentCluster.clusterCount;
+      rec[cur + 66] = nonResidentCluster.lcn;
+      rec[cur + 67] = 0x00;
+      cur += 72;
+    }
+
+    // End marker
+    v.setUint32(cur, 0xffffffff, true);
+    v.setUint32(24, cur + 8, true); // usedBytes
+  };
+
+  // Directory chain: Record 5 (root) -> Record 6 ($Recycle.Bin) -> Record 7 (S-1-5-21-1001)
+  writeMftRecord(6, 0x03, 5, '$Recycle.Bin');
+  writeMftRecord(7, 0x03, 6, 'S-1-5-21-1001');
+
+  // Build Windows $IABC123 v2 stub pointing to C:\Users\Owner\Pictures\Emptied_Sunset.jpg
+  const origPath = 'C:\\Users\\Owner\\Pictures\\Emptied_Sunset.jpg';
+  const iStub = new Uint8Array(28 + origPath.length * 2 + 2);
+  const iView = new DataView(iStub.buffer);
+  iView.setUint32(0, 2, true); // version 2
+  iView.setUint32(8, 2048, true); // original size
+  iView.setBigUint64(16, 133800000000000000n, true); // Windows FILETIME
+  iView.setUint32(24, origPath.length + 1, true);
+  for (let i = 0; i < origPath.length; i++) {
+    iView.setUint16(28 + i * 2, origPath.charCodeAt(i), true);
+  }
+
+  // Write payload cluster at LCN 10 with valid JPEG SOI + EOI
+  const payloadCluster = partByteOffset + 10 * clusterSize;
+  disk.set([0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10, 0x4a, 0x46, 0x49, 0x46, 0x00], payloadCluster);
+  disk[payloadCluster + 2046] = 0xff;
+  disk[payloadCluster + 2047] = 0xd9;
+
+  // Emptied (deleted, flag=0x00) $IABC123 and $RABC123.jpg in MFT records 10 and 11
+  writeMftRecord(10, 0x00, 7, '$IABC123.jpg', iStub);
+  writeMftRecord(11, 0x00, 7, '$RABC123.jpg', undefined, { lcn: 10, clusterCount: 1, fileSize: 2048 });
+
+  const partitions = analyzeDiskImage('ntfs_recycle_test.img', disk).partitions;
+  const recovered = scanNtfsMftRecordsInBuffer(disk, partitions, { includeExisting: false });
+
+  assert.equal(recovered.some((r) => r.filename === '$IABC123.jpg'), false, '$I stub should be consumed');
+  const sunset = recovered.find((r) => r.filename === 'Emptied_Sunset.jpg');
+  assert.ok(sunset, 'Expected emptied $RABC123.jpg to be recovered and re-paired as Emptied_Sunset.jpg');
+  assert.equal(sunset.isDeleted, true);
+  assert.equal(sunset.originalWindowsPath, origPath);
+  assert.equal(sunset.reconstructedPath, '\\$Recycle.Bin\\S-1-5-21-1001\\Emptied_Sunset.jpg');
+  assert.equal(sunset.reconstructedBytes[0], 0xff);
+  assert.equal(sunset.reconstructedBytes[1], 0xd8);
+});
+
+test('recycleBinCjs plans NTFS volumes, re-pairs deleted $I/$R records, and tags emptied entries', () => {
+  const requireCjs = createRequire(import.meta.url);
+  const {
+    buildNtfsVolumeScanPlanCjs,
+    filterAndTagEmptiedRecycleEntriesCjs,
+    isRecycleBinEntryName,
+    rePairDeletedRecycleRecordsCjs,
+  } = requireCjs('../electron/recycleBinCjs.cjs');
+
+  assert.equal(isRecycleBinEntryName('$R9X8Y7Z.mp4'), true);
+  assert.equal(isRecycleBinEntryName('$I9X8Y7Z.mp4'), true);
+  assert.equal(isRecycleBinEntryName('$MFT'), false);
+  assert.equal(isRecycleBinEntryName('$UsnJrnl'), false);
+
+  const plan = buildNtfsVolumeScanPlanCjs(
+    [
+      { DriveLetter: 'D', FileSystem: 'NTFS', FileSystemLabel: 'Media', Size: 500_000_000_000 },
+      { DriveLetter: 'C', FileSystem: 'NTFS', FileSystemLabel: 'Windows', Size: 256_000_000_000 },
+      { DriveLetter: 'E', FileSystem: 'FAT32', FileSystemLabel: 'USB', Size: 32_000_000_000 },
+    ],
+    [
+      { DriveLetter: 'C', DiskNumber: 0, Offset: 1048576, Size: 256_000_000_000 },
+      { DriveLetter: 'D', DiskNumber: 1, Offset: 1048576, Size: 500_000_000_000 },
+    ],
+  );
+  assert.equal(plan.length, 2, 'FAT32 volume should be excluded from NTFS recycle lookup plan');
+  assert.equal(plan[0].driveLetter, 'C:');
+  assert.equal(plan[0].volumeDevicePath, '\\\\.\\C:');
+  assert.equal(plan[0].physicalDevicePath, '\\\\.\\PhysicalDrive0');
+  assert.equal(plan[1].driveLetter, 'D:');
+  assert.equal(plan[1].volumeDevicePath, '\\\\.\\D:');
+
+  // Build $I9X8Y7Z.mp4 v2 metadata buffer
+  const orig = 'D:\\Videos\\Emptied_Holiday.mp4';
+  const iBuf = Buffer.alloc(28 + orig.length * 2 + 2);
+  iBuf.writeUInt32LE(2, 0);
+  iBuf.writeUInt32LE(8_388_608, 8);
+  iBuf.writeBigUInt64LE(133800000000000000n, 16);
+  iBuf.writeUInt32LE(orig.length + 1, 24);
+  iBuf.write(orig, 28, 'utf16le');
+
+  const paired = rePairDeletedRecycleRecordsCjs([
+    {
+      volKey: 0,
+      parentRecord: 42,
+      entry: {
+        id: 'i-stub',
+        filename: '$I9X8Y7Z.mp4',
+        size: iBuf.length,
+        headerSample: new Uint8Array(iBuf),
+      },
+    },
+    {
+      volKey: 0,
+      parentRecord: 42,
+      entry: {
+        id: 'r-payload',
+        filename: '$R9X8Y7Z.mp4',
+        originalPath: '\\$Recycle.Bin\\S-1-5-21\\$R9X8Y7Z.mp4',
+        size: 8_388_608,
+        offset: 409600,
+        scanPhase: 'mft',
+        mftResident: false,
+        runs: [{ offset: 409600, length: 8_388_608 }],
+      },
+    },
+    {
+      volKey: 0,
+      parentRecord: 99,
+      entry: {
+        id: 'normal-doc',
+        filename: 'Other_File.txt',
+        originalPath: '\\Docs\\Other_File.txt',
+        size: 120,
+        offset: 819200,
+        scanPhase: 'mft',
+      },
+    },
+  ]);
+
+  const tagged = filterAndTagEmptiedRecycleEntriesCjs(
+    paired.map((r: { entry: Record<string, unknown> }) => r.entry),
+    { driveLetter: 'D:' },
+  );
+  assert.equal(tagged.length, 1);
+  assert.equal(tagged[0].filename, 'Emptied_Holiday.mp4');
+  assert.equal(tagged[0].originalPath, orig);
+  assert.equal(tagged[0].sourceKind, 'recycle-bin');
+  assert.equal(tagged[0].partitionName, 'Emptied $Recycle.Bin (D: · $MFT)');
+});
+
+test('scanNtfsMftRecordsInBuffer preserves sparse cluster alignment', () => {
+  const bytesPerSector = 512;
+  const clusterSize = 4096;
+  const partStartLba = 2048;
+  const partByteOffset = partStartLba * bytesPerSector;
+  const mftStartCluster = 4;
+  const mftByteOffset = partByteOffset + mftStartCluster * clusterSize;
+  const disk = new Uint8Array(partByteOffset + 16 * clusterSize);
+
+  const mbrView = new DataView(disk.buffer);
+  disk[510] = 0x55;
+  disk[511] = 0xaa;
+  disk[446 + 4] = 0x07;
+  mbrView.setUint32(446 + 8, partStartLba, true);
+  mbrView.setUint32(446 + 12, 128, true);
+
+  for (let i = 0; i < 8; i++) disk[partByteOffset + 3 + i] = 'NTFS    '.charCodeAt(i);
+  const bsView = new DataView(disk.buffer, partByteOffset, 512);
+  bsView.setUint16(11, bytesPerSector, true);
+  disk[partByteOffset + 13] = clusterSize / bytesPerSector;
+  bsView.setBigUint64(40, 128n, true);
+  bsView.setBigUint64(48, BigInt(mftStartCluster), true);
+  disk[partByteOffset + 64] = 0xf6;
+  disk[partByteOffset + 510] = 0x55;
+  disk[partByteOffset + 511] = 0xaa;
+
+  // Record 10: sparse run (1 sparse cluster = 4096 zero bytes) followed by LCN 11 ('HELLO')
+  const recOff = mftByteOffset + 10 * 1024;
+  const rec = disk.subarray(recOff, recOff + 1024);
+  const v = new DataView(disk.buffer, recOff, 1024);
+  rec.set([0x46, 0x49, 0x4c, 0x45], 0);
+  v.setUint16(4, 48, true);
+  v.setUint16(6, 3, true);
+  v.setUint16(20, 56, true);
+  v.setUint16(22, 0x00, true); // deleted file
+  v.setUint32(44, 10, true);
+  v.setUint16(48, 1, true);
+  v.setUint16(510, 1, true);
+  v.setUint16(1022, 1, true);
+
+  const fn = 'Sparse_File.bin';
+  let cur = 56;
+  const fnPayloadLen = 66 + fn.length * 2;
+  const fnAttrLen = Math.ceil((24 + fnPayloadLen) / 8) * 8;
+  v.setUint32(cur, 0x30, true);
+  v.setUint32(cur + 4, fnAttrLen, true);
+  v.setUint32(cur + 16, fnPayloadLen, true);
+  v.setUint16(cur + 20, 24, true);
+  v.setUint32(cur + 24, 5, true);
+  rec[cur + 24 + 64] = fn.length;
+  rec[cur + 24 + 65] = 3;
+  for (let i = 0; i < fn.length; i++) v.setUint16(cur + 24 + 66 + i * 2, fn.charCodeAt(i), true);
+  cur += fnAttrLen;
+
+  // Non-resident $DATA with Run 1: sparse (header 0x01, count=1), Run 2: len=1, lcn=+11 (header 0x11, 1, 11)
+  v.setUint32(cur, 0x80, true);
+  v.setUint32(cur + 4, 80, true);
+  rec[cur + 8] = 1;
+  v.setUint16(cur + 32, 64, true);
+  v.setBigUint64(cur + 48, BigInt(clusterSize + 5), true);
+  rec[cur + 64] = 0x01;
+  rec[cur + 65] = 1;
+  rec[cur + 66] = 0x11;
+  rec[cur + 67] = 1;
+  rec[cur + 68] = 11;
+  rec[cur + 69] = 0x00;
+  cur += 80;
+  v.setUint32(cur, 0xffffffff, true);
+  v.setUint32(24, cur + 8, true);
+
+  disk.set(Buffer.from('HELLO'), partByteOffset + 11 * clusterSize);
+
+  const partitions = analyzeDiskImage('sparse.img', disk).partitions;
+  const mft = scanNtfsMftRecordsInBuffer(disk, partitions, { includeExisting: false });
+  const sparseRec = mft.find((r) => r.filename === 'Sparse_File.bin');
+  assert.ok(sparseRec);
+  assert.equal(sparseRec.extents.length, 2);
+  assert.equal(sparseRec.extents[0].offset, -1);
+  assert.equal(sparseRec.extents[0].length, clusterSize);
+  assert.equal(sparseRec.extents[1].offset, partByteOffset + 11 * clusterSize);
+  assert.equal(sparseRec.extents[1].length, 5);
+  assert.equal(
+    Buffer.from(sparseRec.reconstructedBytes.subarray(clusterSize, clusterSize + 5)).toString('ascii'),
+    'HELLO',
+  );
+});
+
+test('corrupt huge exFAT deleted file size exits cleanly and ftyp-only MP4 stub is flagged truncated', () => {
+  const disk = new Uint8Array(64 * 512);
+  const dv = new DataView(disk.buffer);
+  disk[510] = 0x55;
+  disk[511] = 0xaa;
+  disk[446 + 4] = 0x07;
+  dv.setUint32(446 + 8, 8, true);
+  dv.setUint32(446 + 12, 48, true);
+
+  const vol = 8 * 512;
+  for (let i = 0; i < 8; i++) disk[vol + 3 + i] = 'EXFAT   '.charCodeAt(i);
+  const ev = new DataView(disk.buffer, vol, 512);
+  ev.setUint32(80, 16, true);
+  ev.setUint32(84, 4, true);
+  ev.setUint32(88, 24, true);
+  ev.setUint32(92, 4, true);
+  ev.setUint32(96, 2, true);
+  disk[vol + 108] = 9;
+  disk[vol + 109] = 3;
+  disk[vol + 510] = 0x55;
+  disk[vol + 511] = 0xaa;
+
+  const rootOff = vol + 24 * 512;
+  disk[rootOff] = 0x05;
+  disk[rootOff + 1] = 2;
+  disk[rootOff + 32] = 0x40;
+  disk[rootOff + 33] = 0x02;
+  const sv = new DataView(disk.buffer, rootOff + 32, 32);
+  sv.setBigUint64(24, 0x80000000n, true);
+  sv.setUint32(20, 3, true);
+  disk[rootOff + 64] = 0x41;
+  disk[rootOff + 66] = 0x41;
+
+  const parts = analyzeDiskImage('exfat_corrupt.img', disk).partitions;
+  const t0 = Date.now();
+  const res = scanFatAndExfatDeletedInBuffer(disk, parts, { includeExisting: true });
+  assert.ok(Date.now() - t0 < 1000, 'Corrupt exFAT size scan should finish instantaneously');
+  assert.ok(Array.isArray(res));
+
+  const ftypOnly = new Uint8Array([
+    0x00, 0x00, 0x00, 0x18, 0x66, 0x74, 0x79, 0x70,
+    0x6d, 0x70, 0x34, 0x32, 0x00, 0x00, 0x00, 0x00,
+    0x6d, 0x70, 0x34, 0x32, 0x69, 0x73, 0x6f, 0x6d,
+  ]);
+  const idFtyp = identifyBuffer(ftypOnly);
+  assert.ok(idFtyp);
+  assert.equal(idFtyp.status, 'OK_TRUNCATED');
+});
+
+
 
 

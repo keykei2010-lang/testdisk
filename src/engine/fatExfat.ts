@@ -85,7 +85,7 @@ function scanFat32Partition(
   const fatSz32 = dv.getUint32(36, true);
   const rootCluster = dv.getUint32(44, true) || 2;
 
-  if (fatSz32 === 0 || bps < 512 || spc === 0) return [];
+  if (fatSz32 === 0 || bps < 512 || spc === 0 || reservedSectors === 0) return [];
   const clusterBytes = bps * spc;
   const fatStart = volStart + reservedSectors * bps;
   const fatByteLen = fatSz32 * bps;
@@ -225,11 +225,12 @@ function scanFat32Partition(
           let rem = fileSize;
           for (let ci = 0; ci < neededClusters && rem > 0; ci++) {
             const c = firstCluster + ci;
+            const byteOff = dataStart + (c - 2) * clusterBytes;
+            const take = Math.min(rem, clusterBytes);
+            if (byteOff < volStart || byteOff >= disk.length || take <= 0) break;
             if (isDeletedEntry && ci > 0 && readFatEntry(c) !== 0) {
               overwritten = true;
             }
-            const byteOff = dataStart + (c - 2) * clusterBytes;
-            const take = Math.min(rem, clusterBytes);
             if (byteOff + take <= disk.length) {
               extents.push({ offset: byteOff, length: take });
             }
@@ -433,9 +434,10 @@ function scanExfatPartition(
         if (noFatChain || readFat(firstCluster) === 0) {
           for (let ci = 0; ci < needed && rem > 0; ci++) {
             const c = firstCluster + ci;
-            if (isDeleted && bitmap && isClusterAllocated(c)) overwritten = true;
             const byteOff = heapStart + (c - 2) * clusterBytes;
             const take = Math.min(rem, clusterBytes);
+            if (byteOff < volStart || byteOff >= disk.length || take <= 0) break;
+            if (isDeleted && bitmap && isClusterAllocated(c)) overwritten = true;
             if (byteOff + take <= disk.length) {
               extents.push({ offset: byteOff, length: take });
             }

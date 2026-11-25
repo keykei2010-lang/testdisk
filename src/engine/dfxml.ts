@@ -53,8 +53,14 @@ export function buildDfxmlReport(params: {
     );
     if (item.sourceRef?.runs && item.sourceRef.runs.length > 0) {
       lines.push('      <byte_runs>');
+      let fileOffset = 0;
       for (const r of item.sourceRef.runs) {
-        lines.push(`        <byte_run file_offset="0" fs_offset="${r.offset}" len="${r.length}" />`);
+        if (r.offset < 0) {
+          lines.push(`        <byte_run file_offset="${fileOffset}" fill="0" len="${r.length}" />`);
+        } else {
+          lines.push(`        <byte_run file_offset="${fileOffset}" fs_offset="${r.offset}" len="${r.length}" />`);
+        }
+        fileOffset += r.length;
       }
       lines.push('      </byte_runs>');
     } else if (item.offset > 0 || item.sourceKind === 'carved') {

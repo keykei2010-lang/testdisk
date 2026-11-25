@@ -1,4 +1,7 @@
 import { PartitionEntry } from './partitions';
+import { parseWindowsRecycleIFile } from './recycleBin';
+
+const RECYCLE_BIN_ENTRY_RE = /^\$[RI][A-Za-z0-9]{4,}/i;
 
 export interface NtfsClusterRun {
   lcn: number; // -1 for sparse run
@@ -16,6 +19,7 @@ export interface MftDeletedRecord {
   parentRecord: number;
   filename: string;
   reconstructedPath: string;
+  originalWindowsPath?: string;
   isDirectory: boolean;
   inUse: boolean;
   isDeleted: boolean;
@@ -247,7 +251,9 @@ export function parseSingleMftRecord(
   }
 
   if (!filename) return null;
-  if (!includeSystemAndDirs && (filename.startsWith('$') || isDirectory)) return null;
+  if (!includeSystemAndDirs && (isDirectory || (filename.startsWith('$') && !RECYCLE_BIN_ENTRY_RE.test(filename)))) {
+    return null;
+  }
 
   return {
     inUse,
@@ -406,7 +412,11 @@ export function scanNtfsMftRecordsInBuffer(
       continue;
     }
 
-    if ((!includeExisting && parsed.inUse) || parsed.filename.startsWith('$') || seenOffsets.has(off)) {
+    if (
+      (!includeExisting && parsed.inUse) ||
+      (parsed.filename.startsWith('$') && !RECYCLE_BIN_ENTRY_RE.test(parsed.filename)) ||
+      seenOffsets.has(off)
+    ) {
       continue;
     }
     seenOffsets.add(off);
@@ -414,7 +424,11 @@ export function scanNtfsMftRecordsInBuffer(
   }
 
   // Pass 2: Assemble reconstructed paths, extents, payloads, and $Bitmap overwrite checks
-  const results: MftDeletedRecord[] = [];
+  const rawResults: MftDeletedRecord[] = [];
+  const iMetaByParentSuffix = new Map<string, ReturnType<typeof parseWindowsRecycleIFile>>();
+  const iMetaByPartSuffix = new Map<string, ReturnType<typeof parseWindowsRecycleIFile>>();
+  const consumedIOffsets = new Set<string>();
+
   for (const item of candidates) {
     const { off, partId, partName, volOffset, clusterBytes, parsed } = item;
     let reconstructedBytes: Uint8Array = new Uint8Array(0);
@@ -435,6 +449,8 @@ export function scanNtfsMftRecordsInBuffer(
           if (byteStart + copyLen <= diskBytes.length) {
             out.set(diskBytes.subarray(byteStart, byteStart + copyLen), writeCursor);
           }
+        } else {
+          extents.push({ offset: -1, length: copyLen });
         }
         writeCursor += copyLen;
       }
@@ -442,6 +458,18 @@ export function scanNtfsMftRecordsInBuffer(
     }
 
     if (reconstructedBytes.length === 0 && extents.length === 0) continue;
+
+    if (/^\$I[A-Za-z0-9]{4,}/i.test(parsed.filename) && reconstructedBytes.length >= 28) {
+      const meta = parseWindowsRecycleIFile(reconstructedBytes);
+      if (meta) {
+        const suffix = parsed.filename.slice(2).toLowerCase();
+        iMetaByParentSuffix.set(`${partId}:${parsed.parentRecord}:${suffix}`, meta);
+        if (!iMetaByPartSuffix.has(`${partId}:${suffix}`)) {
+          iMetaByPartSuffix.set(`${partId}:${suffix}`, meta);
+        }
+        consumedIOffsets.add(`${partId}:${off}`);
+      }
+    }
 
     const bitmap = bitmapByPartition.get(partId);
     let bitmapChecked = false;
@@ -459,7 +487,7 @@ export function scanNtfsMftRecordsInBuffer(
 
     const reconstructedPath = buildHierarchyPath(partId, parsed.parentRecord, parsed.filename, dirMap);
 
-    results.push({
+    rawResults.push({
       recordNumber: parsed.recordNumber,
       mftOffset: off,
       parentRecord: parsed.parentRecord,
@@ -482,6 +510,30 @@ export function scanNtfsMftRecordsInBuffer(
       totalClusters,
       reconstructedBytes,
     });
+  }
+
+  // Pass 3: Re-pair deleted $Ixxxxxx metadata with matching $Rxxxxxx payload records
+  const results: MftDeletedRecord[] = [];
+  for (const rec of rawResults) {
+    if (consumedIOffsets.has(`${rec.partitionId}:${rec.mftOffset}`)) continue;
+    if (/^\$R[A-Za-z0-9]{4,}/i.test(rec.filename)) {
+      const suffix = rec.filename.slice(2).toLowerCase();
+      const meta =
+        iMetaByParentSuffix.get(`${rec.partitionId}:${rec.parentRecord}:${suffix}`) ??
+        iMetaByPartSuffix.get(`${rec.partitionId}:${suffix}`) ??
+        null;
+      if (meta) {
+        const lastSlash = rec.reconstructedPath.lastIndexOf('\\');
+        rec.reconstructedPath =
+          lastSlash >= 0
+            ? `${rec.reconstructedPath.slice(0, lastSlash + 1)}${meta.originalName}`
+            : `\\$Recycle.Bin\\${meta.originalName}`;
+        rec.filename = meta.originalName;
+        rec.originalWindowsPath = meta.originalPath;
+        if (meta.deletedAtMs > 0) rec.modifiedAtMs = meta.deletedAtMs;
+      }
+    }
+    results.push(rec);
   }
 
   return results;

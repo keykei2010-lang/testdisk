@@ -794,15 +794,13 @@ export const App: React.FC = () => {
       } else {
         setTreeMode('path');
       }
-      setNavHistory((prev) => {
-        const sliced = prev.slice(0, navIndex + 1);
-        const last = sliced[sliced.length - 1];
-        if (last && treeNodeKey(last) === treeNodeKey(node)) return sliced;
-        return [...sliced, node];
-      });
-      setNavIndex((idx) => idx + 1);
+      const sliced = navHistory.slice(0, navIndex + 1);
+      const last = sliced[sliced.length - 1];
+      if (last && treeNodeKey(last) === treeNodeKey(node)) return;
+      setNavHistory([...sliced, node]);
+      setNavIndex(sliced.length);
     },
-    [navIndex],
+    [navHistory, navIndex],
   );
 
   const handleTreeModeChange = (mode: TreeMode) => {
@@ -816,8 +814,9 @@ export const App: React.FC = () => {
 
   const handleNavBack = useCallback(() => {
     if (navIndex <= 0) return;
-    const nextIdx = navIndex - 1;
+    const nextIdx = Math.min(navIndex - 1, navHistory.length - 1);
     const target = navHistory[nextIdx];
+    if (!target) return;
     setNavIndex(nextIdx);
     setSelectedNode(target);
     if (target.kind === 'all-types' || target.kind === 'family' || target.kind === 'ext') {
@@ -831,6 +830,7 @@ export const App: React.FC = () => {
     if (navIndex >= navHistory.length - 1) return;
     const nextIdx = navIndex + 1;
     const target = navHistory[nextIdx];
+    if (!target) return;
     setNavIndex(nextIdx);
     setSelectedNode(target);
     if (target.kind === 'all-types' || target.kind === 'family' || target.kind === 'ext') {
@@ -909,9 +909,15 @@ export const App: React.FC = () => {
       const res = identifyBuffer(sample);
       const fallback = inferFallbackFromExt(entry.extensionHint);
 
+      const hasDiskRuns = Boolean(entry.runs && entry.runs.length > 0);
+      const hasMftBacking =
+        entry.sourceKind === 'ntfs-mft' ||
+        hasDiskRuns ||
+        Boolean(entry.mftResident) ||
+        Boolean(entry.mftOverwritten);
       const isLocationItem =
-        entry.sourceKind === 'recycle-bin' || entry.sourceKind === 'folder';
-      const isMftItem = entry.sourceKind === 'ntfs-mft';
+        (entry.sourceKind === 'recycle-bin' || entry.sourceKind === 'folder') && !hasMftBacking;
+      const isMftItem = hasMftBacking;
       const ext = res?.extension || entry.extensionHint || 'bin';
       const family = res?.family ?? fallback.family;
       const mimeType = res?.mimeType ?? fallback.mimeType;
@@ -945,7 +951,10 @@ export const App: React.FC = () => {
 
       const origin =
         entry.sourceKind === 'recycle-bin'
-          ? { partitionId: 'recycle-bin', partitionName: 'Windows Recycle Bin ($Recycle.Bin)' }
+          ? {
+              partitionId: 'recycle-bin',
+              partitionName: entry.partitionName || 'Windows Recycle Bin ($Recycle.Bin)',
+            }
           : entry.sourceKind === 'folder'
             ? { partitionId: 'folder-scan', partitionName: entry.originalPath || 'Scanned Folder' }
             : (partResolver ? partResolver(entry.offset) : mapOffsetToPartition(entry.offset));
@@ -983,11 +992,13 @@ export const App: React.FC = () => {
         matchedOffset: res?.matchedOffset ?? 0,
         matchedLength: res?.matchedLength ?? 0,
         metadata: res?.metadata ?? {
-          details: isLocationItem
-            ? `Streamed handle (${formatBytes(entry.size)})`
-            : isMftItem
-              ? `${entry.isDeleted === false ? 'Existing' : 'Deleted'} filesystem record (${entry.runs?.length ?? 0} extent${entry.runs?.length === 1 ? '' : 's'})`
-              : 'Streamed disk signature',
+          details: entry.details
+            ? entry.details
+            : isLocationItem
+              ? `Streamed handle (${formatBytes(entry.size)})`
+              : isMftItem
+                ? `${entry.isDeleted === false ? 'Existing' : 'Deleted'} filesystem record (${entry.runs?.length ?? 0} extent${entry.runs?.length === 1 ? '' : 's'})`
+                : 'Streamed disk signature',
         },
         description,
         data: sample,
@@ -1241,8 +1252,12 @@ export const App: React.FC = () => {
       setActiveScreen('explorer');
       navigateToNode({ kind: 'folder-scan' });
       if (res.deletedLookupStatus === 'needs-admin') {
+        const driveLabel =
+          typeof res.backingDrive === 'string'
+            ? res.backingDrive
+            : res.backingDrive?.devicePath || 'the backing drive';
         setMbrActionNotice(
-          `Indexed ${mapped.length} live/Shadow Copy files in "${folderPath}". Run as Administrator to also inspect deleted $MFT / $UsnJrnl records on ${res.backingDrive || 'the backing drive'}.`,
+          `Indexed ${mapped.length} live/Shadow Copy files in "${folderPath}". Run as Administrator to also inspect deleted $MFT / $UsnJrnl records on ${driveLabel}.`,
         );
       } else if (mapped.length === 0) {
         setMbrActionNotice(`No files found inside "${folderPath}".`);
@@ -1273,8 +1288,12 @@ export const App: React.FC = () => {
       setActiveScreen('explorer');
       navigateToNode({ kind: 'folder-scan' });
       if (res.deletedLookupStatus === 'needs-admin') {
+        const driveLabel =
+          typeof res.backingDrive === 'string'
+            ? res.backingDrive
+            : res.backingDrive?.devicePath || 'the backing drive';
         setMbrActionNotice(
-          `Indexed ${mapped.length} Desktop / Shadow Copy files. Run as Administrator to also search emptied deleted files on ${res.backingDrive || 'the backing drive'}.`,
+          `Indexed ${mapped.length} Desktop / Shadow Copy files. Run as Administrator to also search emptied deleted files on ${driveLabel}.`,
         );
       } else if (mapped.length === 0) {
         setMbrActionNotice('No files found inside Windows Desktop.');
@@ -1305,12 +1324,21 @@ export const App: React.FC = () => {
       setActiveScreen('explorer');
       navigateToNode({ kind: 'recycle-bin' });
       if (res.deletedLookupStatus === 'needs-admin') {
+        const drvList = res.needsAdminVolumes?.join(', ') || (typeof res.backingDrive === 'string' ? res.backingDrive : 'the NTFS drives');
         setMbrActionNotice(
-          `Found ${mapped.length} items currently in $Recycle.Bin. Run as Administrator to scan emptied Recycle Bin entries via $MFT / $UsnJrnl on ${res.backingDrive || 'the physical drive'}.`,
+          `Found ${mapped.length} live/Shadow Copy items in $Recycle.Bin. Run as Administrator to also scan emptied Recycle Bin $MFT / $UsnJrnl records on ${drvList}.`,
+        );
+      } else if (res.deletedLookupStatus === 'partial') {
+        setMbrActionNotice(
+          `Recycle Bin scan recovered ${mapped.length} items (${res.liveCount ?? 0} in-bin, ${res.vssCount ?? 0} Shadow Copy, ${res.emptiedCount ?? 0} emptied from ${res.scannedVolumes?.join(', ') || 'NTFS'}). Run as Administrator to also scan ${res.needsAdminVolumes?.join(', ')}.`,
+        );
+      } else if (res.deletedLookupStatus === 'scanned' && (res.emptiedCount || res.vssCount)) {
+        setMbrActionNotice(
+          `Recycle Bin deep scan recovered ${mapped.length} items across ${res.scannedVolumes?.join(', ') || 'NTFS'} (${res.liveCount ?? 0} in-bin, ${res.vssCount ?? 0} Shadow Copy, ${res.emptiedCount ?? 0} emptied $MFT/$UsnJrnl records).`,
         );
       } else if (mapped.length === 0) {
         setMbrActionNotice(
-          'No deleted items found in Windows $Recycle.Bin.',
+          `No live or emptied Recycle Bin entries found${res.scannedVolumes?.length ? ` on ${res.scannedVolumes.join(', ')}` : ''}.`,
         );
       }
     } catch {
@@ -1606,12 +1634,15 @@ export const App: React.FC = () => {
     let repairedData: Uint8Array | null = null;
     let repairNote = '';
 
-    if (bridge) {
-      const isNative =
-        target.sourceRef &&
+    const isNative = Boolean(
+      target.sourceRef &&
         ['native-device', 'native-runs', 'native-file', 'native-tsk'].includes(
           target.sourceRef.kind,
-        );
+        ),
+    );
+    let largeNativeHandledOnDisk = false;
+
+    if (bridge) {
       const ipcRes = await bridge
         .repairMediaFile({
           filename: target.filename,
@@ -1639,10 +1670,36 @@ export const App: React.FC = () => {
             ? ipcRes.repairedBytes
             : new Uint8Array(ipcRes.repairedBytes);
         repairNote = ipcRes.note;
+      } else if (ipcRes?.ok && isNative) {
+        largeNativeHandledOnDisk = true;
+        repairNote = ipcRes.note;
+        await bridge
+          .repairMediaFile({
+            filename: target.filename,
+            extension: target.extension,
+            sourceKind: target.sourceRef?.kind as 'native-file',
+            filePath:
+              target.sourceRef?.kind === 'native-file'
+                ? target.sourceRef.devicePath
+                : undefined,
+            devicePath: target.sourceRef?.devicePath,
+            offset: target.sourceRef?.offset,
+            size: target.sourceRef?.size,
+            runs: target.sourceRef?.runs,
+            tskInode: target.sourceRef?.tskInode,
+            tskOffset: target.sourceRef?.tskOffset,
+            referenceBuffer: referenceBytes,
+            allowTranscodeFallback: true,
+            saveWithDialog: true,
+          })
+          .catch(() => null);
       }
     }
 
+    if (largeNativeHandledOnDisk) return;
+
     if (!repairedData) {
+      if (isNative && sourceBytes.length < target.size) return;
       const rep = repairFileBuffer(target.extension, sourceBytes, referenceBytes);
       if (!rep.repaired) return;
       repairedData = rep.data;

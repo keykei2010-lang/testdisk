@@ -1446,10 +1446,228 @@ function repairAviBufferCjs(rawBuf) {
   };
 }
 
+function isForeignHeaderCjs(buf, off) {
+  if (off + 8 > buf.length) return false;
+  const b0 = buf[off], b1 = buf[off + 1], b2 = buf[off + 2], b3 = buf[off + 3];
+  if (b0 === 0xff && b1 === 0xd8 && b2 === 0xff) return true;
+  if (b0 === 0x89 && b1 === 0x50 && b2 === 0x4e && b3 === 0x47) return true;
+  if (b0 === 0x47 && b1 === 0x49 && b2 === 0x46 && b3 === 0x38) return true;
+  if (b0 === 0x25 && b1 === 0x50 && b2 === 0x44 && b3 === 0x46) return true;
+  if (b0 === 0x50 && b1 === 0x4b && b2 === 0x03 && b3 === 0x04) return true;
+  if (b0 === 0xd0 && b1 === 0xcf && b2 === 0x11 && b3 === 0xe0) return true;
+  if (b0 === 0x52 && b1 === 0x61 && b2 === 0x72 && b3 === 0x21) return true;
+  if (b0 === 0x37 && b1 === 0x7a && b2 === 0xbc && b3 === 0xaf) return true;
+  if (b0 === 0x53 && b1 === 0x51 && b2 === 0x4c && b3 === 0x69) return true;
+  if (b0 === 0x38 && b1 === 0x42 && b2 === 0x50 && b3 === 0x53) return true;
+  if (b0 === 0x52 && b1 === 0x49 && b2 === 0x46 && (b3 === 0x46 || b3 === 0x58)) return true;
+  if (off + 8 <= buf.length && buf[off + 4] === 0x66 && buf[off + 5] === 0x74 && buf[off + 6] === 0x79 && buf[off + 7] === 0x70) return true;
+  return false;
+}
+
+function scoreVideoClusterCjs(chunk) {
+  if (!chunk || chunk.length < 16) return { isVideo: false, hasMoovEnd: false };
+  if (isForeignHeaderCjs(chunk, 0)) return { isVideo: false, hasMoovEnd: false };
+  let zeros = 0;
+  let printable = 0;
+  for (let i = 0; i < chunk.length; i++) {
+    const v = chunk[i];
+    if (v === 0) zeros++;
+    else if (v === 9 || v === 10 || v === 13 || (v >= 32 && v <= 126)) printable++;
+  }
+  const nonZero = chunk.length - zeros;
+  if (nonZero < 16 || (nonZero >= 24 && printable / nonZero > 0.92)) {
+    return { isVideo: false, hasMoovEnd: false };
+  }
+
+  let hasMoovEnd = false;
+  for (let i = 0; i + 8 <= chunk.length; i += 4) {
+    if (chunk[i + 4] === 0x6d && chunk[i + 5] === 0x6f && chunk[i + 6] === 0x6f && chunk[i + 7] === 0x76) {
+      const sz = chunk.readUInt32BE(i);
+      if (sz >= 16 && sz <= 16 * 1024 * 1024) {
+        hasMoovEnd = true;
+        break;
+      }
+    }
+  }
+
+  let nalScore = 0;
+  let seenSingleSlice = false;
+  const lim = Math.min(chunk.length - 8, 256);
+  for (let start = 0; start < lim; start += 2) {
+    let p = start;
+    let chain = 0;
+    let seenVid = false;
+    while (p + 6 <= chunk.length && chain < 12) {
+      const nl = chunk.readUInt32BE(p);
+      if (nl < 2 || nl > 4 * 1024 * 1024) break;
+      const h0 = chunk[p + 4];
+      const h1 = chunk[p + 5];
+      const avcOk = (h0 & 0x80) === 0 && (h0 & 0x1f) >= 1 && (h0 & 0x1f) <= 12;
+      const hevcOk = (h0 & 0x80) === 0 && (h1 & 0x07) >= 1 && (((h0 >>> 1) & 0x3f) <= 21 || (((h0 >>> 1) & 0x3f) >= 32 && ((h0 >>> 1) & 0x3f) <= 40));
+      if (!avcOk && !hevcOk) break;
+      if ((avcOk && [1, 5, 7, 8].includes(h0 & 0x1f)) || hevcOk) seenVid = true;
+      chain++;
+      if (p + 4 + nl >= chunk.length) break;
+      p += 4 + nl;
+    }
+    if (chain >= 2 && seenVid) {
+      nalScore = Math.max(nalScore, chain * 3);
+      break;
+    }
+    if (chain === 1 && seenVid && start === 0) {
+      seenSingleSlice = true;
+      nalScore = Math.max(nalScore, chunk.readUInt32BE(0) >= 64 ? 4 : 2);
+    }
+  }
+
+  let annexHits = 0;
+  for (let i = 0; i + 5 <= chunk.length; i++) {
+    if (chunk[i] === 0 && chunk[i + 1] === 0 && chunk[i + 2] === 0 && chunk[i + 3] === 1) {
+      const h0 = chunk[i + 4];
+      const avcOk = (h0 & 0x80) === 0 && (h0 & 0x1f) >= 1 && (h0 & 0x1f) <= 12;
+      const hevcOk = i + 5 < chunk.length && (h0 & 0x80) === 0 && (chunk[i + 5] & 0x07) >= 1 && (((h0 >>> 1) & 0x3f) <= 21 || (((h0 >>> 1) & 0x3f) >= 32 && ((h0 >>> 1) & 0x3f) <= 40));
+      if (avcOk || hevcOk) {
+        annexHits++;
+        i += 4;
+      }
+    }
+  }
+  const annexScore = annexHits >= 2 ? annexHits * 3 : annexHits === 1 ? 2 : 0;
+
+  let adtsTransitions = 0;
+  for (let i = 0; i + 7 <= chunk.length; i++) {
+    if (chunk[i] === 0xff && (chunk[i + 1] & 0xf6) === 0xf0) {
+      const fl = ((chunk[i + 3] & 0x03) << 11) | (chunk[i + 4] << 3) | ((chunk[i + 5] >>> 5) & 0x07);
+      if (fl >= 7 && fl <= 4096 && i + fl + 2 <= chunk.length && chunk[i + fl] === 0xff && (chunk[i + fl + 1] & 0xf6) === 0xf0) {
+        adtsTransitions++;
+        i += fl - 1;
+      }
+    }
+  }
+  const adtsScore = adtsTransitions >= 2 ? adtsTransitions * 2 + 1 : adtsTransitions === 1 ? (seenSingleSlice || annexHits > 0 ? 3 : 2) : 0;
+
+  const totalScore = (hasMoovEnd ? 3 : 0) + Math.max(nalScore, annexScore) + adtsScore;
+  const bestScore = Math.max(hasMoovEnd ? 3 : 0, nalScore, annexScore, adtsScore, totalScore >= 4 ? totalScore : 0);
+
+  return { isVideo: bestScore >= 4, hasMoovEnd };
+}
+
+/**
+ * Streaming fd-based fragmented/interleaved video reassembly after Stage 2 worker carving.
+ * Converts interrupted MP4/MOV/M4V/3GP carved entries into multi-extent `native-runs` entries.
+ */
+function stitchFragmentedVideosFromFdCjs(devicePath, results, limitBytes, blockSize = 4096) {
+  if (!devicePath || !Array.isArray(results) || results.length === 0) return [];
+  const step = Math.max(512, Math.floor(blockSize / 512) * 512);
+  const nonVideoRanges = results
+    .filter((r) => !['mp4', 'mov', 'm4v', '3gp'].includes(String(r.extensionHint || '').toLowerCase()))
+    .map((r) => ({ start: r.offset || 0, end: (r.offset || 0) + Math.max(step, r.size || 0) }));
+  const insideNonVid = (off) => nonVideoRanges.some((rg) => off >= rg.start && off < rg.end);
+
+  let fd;
+  const updated = [];
+  const secBuf = Buffer.allocUnsafe(step);
+  try {
+    fd = fs.openSync(devicePath, 'r');
+    for (const entry of results) {
+      const ext = String(entry.extensionHint || '').toLowerCase();
+      if ((entry.sourceKind !== 'carved' && entry.sourceKind !== 'native-device') || !['mp4', 'mov', 'm4v', '3gp'].includes(ext)) continue;
+      const baseOff = entry.offset || 0;
+      const declaredSize = entry.size || 0;
+      if (declaredSize < 512 || declaredSize > 512 * 1024 * 1024) continue;
+
+      const runs = [];
+      let frag1End = baseOff + step;
+      let interrupted = false;
+      const declaredEnd = Math.min(limitBytes, baseOff + declaredSize);
+
+      for (let pos = baseOff + step; pos + step <= declaredEnd; pos += step) {
+        if (insideNonVid(pos)) { interrupted = true; break; }
+        const n = fs.readSync(fd, secBuf, 0, step, pos);
+        if (n < 64) { interrupted = true; break; }
+        const slice = secBuf.subarray(0, n);
+        if (isForeignHeaderCjs(slice, 0)) { interrupted = true; break; }
+        let zeros = 0;
+        for (let i = 0; i < n; i++) if (slice[i] === 0) zeros++;
+        if (zeros / n > 0.94) { interrupted = true; break; }
+        frag1End = pos + n;
+      }
+
+      if (!interrupted && declaredEnd < limitBytes && (entry.truncated || entry.status === 'OK_TRUNCATED')) {
+        interrupted = true;
+      }
+      if (!interrupted) continue;
+
+      runs.push({ offset: baseOff, length: Math.max(0, frag1End - baseOff) });
+      const searchStart = Math.ceil((frag1End + step) / step) * step;
+      const searchEnd = Math.min(limitBytes, searchStart + 32 * 1024 * 1024);
+      let activeStart = -1;
+      let activeEnd = -1;
+      let sawMoovAtEnd = false;
+
+      for (let pos = searchStart; pos + step <= searchEnd; pos += step) {
+        if (insideNonVid(pos)) {
+          if (activeStart !== -1) { runs.push({ offset: activeStart, length: activeEnd - activeStart }); activeStart = -1; }
+          continue;
+        }
+        const n = fs.readSync(fd, secBuf, 0, step, pos);
+        if (n < 64) break;
+        const probe = scoreVideoClusterCjs(secBuf.subarray(0, n));
+        if (probe.isVideo) {
+          if (activeStart === -1) activeStart = pos;
+          activeEnd = pos + n;
+          if (probe.hasMoovEnd) {
+            sawMoovAtEnd = true;
+            runs.push({ offset: activeStart, length: activeEnd - activeStart });
+            activeStart = -1;
+            break;
+          }
+        } else if (activeStart !== -1) {
+          runs.push({ offset: activeStart, length: activeEnd - activeStart });
+          activeStart = -1;
+          if (runs.length >= 16) break;
+        }
+      }
+      if (activeStart !== -1) runs.push({ offset: activeStart, length: activeEnd - activeStart });
+
+      if (runs.length > 1) {
+        const totalSize = runs.reduce((s, r) => s + r.length, 0);
+        const sampleTarget = Math.min(65536, totalSize);
+        const hdrBuf = Buffer.allocUnsafe(sampleTarget);
+        let hPos = 0;
+        for (const r of runs) {
+          if (hPos >= sampleTarget) break;
+          const want = Math.min(r.length, sampleTarget - hPos);
+          if (want <= 0) continue;
+          const rn = r.offset >= 0 ? fs.readSync(fd, hdrBuf, hPos, want, r.offset) : 0;
+          if (rn < want) hdrBuf.fill(0, hPos + Math.max(0, rn), hPos + want);
+          hPos += want;
+        }
+        entry.runs = runs;
+        entry.size = totalSize;
+        entry.calculatedSize = totalSize;
+        entry.truncated = !sawMoovAtEnd;
+        entry.headerSample = new Uint8Array(hdrBuf.buffer, hdrBuf.byteOffset, hPos);
+        entry.discoveryCrc32 = computeCrc32Cjs(hdrBuf, 0, hPos);
+        entry.details = `${entry.details || `${ext.toUpperCase()} stream`} · stitched ${runs.length} non-contiguous fragments`;
+        updated.push(entry);
+      }
+    }
+  } catch {
+    // ignore read error on closing handle
+  } finally {
+    if (fd !== undefined) {
+      try { fs.closeSync(fd); } catch { /* ignore */ }
+    }
+  }
+  return updated;
+}
+
 module.exports = {
   repairMp4StreamingFileCjs,
   repairJpegBufferCjs,
   repairPngBufferCjs,
   repairAviBufferCjs,
   extractEmbeddedJpegCjs,
+  stitchFragmentedVideosFromFdCjs,
 };

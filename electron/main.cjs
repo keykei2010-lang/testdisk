@@ -12,6 +12,7 @@ const {
   runTskFlsScan,
   extractTskInodeToFile,
   readTskInodeHead,
+  identifyBufferHeadCjs,
   runFidentifyPaths,
   probeVideoFrameWithFfmpeg,
   ffmpegRepairVideoFile,
@@ -22,7 +23,9 @@ const {
   repairPngBufferCjs,
   repairAviBufferCjs,
   extractEmbeddedJpegCjs,
+  stitchFragmentedVideosFromFdCjs,
 } = require('./mediaRepairCjs.cjs');
+const { repairNonMediaBufferCjs } = require('./documentRepairCjs.cjs');
 const {
   buildNtfsVolumeScanPlanCjs,
   filterAndTagEmptiedRecycleEntriesCjs,
@@ -62,39 +65,23 @@ const ZIP_CONTAINER_EXTS_CJS = new Set([
   'epub',
   'apk',
   'jar',
+  'kra',
+  'ora',
+  'kmz',
+  'xps',
   'zip',
 ]);
-const OLE2_CONTAINER_EXTS_CJS = new Set(['doc', 'xls', 'ppt', 'msi', 'msg']);
+const OLE2_CONTAINER_EXTS_CJS = new Set(['doc', 'xls', 'ppt', 'msi', 'msg', 'pub']);
+const NON_MEDIA_REPAIR_EXTS_CJS = new Set([
+  'zip', 'docx', 'xlsx', 'pptx', 'odt', 'ods', 'odp', 'epub', 'apk', 'jar', 'kra', 'ora', 'kmz',
+  'aep', 'sqlite', 'db', 'sqlite3', 'psd', 'psb', 'pdf',
+  'doc', 'xls', 'ppt', 'msg', 'msi', 'pst', 'ost', 'rpa',
+  'aepx', 'xml', 'svg', 'html', 'htm', 'json', 'rpy', 'txt', 'py', 'ini', 'csv', 'sql', 'eml', 'rtf',
+  'tar', 'gz', 'mp3', 'flac',
+]);
 
 function detectMagicExtFromHeadCjs(buf) {
-  if (!buf || buf.length < 4) return null;
-  if (buf[0] === 0xff && buf[1] === 0xd8 && buf[2] === 0xff) return 'jpg';
-  if (buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4e && buf[3] === 0x47) return 'png';
-  if (buf.length >= 6 && buf.toString('ascii', 0, 6).startsWith('GIF8')) return 'gif';
-  if (buf[0] === 0x42 && buf[1] === 0x4d) return 'bmp';
-  if (buf.length >= 5 && buf.toString('ascii', 0, 5) === '%PDF-') return 'pdf';
-  if (buf[0] === 0x50 && buf[1] === 0x4b && buf[2] === 0x03 && buf[3] === 0x04) return 'zip';
-  if (buf[0] === 0xd0 && buf[1] === 0xcf && buf[2] === 0x11 && buf[3] === 0xe0) return 'doc';
-  if (buf.length >= 12 && buf.toString('ascii', 4, 8) === 'ftyp') {
-    const brand = buf.toString('ascii', 8, 12);
-    if (brand === 'crx ') return 'cr3';
-    if (brand.toLowerCase().startsWith('qt')) return 'mov';
-    if (brand === 'heic' || brand === 'mif1') return 'heic';
-    return 'mp4';
-  }
-  if (buf[0] === 0x1a && buf[1] === 0x45 && buf[2] === 0xdf && buf[3] === 0xa3) return 'mkv';
-  if (buf.length >= 12 && buf.toString('ascii', 0, 4) === 'RIFF') {
-    const fc = buf.toString('ascii', 8, 12);
-    if (fc === 'WAVE') return 'wav';
-    if (fc === 'AVI ') return 'avi';
-    if (fc === 'WEBP') return 'webp';
-  }
-  if (buf[0] === 0x49 && buf[1] === 0x44 && buf[2] === 0x33) return 'mp3';
-  if (buf.toString('ascii', 0, 4) === 'fLaC') return 'flac';
-  if (buf.toString('ascii', 0, 4) === 'OggS') return 'ogg';
-  if (buf[0] === 0x52 && buf[1] === 0x61 && buf[2] === 0x72 && buf[3] === 0x21) return 'rar';
-  if (buf.length >= 6 && buf[0] === 0x37 && buf[1] === 0x7a && buf[2] === 0xbc && buf[3] === 0xaf) return '7z';
-  return null;
+  return identifyBufferHeadCjs(buf);
 }
 
 function resolvePreferredFilenameCjs(filename, detectedExt) {
@@ -109,6 +96,9 @@ function resolvePreferredFilenameCjs(filename, detectedExt) {
   if (curExt === cleanDetected) return filename;
   if ((curExt === 'jpeg' && cleanDetected === 'jpg') || (curExt === 'jpg' && cleanDetected === 'jpeg')) return filename;
   if ((curExt === 'tiff' && cleanDetected === 'tif') || (curExt === 'tif' && cleanDetected === 'tiff')) return filename;
+  if ((curExt === 'ost' && cleanDetected === 'pst') || (curExt === 'pst' && cleanDetected === 'ost')) return filename;
+  if (cleanDetected === 'sqlite' && (curExt === 'db' || curExt === 'sqlite3')) return filename;
+  if (cleanDetected === 'xml' && ['svg', 'aepx', 'html', 'htm'].includes(curExt)) return filename;
   if (cleanDetected === 'zip' && ZIP_CONTAINER_EXTS_CJS.has(curExt)) return filename;
   if (cleanDetected === 'doc' && OLE2_CONTAINER_EXTS_CJS.has(curExt)) return filename;
   return `${stem}.${cleanDetected}`;
@@ -1864,7 +1854,7 @@ app.whenReady().then(() => {
         const copyChunk = Buffer.allocUnsafe(4 * 1024 * 1024);
         const zeroChunk = Buffer.alloc(1024 * 1024);
         const rawRanges =
-          params.sourceKind === 'native-runs' && Array.isArray(params.runs) && params.runs.length > 0
+          Array.isArray(params.runs) && params.runs.length > 0
             ? params.runs
             : [{ offset: params.offset || 0, length: params.size || 0 }];
         try {
@@ -1977,18 +1967,30 @@ app.whenReady().then(() => {
           stagePath = tmpStruct;
           structuralTier = 'structural-gif';
           structuralNote = 'Appended missing GIF89a/87a trailer (0x3B).';
+        } else if (NON_MEDIA_REPAIR_EXTS_CJS.has(ext)) {
+          const docRes = repairNonMediaBufferCjs(ext, rawBuf);
+          if (docRes) {
+            if (docRes.salvagedPreview) salvagedPreviewBuf = docRes.salvagedPreview;
+            if (docRes.data) {
+              fs.writeFileSync(tmpStruct, docRes.data);
+              stagePath = tmpStruct;
+              structuralTier = `structural-${ext}`;
+              structuralNote = docRes.note;
+            }
+          }
         }
       }
 
-      // Phase 2: Multi-tier FFmpeg escalation when FFmpeg is bundled (skip slow copy on huge already-repaired >1 GiB MP4 unless needed)
+      // Phase 2: Multi-tier FFmpeg escalation when FFmpeg is bundled (skip non-media docs/archives & >1 GiB remuxes)
       let finalPath = stagePath;
       let finalTier = structuralTier || 'none';
       let finalNote = structuralNote;
 
       const stageSize = fs.statSync(stagePath).size;
+      const skipFfmpegForDoc = NON_MEDIA_REPAIR_EXTS_CJS.has(ext) && ext !== 'mp3' && ext !== 'flac';
       const skipRedundantFfmpegCopy = Boolean(structuralTier === 'structural-moov' && stageSize > 1024 * 1024 * 1024);
 
-      if (getEngineCapabilitiesSync().ffmpeg && !skipRedundantFfmpegCopy) {
+      if (!skipFfmpegForDoc && getEngineCapabilitiesSync().ffmpeg && !skipRedundantFfmpegCopy) {
         const ffRes = await ffmpegRepairVideoFile(stagePath, tmpOut, {
           extension: ext,
           allowTranscode: Boolean(params.allowTranscodeFallback),
@@ -2001,12 +2003,15 @@ app.whenReady().then(() => {
       }
 
       if (finalTier === 'none') {
+        const isDocOrArchive = NON_MEDIA_REPAIR_EXTS_CJS.has(ext) && ext !== 'mp3' && ext !== 'flac';
         return {
           ok: false,
           tier: 'none',
           repairedSize: srcSize,
           salvagedPreviewBytes: salvagedPreviewBuf ? new Uint8Array(salvagedPreviewBuf) : undefined,
-          note: 'Container could not be repaired automatically. Enable salvage re-encode or supply a healthy reference clip/photo.',
+          note: isDocOrArchive
+            ? `No structural patches needed or .${ext.toUpperCase()} stream cannot be rebuilt automatically (${Math.round(srcSize / 1024)} KiB).`
+            : 'Container could not be repaired automatically. Enable salvage re-encode or supply a healthy reference clip/photo.',
         };
       }
 
@@ -2651,6 +2656,20 @@ app.whenReady().then(() => {
         }
       });
 
+      // Stage 2B: Non-contiguous / interleaved video frame reassembly across unallocated clusters
+      if (!state.cancelled && results.length > 0) {
+        const stitched = stitchFragmentedVideosFromFdCjs(
+          devicePath,
+          results,
+          limitBytes,
+          Math.max(step, 4096),
+        );
+        if (stitched.length > 0) {
+          foundBytes = results.reduce((s, r) => s + (r.size || 0), 0);
+          event.sender.send('win:drive-scan-batch', { scanId, entries: stitched });
+        }
+      }
+
       event.sender.send('win:drive-scan-progress', {
         scanId,
         currentBytes: state.cancelled ? totalBytesRead : limitBytes,
@@ -2940,9 +2959,10 @@ app.whenReady().then(() => {
         dstFd = fs.openSync(partialPath, 'w');
         const lastTwo = [0, 0];
         const headChunks = [];
-        if (item.sourceKind === 'native-runs' && Array.isArray(item.runs) && item.runs.length > 0) {
+        if (Array.isArray(item.runs) && item.runs.length > 0) {
+          const isRawDev = Boolean(item.devicePath && item.devicePath.startsWith('\\\\.\\')) || item.sourceKind === 'native-runs' || item.sourceKind === 'native-device';
           for (const run of item.runs) {
-            streamExtent(srcFd, dstFd, run.offset, run.length, true, lastTwo, headChunks);
+            streamExtent(srcFd, dstFd, run.offset, run.length, isRawDev, lastTwo, headChunks);
           }
         } else {
           streamExtent(
@@ -3069,6 +3089,18 @@ app.whenReady().then(() => {
           savedCount++;
           reportLines.push(`OK\t${item.size}\t${crcStatus}\t${correctedName}\t${destPath}`);
           continue;
+        } else if (
+          item.repairIfTruncated &&
+          NON_MEDIA_REPAIR_EXTS_CJS.has(effectiveExt) &&
+          fs.statSync(partialPath).size <= 128 * 1024 * 1024
+        ) {
+          fs.closeSync(dstFd);
+          const docRes = repairNonMediaBufferCjs(effectiveExt, fs.readFileSync(partialPath));
+          if (docRes && docRes.data) {
+            fs.writeFileSync(partialPath, docRes.data);
+            repairedCount++;
+          }
+          dstFd = fs.openSync(partialPath, 'r+');
         }
 
         if (item.modifiedAtMs) {

@@ -1086,6 +1086,340 @@ test('corrupt huge exFAT deleted file size exits cleanly and ftyp-only MP4 stub 
   assert.equal(idFtyp.status, 'OK_TRUNCATED');
 });
 
+test('expanded 150+ signature catalog has unique IDs and identifies modern project, office, database, and forensic containers', () => {
+  assert.ok(FILE_FORMATS.length >= 145, `Expected >=145 formats, got ${FILE_FORMATS.length}`);
+  const idSet = new Set<string>();
+  for (const fmt of FILE_FORMATS) {
+    assert.equal(idSet.has(fmt.id), false, `Duplicate format ID: ${fmt.id}`);
+    idSet.add(fmt.id);
+  }
+
+  // ZIP sub-typing -> .docx, .xlsx, .apk
+  const mkZipEntry = (name: string) => {
+    const nb = Buffer.from(name, 'utf8');
+    const hdr = Buffer.alloc(30 + nb.length);
+    hdr.writeUInt32LE(0x04034b50, 0);
+    hdr.writeUInt16LE(20, 4);
+    hdr.writeUInt16LE(nb.length, 26);
+    nb.copy(hdr, 30);
+    return new Uint8Array(hdr);
+  };
+  assert.equal(identifyBuffer(mkZipEntry('word/document.xml'))?.extension, 'docx');
+  assert.equal(identifyBuffer(mkZipEntry('xl/workbook.xml'))?.extension, 'xlsx');
+  assert.equal(identifyBuffer(mkZipEntry('AndroidManifest.xml'))?.extension, 'apk');
+
+  // After Effects .aep (RIFX...Egg!)
+  const aep = Buffer.alloc(32);
+  aep.write('RIFX', 0, 'ascii');
+  aep.writeUInt32BE(24, 4);
+  aep.write('Egg!', 8, 'ascii');
+  aep.write('LIST', 12, 'ascii');
+  assert.equal(identifyBuffer(new Uint8Array(aep))?.extension, 'aep');
+
+  // Photoshop .psd (8BPS v1)
+  const psd = Buffer.alloc(36);
+  psd.write('8BPS', 0, 'ascii');
+  psd.writeUInt16BE(1, 4);
+  assert.equal(identifyBuffer(new Uint8Array(psd))?.extension, 'psd');
+
+  // Outlook .pst (!BDN...SM\0\0)
+  const pst = Buffer.alloc(576);
+  pst.write('!BDN', 0, 'ascii');
+  pst.write('SM\0\0', 8, 'ascii');
+  assert.equal(identifyBuffer(new Uint8Array(pst))?.extension, 'pst');
+
+  // Ren'Py .rpa & .rpyc
+  const rpa = Buffer.from('RPA-3.0 0000000000000120 42424242\nPAYLOAD', 'ascii');
+  assert.equal(identifyBuffer(new Uint8Array(rpa))?.extension, 'rpa');
+  const rpyc = Buffer.concat([Buffer.from('RENPY RPC2', 'ascii'), Buffer.from([1, 0, 0, 0, 0, 0])]);
+  assert.equal(identifyBuffer(new Uint8Array(rpyc))?.extension, 'rpyc');
+
+  // Blender, glTF binary (.glb), AutoCAD (.dwg), EVTX, LNK, PCAPNG, ZSTD
+  assert.equal(identifyBuffer(new Uint8Array(Buffer.from('BLENDER-v305REND\0\0\0\0', 'ascii')))?.extension, 'blend');
+  const glb = Buffer.alloc(24);
+  glb.write('glTF', 0, 'ascii');
+  glb.writeUInt32LE(2, 4);
+  glb.writeUInt32LE(24, 8);
+  assert.equal(identifyBuffer(new Uint8Array(glb))?.extension, 'glb');
+  assert.equal(identifyBuffer(new Uint8Array(Buffer.from('AC1032\0\0\0\0\0\0\0\0\0\0', 'ascii')))?.extension, 'dwg');
+  assert.equal(identifyBuffer(new Uint8Array(Buffer.from('ElfFile\0\0\0\0\0\0\0\0\0', 'ascii')))?.extension, 'evtx');
+  assert.equal(
+    identifyBuffer(new Uint8Array([0x0a, 0x0d, 0x0d, 0x0a, 28, 0, 0, 0, 0x4d, 0x3c, 0x2b, 0x1a, 1, 0, 0, 0]))?.extension,
+    'pcapng',
+  );
+  assert.equal(identifyBuffer(new Uint8Array([0x28, 0xb5, 0x2f, 0xfd, 0x24, 0x00, 0x00, 0x00]))?.extension, 'zst');
+});
+
+test('non-media structural repair fixes ZIP/DOCX central directory, AEP RIFX, AEPX/JSON/RPY, SQLite, PDF xref, PSD, PST, RPA', () => {
+  // 1. Truncated .docx (ZIP missing EOCD + truncated stored XML entry)
+  const docName = Buffer.from('word/document.xml', 'utf8');
+  const xmlBody = Buffer.from('<w:document><w:body><w:p>Hello world', 'utf8');
+  const lfh = Buffer.alloc(30 + docName.length + xmlBody.length);
+  lfh.writeUInt32LE(0x04034b50, 0);
+  lfh.writeUInt16LE(20, 4);
+  lfh.writeUInt16LE(0, 8); // store
+  lfh.writeUInt32LE(xmlBody.length + 50, 18); // intentionally over-long
+  lfh.writeUInt32LE(xmlBody.length + 50, 22);
+  lfh.writeUInt16LE(docName.length, 26);
+  docName.copy(lfh, 30);
+  xmlBody.copy(lfh, 30 + docName.length);
+
+  const docxDiag = diagnoseMediaFile('docx', new Uint8Array(lfh));
+  assert.equal(docxDiag.canRepair, true);
+  const docxRep = repairFileBuffer('docx', new Uint8Array(lfh));
+  assert.equal(docxRep.repaired, true);
+  const docxStr = Buffer.from(docxRep.data).toString('latin1');
+  assert.ok(docxStr.includes('PK\x01\x02'), 'Expected rebuilt Central Directory');
+  assert.ok(docxStr.includes('PK\x05\x06'), 'Expected rebuilt EOCD');
+  assert.ok(docxStr.includes('</w:p></w:body></w:document>'), 'Expected unclosed OOXML tags closed');
+
+  // 2. Truncated .aep RIFX container
+  const aepBad = Buffer.alloc(36);
+  aepBad.write('RIFX', 0, 'ascii');
+  aepBad.writeUInt32BE(9999, 4);
+  aepBad.write('Egg!', 8, 'ascii');
+  aepBad.write('head', 12, 'ascii');
+  aepBad.writeUInt32BE(8, 16);
+  aepBad.write('LIST', 28, 'ascii');
+  aepBad.writeUInt32BE(4000, 32); // broken trailing chunk header
+  const aepRep = repairFileBuffer('aep', new Uint8Array(aepBad));
+  assert.equal(aepRep.repaired, true);
+  assert.equal(aepRep.data.length, 28);
+  assert.equal(Buffer.from(aepRep.data).readUInt32BE(4), 20);
+
+  // 3. Truncated JSON & .aepx / .rpy with trailing nulls
+  const jsonTrunc = Buffer.from('{"project":{"name":"Scene 1","layers":[1,2]}\0\0\0\0', 'utf8');
+  const jsonRep = repairFileBuffer('json', new Uint8Array(jsonTrunc));
+  assert.equal(jsonRep.repaired, true);
+  const parsedJson = JSON.parse(Buffer.from(jsonRep.data).toString('utf8'));
+  assert.equal(parsedJson.project.name, 'Scene 1');
+
+  const aepxTrunc = Buffer.from('<?xml version="1.0"?><AfterEffectsProject><Comp name="Main">\0\0\0', 'utf8');
+  const aepxRep = repairFileBuffer('aepx', new Uint8Array(aepxTrunc));
+  assert.equal(aepxRep.repaired, true);
+  const aepxText = Buffer.from(aepxRep.data).toString('utf8');
+  assert.ok(aepxText.endsWith('</Comp></AfterEffectsProject>'));
+
+  const rpySlack = Buffer.from('label start:\n    "Hi"\n\0\0\0\0\0\0\0\0', 'utf8');
+  const rpyRep = repairFileBuffer('rpy', new Uint8Array(rpySlack));
+  assert.equal(rpyRep.repaired, true);
+  assert.equal(Buffer.from(rpyRep.data).toString('utf8'), 'label start:\n    "Hi"\n');
+
+  // 4. SQLite header alignment + WAL reset
+  const dbBuf = Buffer.alloc(4096 * 2);
+  dbBuf.write('SQLite format 3\0', 0, 'ascii');
+  dbBuf.writeUInt16BE(4096, 16);
+  dbBuf[18] = 2; // WAL write version
+  dbBuf[19] = 2; // WAL read version
+  dbBuf.writeUInt32BE(10, 28); // wrong pageCount + trailing zero page
+  const sqlRep = repairFileBuffer('sqlite', new Uint8Array(dbBuf));
+  assert.equal(sqlRep.repaired, true);
+  assert.equal(sqlRep.data.length, 4096);
+  assert.equal(Buffer.from(sqlRep.data).readUInt32BE(28), 1);
+  assert.equal(sqlRep.data[18], 1);
+
+  // 5. PDF missing xref / startxref
+  const pdfRaw = Buffer.from(
+    '%PDF-1.4\n1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n2 0 obj\n<< /Type /Pages /Count 0 >>\nendobj\n',
+    'ascii',
+  );
+  const pdfRep = repairFileBuffer('pdf', new Uint8Array(pdfRaw));
+  assert.equal(pdfRep.repaired, true);
+  const pdfTxt = Buffer.from(pdfRep.data).toString('ascii');
+  assert.ok(pdfTxt.includes('\nxref\n0 3\n'));
+  assert.ok(pdfTxt.includes('/Root 1 0 R'));
+  assert.ok(pdfTxt.includes('startxref'));
+  assert.ok(pdfTxt.trimEnd().endsWith('%%EOF'));
+
+  // 6. PSD truncated section clamp + RPA / PST
+  const psdBad = Buffer.alloc(48);
+  psdBad.write('8BPS', 0, 'ascii');
+  psdBad.writeUInt16BE(1, 4);
+  psdBad.writeUInt32BE(999999, 26); // ColorModeData len exceeds buffer
+  const psdRep = repairFileBuffer('psd', new Uint8Array(psdBad));
+  assert.equal(psdRep.repaired, true);
+  assert.equal(Buffer.from(psdRep.data).readUInt32BE(26), psdBad.length - 30);
+
+  const pstBad = Buffer.alloc(600);
+  pstBad.write('!BDN', 0, 'ascii');
+  pstBad.write('SM\0\0', 8, 'ascii');
+  pstBad[10] = 23; // Unicode PST magic >= 23
+  pstBad.writeBigUInt64LE(999999n, 0xb8);
+  const pstRep = repairFileBuffer('pst', new Uint8Array(pstBad));
+  assert.equal(pstRep.repaired, true);
+  assert.equal(Buffer.from(pstRep.data).readBigUInt64LE(0xb8), 600n);
+});
+
+test('non-contiguous / interleaved MP4 fragments interrupted by JPEG photo are stitched and playable in TS & Electron CJS', () => {
+  const ftyp = Buffer.from([
+    0x00, 0x00, 0x00, 0x10, 0x66, 0x74, 0x79, 0x70,
+    0x69, 0x73, 0x6f, 0x6d, 0x00, 0x00, 0x02, 0x00,
+  ]);
+  const frag1Payload = Buffer.from([
+    0x00, 0x00, 0x00, 0x04, 0x67, 0x42, 0xc0, 0x1e, // SPS
+    0x00, 0x00, 0x00, 0x04, 0x68, 0xce, 0x38, 0x80, // PPS
+    0x00, 0x00, 0x00, 0x06, 0x65, 0x88, 0x84, 0x21, 0xa0, 0x00, // IDR #1
+  ]);
+  const mdatHdr = Buffer.alloc(8);
+  mdatHdr.writeUInt32BE(2048, 0); // declared size spans across fragmentation gap & interleaved JPEG!
+  mdatHdr.write('mdat', 4, 'ascii');
+
+  const jpgPhoto = Buffer.from([
+    0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10, 0x4a, 0x46, 0x49, 0x46, 0x00, 0x01, 0x01, 0x00, 0x00, 0x01,
+    0x00, 0x01, 0x00, 0x00, 0xff, 0xda, 0x00, 0x08, 0x01, 0x01, 0x00, 0x00, 0x3f, 0x00, 0x11, 0x22,
+    0xff, 0xd9,
+  ]);
+
+  const frag2Frames = Buffer.from([
+    0x00, 0x00, 0x00, 0x06, 0x65, 0x88, 0x84, 0x21, 0xb0, 0x01, // IDR #2
+    0xff, 0xf1, 0x50, 0x80, 0x01, 0x5f, 0xfc, 0x21, 0x00, 0x1a, // ADTS #1
+    0xff, 0xf1, 0x50, 0x80, 0x01, 0x5f, 0xfc, 0x21, 0x00, 0x1b, // ADTS #2
+    0x00, 0x00, 0x00, 0x06, 0x41, 0x9a, 0x22, 0x11, 0x00, 0x02, // P-frame
+  ]);
+
+  // Disk layout:
+  // 512..1024   : Fragment 1 (ftyp + mdat header + SPS/PPS/IDR1)
+  // 1024..1536  : Interleaved JPEG photo
+  // 2048..2560  : Fragment 2 (IDR2 + ADTS + P-frame)
+  const disk = new Uint8Array(8192);
+  disk.set(ftyp, 512);
+  disk.set(mdatHdr, 512 + ftyp.length);
+  disk.set(frag1Payload, 512 + ftyp.length + 8);
+  disk.set(jpgPhoto, 1024);
+  disk.set(frag2Frames, 2048);
+
+  const carved = carveDiskBuffer(disk, { startByte: 0, endByte: disk.length, blockSize: 512 });
+  const carvedJpg = carved.find((c) => c.extension === 'jpg');
+  assert.ok(carvedJpg, 'Expected interleaved JPEG to still be carved');
+
+  const stitchedMp4 = carved.find((c) => c.extension === 'mp4');
+  assert.ok(stitchedMp4, 'Expected MP4 to be carved & stitched');
+  assert.ok(stitchedMp4.runs && stitchedMp4.runs.length >= 2, 'Expected >=2 extent runs after stitching');
+  assert.equal(stitchedMp4.status, 'OK');
+  assert.ok(inspectMp4Health(stitchedMp4.data).hasMoov, 'Expected rebuilt playable moov atom');
+
+  // Verify Electron CJS stitcher + documentRepairCjs + offline fidentify fallback
+  const req = createRequire(import.meta.url);
+  const { stitchFragmentedVideosFromFdCjs } = req('../electron/mediaRepairCjs.cjs');
+  const { repairNonMediaBufferCjs } = req('../electron/documentRepairCjs.cjs');
+  const { runFidentifyPaths, getEngineCapabilitiesSync } = req('../electron/enginesHelper.cjs');
+
+  assert.equal(getEngineCapabilitiesSync(false).fidentify, true);
+  assert.equal(repairNonMediaBufferCjs('json', Buffer.from('{"a":1\0\0')).data.toString('utf8'), '{"a":1}');
+
+  const tmpDir = os.tmpdir();
+  const imgPath = path.join(tmpDir, `frag_test_${Date.now()}.img`);
+  const unkPath = path.join(tmpDir, `unknown_noext_${Date.now()}`);
+  try {
+    fs.writeFileSync(imgPath, disk);
+    fs.writeFileSync(unkPath, Buffer.from('%PDF-1.7\n1 0 obj\n'));
+
+    const cjsEntries: Array<Record<string, unknown>> = [
+      {
+        id: 'drv-512-mp4',
+        extensionHint: 'mp4',
+        sourceKind: 'carved',
+        offset: 512,
+        size: 1024,
+        truncated: true,
+      },
+      {
+        id: 'drv-1024-jpg',
+        extensionHint: 'jpg',
+        sourceKind: 'carved',
+        offset: 1024,
+        size: jpgPhoto.length,
+        truncated: false,
+      },
+    ];
+    const stitchedCjs = stitchFragmentedVideosFromFdCjs(imgPath, cjsEntries, disk.length, 512);
+    assert.equal(stitchedCjs.length, 1);
+    assert.ok(Array.isArray(stitchedCjs[0].runs) && stitchedCjs[0].runs.length >= 2);
+
+    return runFidentifyPaths([unkPath]).then((idMap: Record<string, string>) => {
+      assert.equal(idMap[unkPath], 'pdf');
+    });
+  } finally {
+    if (fs.existsSync(imgPath)) fs.unlinkSync(imgPath);
+    if (fs.existsSync(unkPath)) fs.unlinkSync(unkPath);
+  }
+});
+
+test('audit fixes: multi-byte UTF-8 text not corrupted, RTF brace repair, OST vs PST detection, and stitched CRC-32 match', () => {
+  const req = createRequire(import.meta.url);
+  const { repairNonMediaBufferCjs } = req('../electron/documentRepairCjs.cjs');
+  const { stitchFragmentedVideosFromFdCjs } = req('../electron/mediaRepairCjs.cjs');
+
+  // 1. Intact multi-byte UTF-8 text must NOT trigger trailing slack false positive
+  const utf8Intact = Buffer.from('Copyright © 2026 — 日本語テスト\nlabel hello:', 'utf8');
+  assert.equal(repairNonMediaBufferCjs('rpy', utf8Intact), null);
+  assert.equal(repairFileBuffer('rpy', new Uint8Array(utf8Intact)).repaired, false);
+
+  // 2. Truncated RTF closes unclosed group braces and strips trailing binary null slack
+  const rtfTruncated = Buffer.from('{\\rtf1\\ansi{\\fonttbl\\f0 Arial;\\0\0\0', 'utf8');
+  const rtfTs = repairFileBuffer('rtf', new Uint8Array(rtfTruncated));
+  assert.equal(rtfTs.repaired, true);
+  assert.ok(Buffer.from(rtfTs.data).toString('utf8').endsWith('}}'));
+  const rtfCjs = repairNonMediaBufferCjs('rtf', rtfTruncated);
+  assert.ok(rtfCjs && rtfCjs.data.toString('utf8').endsWith('}}'));
+
+  // 3. OST vs PST magic distinction in identifyBuffer
+  const ostHdr = new Uint8Array(512);
+  ostHdr[0] = 0x21; ostHdr[1] = 0x42; ostHdr[2] = 0x44; ostHdr[3] = 0x4e; // !BDN
+  ostHdr[8] = 0x53; ostHdr[9] = 0x4f; ostHdr[10] = 23; ostHdr[11] = 0; // SO + Unicode ver 23
+  const ostMatch = identifyBuffer(ostHdr);
+  assert.equal(ostMatch?.extension, 'ost');
+
+  const pstHdr = new Uint8Array(512);
+  pstHdr[0] = 0x21; pstHdr[1] = 0x42; pstHdr[2] = 0x44; pstHdr[3] = 0x4e; // !BDN
+  pstHdr[8] = 0x53; pstHdr[9] = 0x4d; pstHdr[10] = 23; pstHdr[11] = 0; // SM + Unicode ver 23
+  const pstMatch = identifyBuffer(pstHdr);
+  assert.equal(pstMatch?.extension, 'pst');
+
+  // 4. Stitched video CRC-32 updates to match assembled multi-run bytes (not contiguous gap bytes)
+  const disk = Buffer.alloc(8192);
+  const ftyp = Buffer.from([0x00, 0x00, 0x00, 0x10, 0x66, 0x74, 0x79, 0x70, 0x69, 0x73, 0x6f, 0x6d, 0x00, 0x00, 0x02, 0x00]);
+  const mdatHdr = Buffer.alloc(8);
+  mdatHdr.writeUInt32BE(2048, 0);
+  mdatHdr.write('mdat', 4, 'ascii');
+  const spsPpsIdr = Buffer.from([
+    0x00, 0x00, 0x00, 0x04, 0x67, 0x42, 0xc0, 0x1e,
+    0x00, 0x00, 0x00, 0x04, 0x68, 0xce, 0x38, 0x80,
+    0x00, 0x00, 0x00, 0x06, 0x65, 0x88, 0x84, 0x21, 0xa0, 0x00,
+  ]);
+  const jpgGap = Buffer.from([0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10, 0x4a, 0x46, 0x49, 0x46, 0x00, 0x01, 0xff, 0xd9]);
+  const frag2 = Buffer.from([
+    0x00, 0x00, 0x00, 0x06, 0x65, 0x88, 0x84, 0x21, 0xb0, 0x01,
+    0xff, 0xf1, 0x50, 0x80, 0x01, 0x5f, 0xfc, 0x21, 0x00, 0x1a,
+    0xff, 0xf1, 0x50, 0x80, 0x01, 0x5f, 0xfc, 0x21, 0x00, 0x1b,
+  ]);
+  ftyp.copy(disk, 512);
+  mdatHdr.copy(disk, 512 + ftyp.length);
+  spsPpsIdr.copy(disk, 512 + ftyp.length + 8);
+  jpgGap.copy(disk, 1024);
+  frag2.copy(disk, 2048);
+
+  const imgPath = path.join(os.tmpdir(), `crc_stitch_${Date.now()}.img`);
+  try {
+    fs.writeFileSync(imgPath, disk);
+    const oldContigCrc = computeCrc32(new Uint8Array(disk.subarray(512, 512 + 2048)));
+    const entries: Array<Record<string, unknown>> = [
+      { id: 'drv-512-mp4', extensionHint: 'mp4', sourceKind: 'carved', offset: 512, size: 1024, truncated: true, discoveryCrc32: oldContigCrc },
+      { id: 'drv-1024-jpg', extensionHint: 'jpg', sourceKind: 'carved', offset: 1024, size: jpgGap.length, truncated: false },
+    ];
+    const stitched = stitchFragmentedVideosFromFdCjs(imgPath, entries, disk.length, 512);
+    assert.equal(stitched.length, 1);
+    const stitchedRuns = stitched[0].runs as Array<{ offset: number; length: number }>;
+    const assembled = Buffer.concat(stitchedRuns.map((r) => disk.subarray(r.offset, r.offset + r.length)));
+    assert.equal(stitched[0].discoveryCrc32, computeCrc32(new Uint8Array(assembled.subarray(0, 65536))));
+    assert.notEqual(stitched[0].discoveryCrc32, oldContigCrc);
+  } finally {
+    if (fs.existsSync(imgPath)) fs.unlinkSync(imgPath);
+  }
+});
+
+
+
 
 
 

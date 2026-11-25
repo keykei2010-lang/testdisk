@@ -19,7 +19,11 @@ import { DiskAnalysisResult, PartitionEntry } from '../engine/partitions';
 import { ExplorerFileItem } from '../engine/explorerTypes';
 import { formatBytes } from '../engine/crc32';
 import { getDesktopBridge, VideoPreviewResult } from '../engine/desktopBridge';
-import { formatShortDate, resolvePreferredExtension } from '../engine/recoveryHealth';
+import {
+  formatShortDate,
+  isNonMediaRepairableExtension,
+  resolvePreferredExtension,
+} from '../engine/recoveryHealth';
 import { useMediaUrl } from '../utils/useMediaUrl';
 import { HexViewer } from './HexViewer';
 
@@ -235,7 +239,9 @@ export const ExplorerInspector: React.FC<ExplorerInspectorProps> = ({
             tskOffset: item.sourceRef.tskOffset,
             discoveryCrc32: item.discoveryCrc32,
             extension: item.extension,
-            repairIfTruncated: item.status === 'OK_TRUNCATED',
+            repairIfTruncated:
+              item.status === 'OK_TRUNCATED' ||
+              (item.status === 'HEADER_ONLY' && isNonMediaRepairableExtension(item.extension)),
             modifiedAtMs: item.modifiedAt,
           },
         ],
@@ -261,14 +267,14 @@ export const ExplorerInspector: React.FC<ExplorerInspectorProps> = ({
     const isAudio = focusedFile.family === 'Audio';
     const isVideo = focusedFile.family === 'Videos';
     const isZoomableMedia = isImage || isVideo;
-    const isTextLike =
-      focusedFile.extension === 'pdf' ||
-      focusedFile.extension === 'txt' ||
-      focusedFile.extension === 'json' ||
-      focusedFile.extension === 'xml' ||
-      focusedFile.extension === 'svg' ||
-      focusedFile.extension === 'html' ||
-      focusedFile.extension === 'eml';
+    const isTextLike = [
+      'pdf', 'txt', 'json', 'xml', 'svg', 'html', 'htm', 'eml',
+      'aepx', 'rpy', 'py', 'ini', 'sql', 'csv', 'rtf', 'md', 'log',
+    ].includes(focusedFile.extension.toLowerCase());
+    const canRepairNonMedia =
+      !focusedFile.repaired &&
+      isNonMediaRepairableExtension(focusedFile.extension) &&
+      (focusedFile.status === 'OK_TRUNCATED' || focusedFile.status === 'HEADER_ONLY' || focusedFile.recoveryChance < 90);
 
     const lc = likelihoodColors(focusedFile.recoveryTier);
     const videoProbe =
@@ -557,6 +563,7 @@ export const ExplorerInspector: React.FC<ExplorerInspectorProps> = ({
               </div>
 
               {((focusedFile.status === 'OK_TRUNCATED' && !focusedFile.repaired) ||
+                canRepairNonMedia ||
                 (!focusedFile.repaired &&
                   ((isImage && previewUrl !== null && failedPreviewUrl === previewUrl) ||
                     (isVideo && previewUrl !== null && failedVideoUrl === previewUrl)))) && (
@@ -621,7 +628,10 @@ export const ExplorerInspector: React.FC<ExplorerInspectorProps> = ({
                 <div>
                   <div className="text-slate-400 text-[11px]">Cluster Extents</div>
                   <div className="text-emerald-300 font-mono mt-0.5">
-                    {focusedFile.sourceRef.runs.length} runs linked via filesystem metadata
+                    {focusedFile.sourceRef.runs.length} runs linked via{' '}
+                    {focusedFile.sourceKind === 'carved'
+                      ? 'video cluster stitcher'
+                      : 'filesystem metadata'}
                   </div>
                 </div>
               )}
@@ -689,15 +699,15 @@ export const ExplorerInspector: React.FC<ExplorerInspectorProps> = ({
           <button
             type="button"
             onClick={() => {
-              if (focusedFile.status === 'OK_TRUNCATED' && !focusedFile.repaired) {
+              if ((focusedFile.status === 'OK_TRUNCATED' && !focusedFile.repaired) || canRepairNonMedia) {
                 onRepairFile(focusedFile);
               } else {
                 setShowHex((v) => !v);
               }
             }}
             title={
-              focusedFile.status === 'OK_TRUNCATED' && !focusedFile.repaired
-                ? 'Repair truncated file structure'
+              (focusedFile.status === 'OK_TRUNCATED' && !focusedFile.repaired) || canRepairNonMedia
+                ? 'Repair corrupted file structure'
                 : 'Toggle binary hex signature inspector'
             }
             aria-label="Quick repair and hex inspector"

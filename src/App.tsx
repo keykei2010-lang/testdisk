@@ -73,6 +73,7 @@ import {
   computeRecoveryLikelihood,
   deriveCarvedTimestamp,
   formatShortDate,
+  isNonMediaRepairableExtension,
   repairFileBuffer,
   resolvePreferredExtension,
 } from './engine/recoveryHealth';
@@ -112,54 +113,47 @@ function inferFallbackFromExt(ext: string): {
   const e = ext.toLowerCase();
   if (
     [
-      'jpg',
-      'jpeg',
-      'png',
-      'gif',
-      'bmp',
-      'webp',
-      'tif',
-      'tiff',
-      'svg',
-      'heic',
-      'cr2',
-      'cr3',
-      'nef',
-      'arw',
-      'dng',
-      'raf',
-      'orf',
-      'rw2',
+      'jpg', 'jpeg', 'png', 'gif', 'bmp', 'webp', 'tif', 'tiff', 'svg', 'heic', 'avif',
+      'ico', 'psd', 'psb', 'exr', 'dds', 'tga', 'cr2', 'cr3', 'nef', 'arw', 'dng',
+      'raf', 'orf', 'rw2', 'pef', 'sr2', 'mrw', 'x3f', 'kra', 'ora', 'cdr',
     ].includes(e)
   ) {
     return {
       family: 'Pictures',
       mimeType: e === 'jpg' || e === 'jpeg' ? 'image/jpeg' : e === 'svg' ? 'image/svg+xml' : `image/${e}`,
-      description: `${e.toUpperCase()} Image`,
+      description: `${e.toUpperCase()} Image / Design`,
     };
   }
-  if (['mp4', 'mov', 'avi', 'mkv', 'webm', 'wmv', 'm4v', '3gp'].includes(e)) {
+  if (['mp4', 'mov', 'avi', 'mkv', 'webm', 'wmv', 'm4v', '3gp', '3g2', 'flv', 'mxf', 'ts', 'mpg', 'vob', 'rmvb', 'braw', 'r3d', 'ani'].includes(e)) {
     return {
       family: 'Videos',
       mimeType: e === 'mov' ? 'video/quicktime' : e === 'webm' ? 'video/webm' : 'video/mp4',
       description: `${e.toUpperCase()} Video Stream`,
     };
   }
-  if (['mp3', 'wav', 'flac', 'ogg', 'm4a', 'aac', 'wma'].includes(e)) {
+  if (['mp3', 'wav', 'flac', 'ogg', 'm4a', 'm4b', 'aac', 'wma', 'aiff', 'opus', 'mid', 'amr', 'ape', 'wv', 'caf'].includes(e)) {
     return {
       family: 'Audio',
       mimeType: e === 'mp3' ? 'audio/mpeg' : `audio/${e}`,
       description: `${e.toUpperCase()} Audio Track`,
     };
   }
-  if (['pdf', 'doc', 'docx', 'xls', 'xlsx', 'ppt', 'pptx', 'txt', 'csv', 'json', 'xml', 'md'].includes(e)) {
+  if (
+    [
+      'pdf', 'doc', 'docx', 'xls', 'xlsx', 'ppt', 'pptx', 'odt', 'ods', 'odp', 'epub',
+      'rtf', 'txt', 'csv', 'json', 'xml', 'md', 'html', 'htm', 'pst', 'ost', 'msg',
+      'eml', 'vcf', 'ics', 'one', 'pub', 'mdb', 'accdb', 'sqlite', 'db', 'sqlite3',
+      'aep', 'aepx', 'prproj', 'dwg', 'dxf', 'blend', 'fbx', 'glb', 'stl', 'rpy', 'py',
+      'ini', 'sql', 'xps', 'kmz',
+    ].includes(e)
+  ) {
     return {
       family: 'Documents',
       mimeType: e === 'pdf' ? 'application/pdf' : 'text/plain',
-      description: `${e.toUpperCase()} Document`,
+      description: `${e.toUpperCase()} Document / Project`,
     };
   }
-  if (['zip', 'rar', '7z', 'gz', 'tar', 'iso'].includes(e)) {
+  if (['zip', 'rar', '7z', 'gz', 'tar', 'iso', 'bz2', 'xz', 'zst', 'lz4', 'cab', 'apk', 'jar', 'rpa'].includes(e)) {
     return {
       family: 'Archives',
       mimeType: 'application/zip',
@@ -510,6 +504,7 @@ export const App: React.FC = () => {
           kind: 'memory',
           offset: c.offset,
           size: c.size,
+          runs: c.runs && c.runs.length > 0 ? c.runs : undefined,
         },
         modifiedAt: c.metadata.takenAtMs ?? deriveCarvedTimestamp(c.sector, origin.partitionId),
         recoveryChance: assessment.chance,
@@ -991,15 +986,27 @@ export const App: React.FC = () => {
         sector: entry.sector,
         matchedOffset: res?.matchedOffset ?? 0,
         matchedLength: res?.matchedLength ?? 0,
-        metadata: res?.metadata ?? {
-          details: entry.details
-            ? entry.details
-            : isLocationItem
-              ? `Streamed handle (${formatBytes(entry.size)})`
-              : isMftItem
-                ? `${entry.isDeleted === false ? 'Existing' : 'Deleted'} filesystem record (${entry.runs?.length ?? 0} extent${entry.runs?.length === 1 ? '' : 's'})`
-                : 'Streamed disk signature',
-        },
+        metadata: res?.metadata
+          ? {
+              ...res.metadata,
+              details:
+                entry.details && res.metadata.details
+                  ? res.metadata.details.includes(entry.details)
+                    ? res.metadata.details
+                    : `${res.metadata.details} · ${entry.details}`
+                  : entry.details || res.metadata.details,
+            }
+          : {
+              details: entry.details
+                ? entry.details
+                : isLocationItem
+                  ? `Streamed handle (${formatBytes(entry.size)})`
+                  : entry.sourceKind === 'carved' && hasDiskRuns
+                    ? `Deleted carved stream (${entry.runs?.length ?? 0} non-contiguous fragments)`
+                    : isMftItem
+                      ? `${entry.isDeleted === false ? 'Existing' : 'Deleted'} filesystem record (${entry.runs?.length ?? 0} extent${entry.runs?.length === 1 ? '' : 's'})`
+                      : 'Streamed disk signature',
+            },
         description,
         data: sample,
         sourceRef: {
@@ -1115,9 +1122,27 @@ export const App: React.FC = () => {
         mapNativeEntryToExplorerItem(e, resolveLocalPart),
       );
       setCarvedItems((prev) => {
-        const existingIds = new Set(prev.map((x) => x.id));
-        const fresh = incoming.filter((x) => !existingIds.has(x.id));
-        return fresh.length > 0 ? [...prev, ...fresh] : prev;
+        const byId = new Map(prev.map((x, idx) => [x.id, idx]));
+        let next = prev;
+        let mutated = false;
+        for (const item of incoming) {
+          const existingIdx = byId.get(item.id);
+          if (existingIdx !== undefined) {
+            if (!mutated) {
+              next = prev.slice();
+              mutated = true;
+            }
+            next[existingIdx] = item;
+          } else {
+            if (!mutated) {
+              next = prev.slice();
+              mutated = true;
+            }
+            byId.set(item.id, next.length);
+            next.push(item);
+          }
+        }
+        return mutated ? next : prev;
       });
       setFocusedFileId((cur) => cur ?? incoming[0]?.id ?? null);
     });
@@ -1144,9 +1169,18 @@ export const App: React.FC = () => {
       const mapped = entries.map((e) => mapNativeEntryToExplorerItem(e, resolveLocalPart));
       setCarvedItems((prev) => {
         if (effectiveStartPhase === 'deep' && prev.length > 0) {
-          const seen = new Set(prev.map((x) => x.id));
-          const fresh = mapped.filter((x) => !seen.has(x.id));
-          return [...prev, ...fresh];
+          const next = prev.slice();
+          const byId = new Map(next.map((x, idx) => [x.id, idx]));
+          for (const item of mapped) {
+            const idx = byId.get(item.id);
+            if (idx !== undefined) {
+              next[idx] = item;
+            } else {
+              byId.set(item.id, next.length);
+              next.push(item);
+            }
+          }
+          return next;
         }
         return mapped;
       });
@@ -1781,7 +1815,9 @@ export const App: React.FC = () => {
             tskOffset: item.sourceRef.tskOffset,
             discoveryCrc32: item.discoveryCrc32,
             extension: item.extension,
-            repairIfTruncated: item.status === 'OK_TRUNCATED',
+            repairIfTruncated:
+              item.status === 'OK_TRUNCATED' ||
+              (item.status === 'HEADER_ONLY' && isNonMediaRepairableExtension(item.extension)),
             modifiedAtMs: item.modifiedAt,
           },
         ],

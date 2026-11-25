@@ -7,7 +7,11 @@ import {
   WindowsVolumeInfo,
 } from '../engine/desktopBridge';
 import { FileSourceRef } from '../engine/explorerTypes';
-import { repairFileBuffer, resolvePreferredExtension } from '../engine/recoveryHealth';
+import {
+  isNonMediaRepairableExtension,
+  repairFileBuffer,
+  resolvePreferredExtension,
+} from '../engine/recoveryHealth';
 
 export interface RecoverableItem {
   id: string;
@@ -236,12 +240,19 @@ export const RecoveryModal: React.FC<RecoveryModalProps> = ({
               tskOffset: item.sourceRef?.tskOffset,
               discoveryCrc32: item.discoveryCrc32,
               extension: item.extension,
-              repairIfTruncated: enableFileRepair && item.status === 'OK_TRUNCATED',
+              repairIfTruncated:
+                enableFileRepair &&
+                (item.status === 'OK_TRUNCATED' ||
+                  (item.status === 'HEADER_ONLY' && isNonMediaRepairableExtension(item.extension))),
               modifiedAtMs: item.modifiedAt,
             };
           }
           let payload = item.data;
-          if (enableFileRepair && item.status === 'OK_TRUNCATED') {
+          if (
+            enableFileRepair &&
+            (item.status === 'OK_TRUNCATED' ||
+              (item.status === 'HEADER_ONLY' && isNonMediaRepairableExtension(item.extension)))
+          ) {
             const rep = repairFileBuffer(item.extension, payload, referenceVideoBytes ?? undefined);
             if (rep.repaired) payload = rep.data;
           }
@@ -325,8 +336,12 @@ export const RecoveryModal: React.FC<RecoveryModalProps> = ({
           const fileHandle = await curDir.getFileHandle(uniqueFilename, { create: true });
           const writable = await fileHandle.createWritable();
 
+          const shouldRepair =
+            enableFileRepair &&
+            (item.status === 'OK_TRUNCATED' ||
+              (item.status === 'HEADER_ONLY' && isNonMediaRepairableExtension(item.extension)));
           if (item.sourceRef?.browserFile) {
-            if (enableFileRepair && item.status === 'OK_TRUNCATED') {
+            if (shouldRepair) {
               let payload: Uint8Array = new Uint8Array(
                 await item.sourceRef.browserFile.arrayBuffer(),
               );
@@ -345,7 +360,7 @@ export const RecoveryModal: React.FC<RecoveryModalProps> = ({
             }
           } else {
             let payload = item.data;
-            if (enableFileRepair && item.status === 'OK_TRUNCATED') {
+            if (shouldRepair) {
               const rep = repairFileBuffer(
                 item.extension,
                 payload,
@@ -430,7 +445,11 @@ export const RecoveryModal: React.FC<RecoveryModalProps> = ({
           );
         }
 
-        if (enableFileRepair && item.status === 'OK_TRUNCATED') {
+        if (
+          enableFileRepair &&
+          (item.status === 'OK_TRUNCATED' ||
+            (item.status === 'HEADER_ONLY' && isNonMediaRepairableExtension(item.extension)))
+        ) {
           const rep = repairFileBuffer(item.extension, payload, referenceVideoBytes ?? undefined);
           if (rep.repaired) {
             payload = rep.data;

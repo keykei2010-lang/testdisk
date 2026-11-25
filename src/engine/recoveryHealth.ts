@@ -2,6 +2,11 @@ import { computeCrc32 } from './crc32';
 import { ExplorerFileItem, RecoveryLikelihoodTier } from './explorerTypes';
 import { scanFatAndExfatDeletedInBuffer } from './fatExfat';
 import {
+  diagnoseNonMediaFile,
+  isNonMediaRepairableExtension,
+  repairNonMediaBuffer,
+} from './documentRepair';
+import {
   extractEmbeddedJpegPreview,
   inspectJpegStructure,
   repairAviBuffer,
@@ -16,7 +21,7 @@ import { analyzeDiskImage } from './partitions';
 import { buildSampleDiskImage } from './sampleDisk';
 import { carveDiskBuffer, FILE_FORMATS, identifyBuffer, IdentifyMetadata } from './signatures';
 
-export { extractEmbeddedJpegPreview, repairJpegBuffer, repairPngBuffer, repairAviBuffer };
+export { extractEmbeddedJpegPreview, repairJpegBuffer, repairPngBuffer, repairAviBuffer, isNonMediaRepairableExtension };
 
 export interface RecoveryLikelihoodAssessment {
   chance: number;
@@ -283,6 +288,9 @@ export function diagnoseMediaFile(extension: string, data: Uint8Array): MediaDia
       needsReferenceHint: false,
     };
   }
+  if (isNonMediaRepairableExtension(ext)) {
+    return diagnoseNonMediaFile(ext, data);
+  }
   return {
     issue: 'Ready for structural inspection & magic-byte header verification.',
     canRepair: false,
@@ -291,14 +299,16 @@ export function diagnoseMediaFile(extension: string, data: Uint8Array): MediaDia
 }
 
 /**
- * Structural repair for truncated/damaged carved & recovered media buffers:
+ * Structural repair for truncated/damaged carved & recovered media & document buffers:
  * - JPEG EOI, Baseline DHT, RSTn/0xFF entropy sanitizer, Reference Header Transplant & EXIF preview salvage
  * - PNG chunk CRC-32 repair, truncated IDAT length clamping & IEND trailer
  * - Camera RAW (CR2/CR3/NEF/ARW/DNG) & TIFF embedded JPEG preview salvage
  * - AVI idx1 index + avih dwTotalFrames + movi rebuild
- * - MKV / WebM EBML null-tail trim
- * - WebP / GIF / BMP / WAV / PDF structural header & EOF repairs
+ * - MKV / WebM EBML null-tail trim; WebP / GIF / BMP / WAV header & EOF repairs
  * - MP4 / MOV / M4V / 3GP H.264/HEVC SPS parsing, headerless salvage, moov + dual-track audio synthesis
+ * - ZIP / DOCX / XLSX / PPTX / ODT / EPUB / APK / JAR / KRA / ORA Central Directory & EOCD rebuild
+ * - Adobe After Effects (.aep RIFX / .aepx XML), Photoshop (.psd/.psb), PDF xref/startxref, SQLite pageCount/WAL,
+ *   OLE2 (.doc/.xls/.ppt/.msg), Outlook (.pst/.ost), Ren'Py (.rpa/.rpy), JSON/XML/SVG/TAR/GZ/MP3/FLAC
  */
 export function repairFileBuffer(
   extension: string,
@@ -325,21 +335,6 @@ export function repairFileBuffer(
 
   if (['webp', 'gif', 'cr2', 'cr3', 'nef', 'arw', 'dng', 'orf', 'rw2', 'tif', 'tiff'].includes(ext)) {
     return repairRawOrImageBuffer(ext, data);
-  }
-
-  if (ext === 'pdf') {
-    const tailText = new TextDecoder().decode(data.subarray(Math.max(0, data.length - 32)));
-    if (!tailText.includes('%%EOF')) {
-      const suffix = new TextEncoder().encode('\n%%EOF\n');
-      const patched = new Uint8Array(data.length + suffix.length);
-      patched.set(data, 0);
-      patched.set(suffix, data.length);
-      return {
-        repaired: true,
-        data: patched,
-        note: 'Appended missing %%EOF trailer to PDF stream.',
-      };
-    }
   }
 
   if (ext === 'wav' && data.length >= 12) {
@@ -371,6 +366,10 @@ export function repairFileBuffer(
     };
   }
 
+  if (isNonMediaRepairableExtension(ext)) {
+    return repairNonMediaBuffer(ext, data);
+  }
+
   return {
     repaired: false,
     data,
@@ -388,6 +387,9 @@ const ZIP_CONTAINER_EXTS = new Set([
   'epub',
   'apk',
   'jar',
+  'kra',
+  'ora',
+  'kmz',
   'zip',
 ]);
 

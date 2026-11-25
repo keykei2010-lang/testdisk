@@ -1,10 +1,14 @@
 import React, { useEffect, useRef, useState } from 'react';
 import {
+  Archive,
   CheckCircle2,
   Download,
+  FileCode,
   FileQuestion,
+  FileText,
   Film,
   Image as ImageIcon,
+  Music,
   Play,
   Trash2,
   Upload,
@@ -43,8 +47,12 @@ interface RepairQueueItem {
 }
 
 const IMAGE_EXTS = new Set(['jpg', 'jpeg', 'png', 'webp', 'bmp', 'gif']);
-const RAW_EXTS = new Set(['cr2', 'cr3', 'nef', 'arw', 'dng', 'orf', 'rw2', 'tif', 'tiff']);
+const RAW_EXTS = new Set(['cr2', 'cr3', 'nef', 'arw', 'dng', 'orf', 'rw2', 'tif', 'tiff', 'psd', 'psb']);
 const VIDEO_EXTS = new Set(['mp4', 'mov', 'm4v', '3gp', 'avi', 'mkv', 'webm']);
+const AUDIO_EXTS = new Set(['wav', 'mp3', 'flac', 'ogg', 'm4a', 'aac', 'opus']);
+const ARCHIVE_EXTS = new Set(['zip', 'tar', 'gz', 'apk', 'jar', 'rpa']);
+const CODE_EXTS = new Set(['json', 'xml', 'svg', 'html', 'htm', 'aep', 'aepx', 'rpy', 'py', 'sql', 'ini']);
+const DOC_EXTS = new Set(['pdf', 'docx', 'xlsx', 'pptx', 'odt', 'ods', 'odp', 'epub', 'doc', 'xls', 'ppt', 'msg', 'msi', 'pub', 'pst', 'ost', 'sqlite', 'db', 'sqlite3', 'txt', 'csv', 'eml', 'rtf', 'kra', 'ora', 'kmz']);
 
 function mimeForExt(ext: string): string {
   switch (ext.toLowerCase()) {
@@ -59,6 +67,8 @@ function mimeForExt(ext: string): string {
       return 'image/bmp';
     case 'gif':
       return 'image/gif';
+    case 'svg':
+      return 'image/svg+xml';
     case 'mp4':
     case 'm4v':
     case '3gp':
@@ -75,6 +85,34 @@ function mimeForExt(ext: string): string {
       return 'audio/wav';
     case 'mp3':
       return 'audio/mpeg';
+    case 'flac':
+      return 'audio/flac';
+    case 'pdf':
+      return 'application/pdf';
+    case 'json':
+      return 'application/json';
+    case 'xml':
+    case 'aepx':
+      return 'application/xml';
+    case 'html':
+    case 'htm':
+      return 'text/html';
+    case 'txt':
+    case 'rpy':
+    case 'py':
+    case 'csv':
+    case 'sql':
+    case 'ini':
+      return 'text/plain';
+    case 'rtf':
+      return 'application/rtf';
+    case 'zip':
+    case 'docx':
+    case 'xlsx':
+    case 'pptx':
+    case 'apk':
+    case 'jar':
+      return 'application/zip';
     default:
       return 'application/octet-stream';
   }
@@ -109,7 +147,19 @@ export const MediaRepairLab: React.FC<MediaRepairLabProps> = ({ onOpenUnknownFil
       const head = new Uint8Array(await file.slice(0, headSize).arrayBuffer());
       const sig = identifyBuffer(head);
       const fileExt = (file.name.split('.').pop() || '').toLowerCase();
-      const ext = (sig?.extension || fileExt || 'mp4').toLowerCase();
+      const detectedExt = sig?.extension?.toLowerCase();
+      const keepFilenameContainerExt =
+        fileExt &&
+        ((detectedExt === 'zip' && DOC_EXTS.has(fileExt)) ||
+          (detectedExt === 'zip' && ARCHIVE_EXTS.has(fileExt)) ||
+          (detectedExt === 'doc' && ['xls', 'ppt', 'msg', 'msi', 'pub', 'db'].includes(fileExt)) ||
+          (detectedExt === 'pst' && fileExt === 'ost') ||
+          (detectedExt === 'sqlite' && (fileExt === 'db' || fileExt === 'sqlite3')) ||
+          (detectedExt === 'xml' && ['svg', 'aepx', 'html', 'htm'].includes(fileExt)) ||
+          (detectedExt === 'txt' && (CODE_EXTS.has(fileExt) || DOC_EXTS.has(fileExt))) ||
+          !detectedExt ||
+          detectedExt === 'bin');
+      const ext = (keepFilenameContainerExt ? fileExt : detectedExt || fileExt || 'mp4').toLowerCase();
       const diag = diagnoseMediaFile(ext, head);
       const nativePath = (file as File & { path?: string }).path;
 
@@ -177,6 +227,21 @@ export const MediaRepairLab: React.FC<MediaRepairLabProps> = ({ onOpenUnknownFil
                     previewUrl,
                     previewIsVideo,
                     previewFailed: false,
+                  }
+                : x,
+            ),
+          );
+          return;
+        }
+
+        if (item.nativePath || item.file.size > 256 * 1024 * 1024) {
+          setItems((prev) =>
+            prev.map((x) =>
+              x.id === item.id
+                ? {
+                    ...x,
+                    status: res.tier === 'none' ? 'unchanged' : 'failed',
+                    resultNote: res.note,
                   }
                 : x,
             ),
@@ -330,12 +395,13 @@ export const MediaRepairLab: React.FC<MediaRepairLabProps> = ({ onOpenUnknownFil
       <div className="flex flex-col md:flex-row md:items-start justify-between gap-4">
         <div className="space-y-1 min-w-0 flex-1">
           <h1 className="text-[17px] font-semibold text-slate-100 tracking-tight">
-            Media Repair Lab
+            Media &amp; Document Repair Lab
           </h1>
           <p className="text-xs text-slate-400 leading-relaxed max-w-xl">
-            Rebuild unplayable MP4/MOV/HEVC recordings missing <code className="text-slate-300">moov</code>{' '}
-            atoms (streaming multi-GB support on desktop), sanitize corrupt JPEG entropy &amp; transplant DQT/SOF headers,
-            repair PNG CRC-32/IDAT &amp; AVI <code className="text-slate-300">idx1</code> tables, and extract Camera RAW previews.
+            Rebuild unplayable MP4/MOV/HEVC videos missing <code className="text-slate-300">moov</code> atoms,
+            fix JPEG/PNG/AVI/RAW previews, and structurally repair Office (<code className="text-slate-300">.docx/.xlsx/.pptx</code>),{' '}
+            <code className="text-slate-300">.pdf</code>, <code className="text-slate-300">.psd/.aep/.aepx</code>, SQLite, Outlook{' '}
+            <code className="text-slate-300">.pst/.msg</code>, Ren&apos;Py (<code className="text-slate-300">.rpa/.rpy</code>), and ZIP archives.
           </p>
         </div>
 
@@ -373,7 +439,7 @@ export const MediaRepairLab: React.FC<MediaRepairLabProps> = ({ onOpenUnknownFil
           ref={mediaInputRef}
           type="file"
           multiple
-          accept=".mp4,.mov,.m4v,.3gp,.avi,.mkv,.webm,.jpg,.jpeg,.png,.webp,.bmp,.gif,.cr2,.cr3,.nef,.arw,.dng,.orf,.rw2,.tif,.tiff,.wav,.mp3,.pdf,*"
+          accept=".mp4,.mov,.m4v,.3gp,.avi,.mkv,.webm,.jpg,.jpeg,.png,.webp,.bmp,.gif,.cr2,.cr3,.nef,.arw,.dng,.orf,.rw2,.tif,.tiff,.wav,.mp3,.flac,.pdf,.docx,.xlsx,.pptx,.odt,.ods,.odp,.epub,.zip,.apk,.jar,.kra,.ora,.kmz,.psd,.psb,.aep,.aepx,.sqlite,.db,.sqlite3,.doc,.xls,.ppt,.msg,.pst,.ost,.rpa,.rpy,.json,.xml,.svg,.html,.tar,.gz,*"
           className="hidden"
           onChange={(e) => {
             if (e.target.files) void ingestFiles(e.target.files);
@@ -385,10 +451,10 @@ export const MediaRepairLab: React.FC<MediaRepairLabProps> = ({ onOpenUnknownFil
         </div>
         <div className="space-y-1">
           <div className="text-xs font-medium text-slate-100">
-            Drop corrupted videos, photos, or Camera RAW files here, or browse local files
+            Drop corrupted videos, photos, documents, projects, or databases here
           </div>
           <div className="text-[11px] text-slate-400 font-mono">
-            MP4 · MOV · M4V · 3GP · MKV · WEBM · AVI · JPG · PNG · WEBP · GIF · CR2 · CR3 · NEF · ARW · DNG · WAV · MP3
+            MP4 · MOV · MKV · AVI · JPG · PNG · CR2/NEF · DOCX · XLSX · PDF · PSD · AEP · SQLITE · PST · RPA · RPY · ZIP
           </div>
         </div>
         <div className="flex flex-wrap items-center justify-center gap-2.5 pt-1">
@@ -397,7 +463,7 @@ export const MediaRepairLab: React.FC<MediaRepairLabProps> = ({ onOpenUnknownFil
             onClick={() => mediaInputRef.current?.click()}
             className="inline-flex items-center gap-1.5 px-4 py-1.5 rounded-md bg-[#3A7AFE] hover:bg-[#2F6EEB] text-xs font-medium text-white whitespace-nowrap shrink-0 transition-colors"
           >
-            Add Damaged Media
+            Add Damaged Files
           </button>
 
           <label className="inline-flex items-center gap-1.5 px-3.5 py-1.5 rounded-md bg-[#232834] hover:bg-[#2C3242] border border-[#343C4E] text-xs text-slate-200 cursor-pointer whitespace-nowrap shrink-0 transition-colors">
@@ -520,6 +586,14 @@ export const MediaRepairLab: React.FC<MediaRepairLabProps> = ({ onOpenUnknownFil
                       <Film className="w-5 h-5 text-[#60A5FA]" />
                     ) : isImg ? (
                       <ImageIcon className="w-5 h-5 text-amber-400" />
+                    ) : AUDIO_EXTS.has(item.extension) ? (
+                      <Music className="w-5 h-5 text-violet-400" />
+                    ) : ARCHIVE_EXTS.has(item.extension) ? (
+                      <Archive className="w-5 h-5 text-amber-300" />
+                    ) : CODE_EXTS.has(item.extension) ? (
+                      <FileCode className="w-5 h-5 text-emerald-400" />
+                    ) : DOC_EXTS.has(item.extension) ? (
+                      <FileText className="w-5 h-5 text-sky-400" />
                     ) : (
                       <Wrench className="w-5 h-5 text-slate-400" />
                     )}

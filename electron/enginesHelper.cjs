@@ -1,33 +1,98 @@
-const { execFile, spawn } = require('node:child_process');
+const { execFile, execFileSync, spawn } = require('node:child_process');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 
-/**
- * Resolves bundled C engine binaries (The Sleuth Kit, CGSecurity TestDisk/PhotoRec, FFmpeg)
- * from packaged `process.resourcesPath/engines` or local `electron/bin`.
- */
-function resolveEngineRoot() {
-  const candidates = [];
-  if (process.resourcesPath) {
-    candidates.push(path.join(process.resourcesPath, 'engines'));
+const pathLookupCache = new Map();
+
+function findExecutableInPathSync(binName) {
+  if (pathLookupCache.has(binName)) return pathLookupCache.get(binName);
+  const cmd = process.platform === 'win32' ? 'where.exe' : 'which';
+  let found = null;
+  try {
+    const out = execFileSync(cmd, [binName], {
+      windowsHide: true,
+      timeout: 1500,
+      encoding: 'utf8',
+    });
+    const first = String(out || '')
+      .split(/\r?\n/)
+      .map((l) => l.trim())
+      .find((l) => l && fs.existsSync(l));
+    if (first) found = first;
+  } catch {
+    found = null;
   }
-  candidates.push(path.join(__dirname, 'bin'));
-  for (const dir of candidates) {
-    if (fs.existsSync(dir)) return dir;
-  }
-  return null;
+  pathLookupCache.set(binName, found);
+  return found;
 }
 
+function getCandidateEngineDirs() {
+  const dirs = [];
+  if (process.resourcesPath) {
+    dirs.push(path.join(process.resourcesPath, 'engines'));
+  }
+  dirs.push(path.join(__dirname, 'bin'));
+
+  const appData = process.env.APPDATA || (process.platform === 'win32' ? path.join(os.homedir(), 'AppData', 'Roaming') : path.join(os.homedir(), '.config'));
+  dirs.push(path.join(appData, 'TestDisk-PhotoRec', 'engines'));
+  dirs.push(path.join(appData, 'testdisk-photorec-web', 'engines'));
+
+  if (process.platform === 'win32') {
+    const localAppData = process.env.LOCALAPPDATA || path.join(os.homedir(), 'AppData', 'Local');
+    const progFiles = process.env.ProgramFiles || 'C:\\Program Files';
+    const progFilesX86 = process.env['ProgramFiles(x86)'] || 'C:\\Program Files (x86)';
+    const userProfile = process.env.USERPROFILE || os.homedir();
+    const choco = process.env.ChocolateyInstall || 'C:\\ProgramData\\chocolatey';
+
+    dirs.push(
+      'C:\\ffmpeg\\bin',
+      path.join(progFiles, 'ffmpeg', 'bin'),
+      path.join(progFilesX86, 'ffmpeg', 'bin'),
+      path.join(progFiles, 'The Sleuth Kit', 'bin'),
+      path.join(progFilesX86, 'The Sleuth Kit', 'bin'),
+      path.join(progFiles, 'TestDisk'),
+      path.join(progFilesX86, 'TestDisk'),
+      path.join(userProfile, 'scoop', 'shims'),
+      path.join(userProfile, 'scoop', 'apps', 'ffmpeg', 'current', 'bin'),
+      path.join(choco, 'bin'),
+    );
+
+    const wingetRoot = path.join(localAppData, 'Microsoft', 'WinGet', 'Packages');
+    if (fs.existsSync(wingetRoot)) {
+      try {
+        for (const pkg of fs.readdirSync(wingetRoot).slice(0, 40)) {
+          if (/ffmpeg|testdisk|sleuthkit/i.test(pkg)) {
+            dirs.push(path.join(wingetRoot, pkg));
+            dirs.push(path.join(wingetRoot, pkg, 'bin'));
+          }
+        }
+      } catch {
+        // ignore unreadable WinGet folder
+      }
+    }
+  }
+  return dirs;
+}
+
+/**
+ * Resolves engine binaries from packaged `process.resourcesPath/engines`, local `electron/bin`,
+ * `userData/engines`, Windows standard/package-manager folders, and system PATH.
+ */
 function findBinary(subFolder, baseNames) {
-  const root = resolveEngineRoot();
-  if (root) {
+  const roots = getCandidateEngineDirs();
+  for (const root of roots) {
+    if (!fs.existsSync(root)) continue;
     for (const name of baseNames) {
       const p1 = path.join(root, subFolder, name);
       if (fs.existsSync(p1)) return p1;
       const p2 = path.join(root, name);
       if (fs.existsSync(p2)) return p2;
     }
+  }
+  for (const name of baseNames) {
+    const inPath = findExecutableInPathSync(name);
+    if (inPath) return inPath;
   }
   return null;
 }
@@ -54,7 +119,9 @@ function getEngineCapabilitiesSync(isAdmin) {
     sleuthkit: Boolean(bins.fls && bins.icat),
     mmls: Boolean(bins.mmls),
     photorec: Boolean(bins.photorec),
-    fidentify: Boolean(bins.fidentify),
+    // Built-in pure-Node signature + container engine backs fidentify even if external binary is absent.
+    fidentify: true,
+    externalFidentify: Boolean(bins.fidentify),
     ffmpeg: Boolean(bins.ffmpeg),
     ffprobe: Boolean(bins.ffprobe),
   };
@@ -315,21 +382,193 @@ function readTskInodeHead(devicePath, partOffsetBytes, inode, maxBytes = 256 * 1
   });
 }
 
+function identifyZipContainerHeadCjs(buf) {
+  const ascii = buf.toString('latin1', 0, Math.min(buf.length, 32768));
+  if (ascii.includes('word/')) return 'docx';
+  if (ascii.includes('xl/')) return 'xlsx';
+  if (ascii.includes('ppt/')) return 'pptx';
+  if (ascii.includes('AndroidManifest.xml') || ascii.includes('classes.dex')) return 'apk';
+  if (ascii.includes('META-INF/MANIFEST.MF')) return 'jar';
+  if (ascii.includes('application/epub+zip') || ascii.includes('OEBPS/')) return 'epub';
+  if (ascii.includes('application/vnd.oasis.opendocument.text')) return 'odt';
+  if (ascii.includes('application/vnd.oasis.opendocument.spreadsheet')) return 'ods';
+  if (ascii.includes('application/vnd.oasis.opendocument.presentation')) return 'odp';
+  if (ascii.includes('application/x-krita')) return 'kra';
+  if (ascii.includes('image/openraster')) return 'ora';
+  if (ascii.includes('doc.kml')) return 'kmz';
+  if (ascii.includes('FixedDocumentSequence.fdseq')) return 'xps';
+  if (ascii.includes('[Content_Types].xml')) return 'docx';
+  return 'zip';
+}
+
+function identifyOle2ContainerHeadCjs(buf) {
+  const scanLen = Math.min(buf.length, 65536);
+  // UTF-16LE directory stream markers commonly found inside OLE2 CFBF containers
+  const text16 = buf.toString('utf16le', 0, scanLen);
+  if (text16.includes('__substg1.0') || text16.includes('__properties_version1.0')) return 'msg';
+  if (text16.includes('WordDocument')) return 'doc';
+  if (text16.includes('Workbook') || text16.includes('Book')) return 'xls';
+  if (text16.includes('PowerPoint Document') || text16.includes('Current User')) return 'ppt';
+  if (text16.includes('Quill')) return 'pub';
+  if (text16.includes('SummaryInformation') && buf.toString('latin1', 0, scanLen).includes('Windows Installer')) return 'msi';
+  return 'doc';
+}
+
+function identifyBufferHeadCjs(buf) {
+  if (!buf || buf.length < 4) return null;
+  const b0 = buf[0];
+  const b1 = buf[1];
+  const b2 = buf[2];
+  const b3 = buf[3];
+
+  if (b0 === 0xff && b1 === 0xd8 && b2 === 0xff) return 'jpg';
+  if (b0 === 0x89 && b1 === 0x50 && b2 === 0x4e && b3 === 0x47) return 'png';
+  if (buf.length >= 6 && (buf.toString('ascii', 0, 6) === 'GIF89a' || buf.toString('ascii', 0, 6) === 'GIF87a')) return 'gif';
+  if (b0 === 0x42 && b1 === 0x4d && buf.length >= 18 && [12, 40, 52, 56, 108, 124].includes(buf.readUInt32LE(14))) return 'bmp';
+  if (b0 === 0x38 && b1 === 0x42 && b2 === 0x50 && b3 === 0x53 && buf.length >= 6) {
+    return buf.readUInt16BE(4) === 2 ? 'psb' : 'psd';
+  }
+  if (b0 === 0x76 && b1 === 0x2f && b2 === 0x31 && b3 === 0x01) return 'exr';
+  if (b0 === 0x44 && b1 === 0x44 && b2 === 0x53 && b3 === 0x20) return 'dds';
+  if (buf.length >= 16 && buf.toString('ascii', 0, 16) === 'FUJIFILMCCD-RAW ') return 'raf';
+  if (buf.length >= 8 && buf[0] === 0 && b1 === 0 && b2 === 1 && b3 === 0) return 'ico';
+
+  if (buf.length >= 5 && buf.toString('ascii', 0, 5) === '%PDF-') return 'pdf';
+  if (b0 === 0x50 && b1 === 0x4b && b2 === 0x03 && b3 === 0x04) return identifyZipContainerHeadCjs(buf);
+  if (b0 === 0xd0 && b1 === 0xcf && b2 === 0x11 && b3 === 0xe0) return identifyOle2ContainerHeadCjs(buf);
+
+  if (buf.length >= 16 && buf.toString('ascii', 0, 15) === 'SQLite format 3') return 'sqlite';
+  if (buf.length >= 12 && buf.toString('ascii', 0, 4) === '!BDN') {
+    const magic2 = buf.toString('ascii', 8, 10);
+    if (magic2 === 'SM' || magic2 === 'SO') return magic2 === 'SO' ? 'ost' : 'pst';
+  }
+  if (buf.length >= 12 && buf.toString('ascii', 0, 4) === 'RIFX') {
+    if (buf.toString('ascii', 8, 12) === 'Egg!') return 'aep';
+    return 'rifx';
+  }
+  if (buf.length >= 12 && buf.toString('ascii', 0, 4) === 'RIFF') {
+    const fc = buf.toString('ascii', 8, 12);
+    if (fc === 'WAVE') return 'wav';
+    if (fc === 'AVI ') return 'avi';
+    if (fc === 'WEBP') return 'webp';
+    if (fc.startsWith('CDR')) return 'cdr';
+    if (fc === 'ACON') return 'ani';
+  }
+  if (buf.length >= 12 && buf.toString('ascii', 0, 4) === 'FORM') {
+    const fc = buf.toString('ascii', 8, 12);
+    if (fc === 'AIFF' || fc === 'AIFC') return 'aiff';
+  }
+  if (buf.length >= 12 && buf.toString('ascii', 4, 8) === 'ftyp') {
+    const brand = buf.toString('ascii', 8, 12);
+    if (brand === 'crx ') return 'cr3';
+    if (brand.toLowerCase().startsWith('qt')) return 'mov';
+    if (brand === 'M4A ') return 'm4a';
+    if (brand === 'M4B ') return 'm4b';
+    if (brand === 'M4V ') return 'm4v';
+    if (brand.startsWith('3gp')) return '3gp';
+    if (brand.startsWith('3g2')) return '3g2';
+    if (brand === 'avif' || brand === 'avis') return 'avif';
+    if (brand === 'heic' || brand === 'mif1' || brand === 'heix') return 'heic';
+    return 'mp4';
+  }
+  if (b0 === 0x1a && b1 === 0x45 && b2 === 0xdf && b3 === 0xa3) {
+    return buf.toString('latin1', 0, Math.min(buf.length, 64)).includes('webm') ? 'webm' : 'mkv';
+  }
+  if (b0 === 0x30 && b1 === 0x26 && b2 === 0xb2 && b3 === 0x75) return 'wmv';
+  if (b0 === 0x46 && b1 === 0x4c && b2 === 0x56 && b3 === 0x01) return 'flv';
+  if (buf.length >= 16 && b0 === 0x06 && b1 === 0x0e && b2 === 0x2b && b3 === 0x34) return 'mxf';
+  if (b0 === 0x49 && b1 === 0x44 && b2 === 0x33) return 'mp3';
+  if (buf.toString('ascii', 0, 4) === 'fLaC') return 'flac';
+  if (buf.toString('ascii', 0, 4) === 'OggS') {
+    return buf.toString('latin1', 0, Math.min(buf.length, 64)).includes('OpusHead') ? 'opus' : 'ogg';
+  }
+  if (buf.toString('ascii', 0, 4) === 'MThd') return 'mid';
+  if (b0 === 0x52 && b1 === 0x61 && b2 === 0x72 && b3 === 0x21) return 'rar';
+  if (buf.length >= 6 && b0 === 0x37 && b1 === 0x7a && b2 === 0xbc && b3 === 0xaf) return '7z';
+  if (b0 === 0x1f && b1 === 0x8b && b2 === 0x08) return 'gz';
+  if (b0 === 0x42 && b1 === 0x5a && b2 === 0x68) return 'bz2';
+  if (buf.length >= 6 && b0 === 0xfd && b1 === 0x37 && b2 === 0x7a && b3 === 0x58 && buf[4] === 0x5a) return 'xz';
+  if (b0 === 0x28 && b1 === 0xb5 && b2 === 0x2f && b3 === 0xfd) return 'zst';
+  if (b0 === 0x04 && b1 === 0x22 && b2 === 0x4d && b3 === 0x18) return 'lz4';
+  if (b0 === 0x4d && b1 === 0x53 && b2 === 0x43 && b3 === 0x46) return 'cab';
+  if (buf.length >= 265 && buf.toString('ascii', 257, 262) === 'ustar') return 'tar';
+  if (buf.length >= 7 && buf.toString('ascii', 0, 7) === 'BLENDER') return 'blend';
+  if (b0 === 0x67 && b1 === 0x6c && b2 === 0x54 && b3 === 0x46) return 'glb';
+  if (buf.length >= 6 && /^AC10\d\d$/.test(buf.toString('ascii', 0, 6))) return 'dwg';
+  if (buf.length >= 8 && (buf.toString('ascii', 0, 7) === 'RPA-3.0' || buf.toString('ascii', 0, 7) === 'RPA-2.0')) return 'rpa';
+  if (buf.length >= 10 && buf.toString('ascii', 0, 10) === 'RENPY RPC2') return 'rpyc';
+  if (buf.length >= 8 && buf.toString('ascii', 0, 8) === 'ElfFile\0') return 'evtx';
+  if (b0 === 0x4c && b1 === 0x00 && b2 === 0x00 && b3 === 0x00 && buf.length >= 20 && buf[4] === 0x01 && buf[5] === 0x14) return 'lnk';
+  if (b0 === 0x0a && b1 === 0x0d && b2 === 0x0d && b3 === 0x0a) return 'pcapng';
+  if ((b0 === 0xd4 && b1 === 0xc3 && b2 === 0xb2 && b3 === 0xa1) || (b0 === 0xa1 && b1 === 0xb2 && b2 === 0xc3 && b3 === 0xd4)) return 'pcap';
+  if (b0 === 0x03 && b1 === 0xd9 && b2 === 0xa2 && b3 === 0x9a) return 'kdbx';
+  if (b0 === 0x00 && b1 === 0x61 && b2 === 0x73 && b3 === 0x6d) return 'wasm';
+  if (b0 === 0xca && b1 === 0xfe && b2 === 0xba && b3 === 0xbe) return 'class';
+  if (buf.toString('ascii', 0, 4) === 'OTTO') return 'otf';
+  if (buf.toString('ascii', 0, 4) === 'wOFF') return 'woff';
+  if (buf.toString('ascii', 0, 4) === 'wOF2') return 'woff2';
+  if (buf.length >= 5 && buf.toString('ascii', 0, 5) === '{\\rtf') return 'rtf';
+  if (buf.length >= 16 && (buf.toString('ascii', 0, 4) === 'II*\0' || buf.toString('ascii', 0, 4) === 'MM\0*')) return 'tif';
+  if (b0 === 0x4d && b1 === 0x5a) return 'exe';
+
+  // Structured text / XML / SVG / AEPX / JSON / Ren'Py fallback
+  const headText = buf.toString('utf8', 0, Math.min(buf.length, 4096)).trimStart();
+  if (headText.startsWith('{') || headText.startsWith('[')) {
+    if (/^\s*[\[{]/.test(headText) && !/[\x00-\x08\x0e-\x1f]/.test(headText.slice(0, 256))) return 'json';
+  }
+  if (headText.startsWith('<?xml') || headText.startsWith('<')) {
+    if (headText.includes('<AfterEffectsProject')) return 'aepx';
+    if (headText.includes('<svg')) return 'svg';
+    if (/^<!doctype\s+html|^<html/i.test(headText)) return 'html';
+    if (/^<\?xml|^<[A-Za-z_][\w:.-]*/.test(headText)) return 'xml';
+  }
+  if (/^(init\s+(-\d+\s+)?python:|label\s+[A-Za-z_]\w*:|define\s+[A-Za-z_])/m.test(headText)) return 'rpy';
+  return null;
+}
+
 /**
- * Identifies extensionless/corrupted files using bundled `fidentify_win.exe` (480+ PhotoRec signatures).
+ * Identifies extensionless/corrupted files using bundled `fidentify_win.exe` (when present)
+ * with built-in pure-Node deep header + OOXML/ODF/OLE2/RIFF/ISO-BMFF fallback so it works 100% offline.
  */
 async function runFidentifyPaths(filePaths) {
+  if (!Array.isArray(filePaths) || filePaths.length === 0) return {};
   const { fidentify } = getEnginePaths();
-  if (!fidentify || !Array.isArray(filePaths) || filePaths.length === 0) return {};
   const map = {};
-  for (const fp of filePaths.slice(0, 64)) {
-    const res = await execBinaryText(fidentify, [fp], { timeout: 6000 });
-    if (res.ok && res.stdout) {
-      // Output line: "<path>: <ext>" or "<path>: unknown"
-      const m = res.stdout.trim().match(/:\s*([a-zA-Z0-9_+-]+)\s*$/);
-      if (m && m[1] && m[1].toLowerCase() !== 'unknown') {
-        map[fp] = m[1].toLowerCase();
+
+  for (const fp of filePaths.slice(0, 128)) {
+    if (typeof fp !== 'string' || !fp.trim()) continue;
+    let detected = null;
+
+    if (fidentify) {
+      const res = await execBinaryText(fidentify, [fp], { timeout: 6000 });
+      if (res.ok && res.stdout) {
+        const m = res.stdout.trim().match(/:\s*([a-zA-Z0-9_+-]+)\s*$/);
+        if (m && m[1] && m[1].toLowerCase() !== 'unknown') {
+          detected = m[1].toLowerCase();
+        }
       }
+    }
+
+    if (!detected || detected === 'zip' || detected === 'doc' || detected === 'tif') {
+      try {
+        const fd = fs.openSync(fp, 'r');
+        try {
+          const headBuf = Buffer.allocUnsafe(65536);
+          const n = fs.readSync(fd, headBuf, 0, 65536, 0);
+          if (n > 0) {
+            const nativeGuess = identifyBufferHeadCjs(headBuf.subarray(0, n));
+            if (nativeGuess) detected = nativeGuess;
+          }
+        } finally {
+          fs.closeSync(fd);
+        }
+      } catch {
+        // ignore unreadable path
+      }
+    }
+
+    if (detected && detected !== 'unknown') {
+      map[fp] = detected;
     }
   }
   return map;
@@ -666,6 +905,7 @@ module.exports = {
   runTskFlsScan,
   extractTskInodeToFile,
   readTskInodeHead,
+  identifyBufferHeadCjs,
   runFidentifyPaths,
   probeVideoFrameWithFfmpeg,
   ffmpegRepairVideoFile,

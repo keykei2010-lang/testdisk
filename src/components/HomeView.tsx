@@ -435,11 +435,19 @@ export const HomeView: React.FC<HomeViewProps> = ({
                         capabilities.ffmpeg && 'FFmpeg',
                       ]
                         .filter(Boolean)
-                        .join(' · ') || 'Pure-JS Forensic Engine'}
+                        .join(' · ') || 'Built-in Recovery Engine'}
                     </span>
                   </div>
                 )}
               </div>
+
+              {(section === 'hardware' || section === 'sdcard') && (
+                <div className="px-3.5 py-2 rounded-md bg-[#181B22] border border-[#2B303C] text-[11px] text-slate-400 leading-relaxed">
+                  <strong className="text-slate-200 font-medium">SSD / NVMe TRIM &amp; Safety Advisory:</strong>{' '}
+                  Modern SSDs discard deleted blocks shortly after file deletion (TRIM). Stop writing to
+                  the target drive immediately and always save recovered files to a separate physical drive.
+                </div>
+              )}
 
               {selfTestResult && (
                 <div

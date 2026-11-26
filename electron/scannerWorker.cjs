@@ -1,19 +1,11 @@
-const { parentPort, workerData } = require('node:worker_threads');
+const { isMainThread, parentPort, workerData } = require('node:worker_threads');
 const fs = require('node:fs');
-
 const {
-  devicePath,
-  rangeStart,
-  rangeEnd,
-  totalLimitBytes,
-  step = 512,
-  workerIndex = 0,
-  ctrlBuffer,
-  unallocatedOnly = false,
-  allocatedBitmaps = [],
-} = workerData;
-
-const ctrl = ctrlBuffer ? new Int32Array(ctrlBuffer) : null;
+  normalizeSectorSize,
+  detectSectorSizeSync,
+  readAlignedSync,
+  readAlignedResilientSync,
+} = require('./alignedIoCjs.cjs');
 
 const CRC32_TABLE = new Uint32Array(256);
 for (let n = 0; n < 256; n++) {
@@ -33,23 +25,45 @@ function computeCrc32Buf(buf, len) {
   return (crc ^ 0xffffffff) >>> 0;
 }
 
-function isOffsetAllocated(absOffset) {
-  if (!unallocatedOnly || !allocatedBitmaps || allocatedBitmaps.length === 0) return false;
+/**
+ * Checks SharedArrayBuffer control flags synchronously inside worker loops:
+ * 0 = running, 1 = paused (blocks via Atomics.wait in worker threads), 2 = cancelled.
+ */
+function checkCtrlSync(ctrl) {
+  if (!ctrl) return false;
+  let state = Atomics.load(ctrl, 0);
+  while (state === 1) {
+    try {
+      Atomics.wait(ctrl, 0, 1, 80);
+    } catch {
+      return false;
+    }
+    state = Atomics.load(ctrl, 0);
+  }
+  return state === 2;
+}
+
+function checkOffsetAllocation(absOffset, unallocatedOnly, allocatedBitmaps) {
+  if (!unallocatedOnly || !allocatedBitmaps || allocatedBitmaps.length === 0) {
+    return { allocated: false, verified: false };
+  }
   for (const bmInfo of allocatedBitmaps) {
     if (absOffset >= bmInfo.volStart && absOffset < bmInfo.volEnd) {
       const lcn = Math.floor((absOffset - bmInfo.volStart) / bmInfo.clusterBytes);
       const bIdx = lcn >>> 3;
       if (bIdx < bmInfo.bitmap.length) {
-        return (bmInfo.bitmap[bIdx] & (1 << (lcn & 7))) !== 0;
+        return {
+          allocated: (bmInfo.bitmap[bIdx] & (1 << (lcn & 7))) !== 0,
+          verified: true,
+        };
       }
-      return false;
+      return { allocated: false, verified: false };
     }
   }
-  return false;
+  return { allocated: false, verified: false };
 }
 
 function isSectorAllZero(buf, offset) {
-  // Fast 64-bit check: bail out immediately on first non-zero 8-byte lane
   const end = Math.min(buf.length, offset + 512);
   for (let i = offset; i + 8 <= end; i += 8) {
     if (buf.readBigUInt64LE(i) !== 0n) return false;
@@ -57,7 +71,15 @@ function isSectorAllZero(buf, offset) {
   return true;
 }
 
-function measureMp4FromFd(fd, startOffset, maxEnd) {
+function safeReadAligned(fd, dstBuf, dstOff, len, pos, sectorSize = 512) {
+  try {
+    return readAlignedSync(fd, dstBuf, dstOff, len, pos, sectorSize);
+  } catch {
+    return 0;
+  }
+}
+
+function measureMp4FromFd(fd, startOffset, maxEnd, sectorSize = 512) {
   let pos = startOffset;
   const hdr = Buffer.allocUnsafe(16);
   let sawMoov = false;
@@ -65,7 +87,7 @@ function measureMp4FromFd(fd, startOffset, maxEnd) {
   let lastValidEnd = startOffset;
 
   for (let boxes = 0; boxes < 128 && pos + 8 <= maxEnd; boxes++) {
-    const n = fs.readSync(fd, hdr, 0, 16, pos);
+    const n = safeReadAligned(fd, hdr, 0, 16, pos, sectorSize);
     if (n < 8) break;
     let boxSize = hdr.readUInt32BE(0);
     const boxType = hdr.toString('ascii', 4, 8);
@@ -85,20 +107,23 @@ function measureMp4FromFd(fd, startOffset, maxEnd) {
   }
 
   if (!sawMoov && !sawMdat) return null;
+  const truncated = sawMdat && !sawMoov;
   return {
     size: lastValidEnd - startOffset,
-    truncated: sawMdat && !sawMoov,
+    truncated,
+    sizeEstimated: false,
   };
 }
 
-function measureJpgFromFd(fd, startOffset, maxEnd) {
+function measureJpgFromFd(fd, startOffset, maxEnd, sectorSize = 512, ctrl = null) {
   const maxJpg = Math.min(maxEnd, startOffset + 48 * 1024 * 1024);
   const segHdr = Buffer.allocUnsafe(4);
   let pos = startOffset + 2;
   let sawSos = false;
 
   for (let segs = 0; segs < 256 && pos + 2 <= maxJpg; segs++) {
-    const n = fs.readSync(fd, segHdr, 0, 4, pos);
+    if (checkCtrlSync(ctrl)) return null;
+    const n = safeReadAligned(fd, segHdr, 0, 4, pos, sectorSize);
     if (n < 2) break;
     if (segHdr[0] !== 0xff) {
       if (sawSos) break;
@@ -111,11 +136,11 @@ function measureJpgFromFd(fd, startOffset, maxEnd) {
     }
     const marker = segHdr[mIdx];
     pos += 2;
-    if (marker === 0xd9) return { size: pos - startOffset, truncated: false };
+    if (marker === 0xd9) return { size: pos - startOffset, truncated: false, sizeEstimated: false };
     if (marker === 0x00 || (marker >= 0xd0 && marker <= 0xd8)) continue;
     if (n < mIdx + 3) {
       const lenBuf = Buffer.allocUnsafe(2);
-      if (fs.readSync(fd, lenBuf, 0, 2, pos) < 2) break;
+      if (safeReadAligned(fd, lenBuf, 0, 2, pos, sectorSize) < 2) break;
       const segLen = lenBuf.readUInt16BE(0);
       if (segLen < 2) break;
       pos += segLen;
@@ -135,13 +160,14 @@ function measureJpgFromFd(fd, startOffset, maxEnd) {
   const chunk = Buffer.allocUnsafe(262144);
   let prevFf = false;
   while (pos < maxJpg) {
+    if (checkCtrlSync(ctrl)) return null;
     const toRead = Math.min(chunk.length, maxJpg - pos);
-    const n = fs.readSync(fd, chunk, 0, toRead, pos);
+    const n = safeReadAligned(fd, chunk, 0, toRead, pos, sectorSize);
     if (n <= 0) break;
     for (let i = 0; i < n; i++) {
       const b = chunk[i];
       if (prevFf) {
-        if (b === 0xd9) return { size: pos + i + 1 - startOffset, truncated: false };
+        if (b === 0xd9) return { size: pos + i + 1 - startOffset, truncated: false, sizeEstimated: false };
         prevFf = b === 0xff;
         continue;
       }
@@ -149,35 +175,40 @@ function measureJpgFromFd(fd, startOffset, maxEnd) {
     }
     pos += n;
   }
-  return { size: Math.min(maxJpg - startOffset, 2 * 1024 * 1024), truncated: true };
+  return {
+    size: Math.min(maxJpg - startOffset, 2 * 1024 * 1024),
+    truncated: true,
+    sizeEstimated: true,
+  };
 }
 
-function measurePngFromFd(fd, startOffset, maxEnd) {
+function measurePngFromFd(fd, startOffset, maxEnd, sectorSize = 512) {
   const hdr = Buffer.allocUnsafe(12);
   let pos = startOffset + 8;
   for (let i = 0; i < 256 && pos + 12 <= maxEnd; i++) {
-    const n = fs.readSync(fd, hdr, 0, 12, pos);
+    const n = safeReadAligned(fd, hdr, 0, 12, pos, sectorSize);
     if (n < 12) break;
     const len = hdr.readUInt32BE(0);
     const type = hdr.toString('ascii', 4, 8);
     if (len > 32 * 1024 * 1024) return null;
     const nextPos = pos + 12 + len;
-    if (nextPos > maxEnd) return { size: maxEnd - startOffset, truncated: true };
+    if (nextPos > maxEnd) return { size: maxEnd - startOffset, truncated: true, sizeEstimated: false };
     pos = nextPos;
-    if (type === 'IEND') return { size: pos - startOffset, truncated: false };
+    if (type === 'IEND') return { size: pos - startOffset, truncated: false, sizeEstimated: false };
   }
   return null;
 }
 
-function findMarkerInStream(fd, startOffset, maxScanLen, maxEnd, patternBuf) {
+function findMarkerInStream(fd, startOffset, maxScanLen, maxEnd, patternBuf, sectorSize = 512, ctrl = null) {
   const limit = Math.min(maxEnd, startOffset + maxScanLen);
   const scanChunk = Buffer.allocUnsafe(131072);
   let pos = startOffset;
   const overlap = Math.max(1, patternBuf.length - 1);
 
   while (pos < limit) {
+    if (checkCtrlSync(ctrl)) return -1;
     const toRead = Math.min(scanChunk.length, limit - pos);
-    const n = fs.readSync(fd, scanChunk, 0, toRead, pos);
+    const n = safeReadAligned(fd, scanChunk, 0, toRead, pos, sectorSize);
     if (n < patternBuf.length) break;
     const hitIdx = scanChunk.subarray(0, n).indexOf(patternBuf);
     if (hitIdx !== -1) return pos + hitIdx;
@@ -187,65 +218,77 @@ function findMarkerInStream(fd, startOffset, maxScanLen, maxEnd, patternBuf) {
   return -1;
 }
 
-function measurePdfFromFd(fd, startOffset, maxEnd) {
+function measurePdfFromFd(fd, startOffset, maxEnd, sectorSize = 512, ctrl = null) {
   const eofMarker = Buffer.from('%%EOF', 'ascii');
-  const hit = findMarkerInStream(fd, startOffset, 64 * 1024 * 1024, maxEnd, eofMarker);
+  const hit = findMarkerInStream(fd, startOffset, 64 * 1024 * 1024, maxEnd, eofMarker, sectorSize, ctrl);
   if (hit !== -1) {
     let end = hit + 5;
     const tail = Buffer.allocUnsafe(4);
-    const tn = fs.readSync(fd, tail, 0, Math.min(4, maxEnd - end), end);
+    const tn = safeReadAligned(fd, tail, 0, Math.min(4, maxEnd - end), end, sectorSize);
     for (let i = 0; i < tn; i++) {
       if (tail[i] === 0x0d || tail[i] === 0x0a) end++;
       else break;
     }
-    return { size: end - startOffset, truncated: false };
+    return { size: end - startOffset, truncated: false, sizeEstimated: false };
   }
-  return { size: Math.min(4 * 1024 * 1024, maxEnd - startOffset), truncated: true };
+  return {
+    size: Math.min(4 * 1024 * 1024, maxEnd - startOffset),
+    truncated: true,
+    sizeEstimated: true,
+  };
 }
 
-function measureZipFromFd(fd, startOffset, maxEnd) {
+function measureZipFromFd(fd, startOffset, maxEnd, sectorSize = 512, ctrl = null) {
   const eocdSig = Buffer.from([0x50, 0x4b, 0x05, 0x06]);
-  const hit = findMarkerInStream(fd, startOffset, 128 * 1024 * 1024, maxEnd, eocdSig);
+  const hit = findMarkerInStream(fd, startOffset, 128 * 1024 * 1024, maxEnd, eocdSig, sectorSize, ctrl);
   if (hit !== -1 && hit + 22 <= maxEnd) {
     const eocdBuf = Buffer.allocUnsafe(22);
-    if (fs.readSync(fd, eocdBuf, 0, 22, hit) === 22) {
+    if (safeReadAligned(fd, eocdBuf, 0, 22, hit, sectorSize) === 22) {
       const commentLen = eocdBuf.readUInt16LE(20);
       const total = Math.min(maxEnd - startOffset, hit + 22 + commentLen - startOffset);
-      return { size: total, truncated: false };
+      return { size: total, truncated: false, sizeEstimated: false };
     }
   }
-  return { size: Math.min(8 * 1024 * 1024, maxEnd - startOffset), truncated: true };
+  return {
+    size: Math.min(8 * 1024 * 1024, maxEnd - startOffset),
+    truncated: true,
+    sizeEstimated: true,
+  };
 }
 
-function measureGifFromFd(fd, startOffset, maxEnd) {
+function measureGifFromFd(fd, startOffset, maxEnd, sectorSize = 512, ctrl = null) {
   const hdr = Buffer.allocUnsafe(16);
-  if (fs.readSync(fd, hdr, 0, 13, startOffset) < 13) return null;
+  if (safeReadAligned(fd, hdr, 0, 13, startOffset, sectorSize) < 13) return null;
   const ver = hdr.toString('ascii', 0, 6);
   if (ver !== 'GIF87a' && ver !== 'GIF89a') return null;
   const maxGif = Math.min(maxEnd, startOffset + 25 * 1024 * 1024);
   const trailer = Buffer.from([0x00, 0x3b]);
-  const hit = findMarkerInStream(fd, startOffset + 13, maxGif - (startOffset + 13), maxGif, trailer);
-  if (hit !== -1) return { size: hit + 2 - startOffset, truncated: false };
-  return { size: Math.min(2 * 1024 * 1024, maxGif - startOffset), truncated: true };
+  const hit = findMarkerInStream(fd, startOffset + 13, maxGif - (startOffset + 13), maxGif, trailer, sectorSize, ctrl);
+  if (hit !== -1) return { size: hit + 2 - startOffset, truncated: false, sizeEstimated: false };
+  return {
+    size: Math.min(2 * 1024 * 1024, maxGif - startOffset),
+    truncated: true,
+    sizeEstimated: true,
+  };
 }
 
-function measureSqliteFromFd(fd, startOffset, maxEnd) {
+function measureSqliteFromFd(fd, startOffset, maxEnd, sectorSize = 512) {
   const hdr = Buffer.allocUnsafe(36);
-  if (fs.readSync(fd, hdr, 0, 36, startOffset) < 36) return null;
+  if (safeReadAligned(fd, hdr, 0, 36, startOffset, sectorSize) < 36) return null;
   let pageSize = hdr.readUInt16BE(16);
   if (pageSize === 1) pageSize = 65536;
   const pageCount = hdr.readUInt32BE(28);
   if (pageSize < 512 || (pageSize & (pageSize - 1)) !== 0 || pageCount === 0) return null;
   const decl = pageSize * pageCount;
   const avail = maxEnd - startOffset;
-  return { size: Math.min(decl, avail), truncated: decl > avail };
+  return { size: Math.min(decl, avail), truncated: decl > avail, sizeEstimated: false };
 }
 
-function detectZipFlavorFromFd(fd, startOffset, maxEnd) {
+function detectZipFlavorFromFd(fd, startOffset, maxEnd, sectorSize = 512) {
   const probeLen = Math.min(32768, Math.max(0, maxEnd - startOffset));
   if (probeLen < 30) return 'zip';
   const buf = Buffer.allocUnsafe(probeLen);
-  const n = fs.readSync(fd, buf, 0, probeLen, startOffset);
+  const n = safeReadAligned(fd, buf, 0, probeLen, startOffset, sectorSize);
   const ascii = buf.toString('latin1', 0, n);
   if (ascii.includes('word/')) return 'docx';
   if (ascii.includes('xl/')) return 'xlsx';
@@ -264,11 +307,11 @@ function detectZipFlavorFromFd(fd, startOffset, maxEnd) {
   return 'zip';
 }
 
-function detectOle2FlavorFromFd(fd, startOffset, maxEnd) {
+function detectOle2FlavorFromFd(fd, startOffset, maxEnd, sectorSize = 512) {
   const probeLen = Math.min(65536, Math.max(0, maxEnd - startOffset));
   if (probeLen < 512) return 'doc';
   const buf = Buffer.allocUnsafe(probeLen);
-  const n = fs.readSync(fd, buf, 0, probeLen, startOffset);
+  const n = safeReadAligned(fd, buf, 0, probeLen, startOffset, sectorSize);
   const text16 = buf.toString('utf16le', 0, n);
   if (text16.includes('__substg1.0') || text16.includes('__properties_version1.0')) return 'msg';
   if (text16.includes('WordDocument')) return 'doc';
@@ -279,21 +322,22 @@ function detectOle2FlavorFromFd(fd, startOffset, maxEnd) {
   return 'doc';
 }
 
-function measureRifxFromFd(fd, startOffset, maxEnd) {
+function measureRifxFromFd(fd, startOffset, maxEnd, sectorSize = 512) {
   const hdr = Buffer.allocUnsafe(16);
-  if (fs.readSync(fd, hdr, 0, 12, startOffset) < 12) return null;
+  if (safeReadAligned(fd, hdr, 0, 12, startOffset, sectorSize) < 12) return null;
   const declared = hdr.readUInt32BE(4) + 8;
   const avail = maxEnd - startOffset;
   if (declared < 16) return null;
   return {
     size: Math.min(declared, avail, 128 * 1024 * 1024),
     truncated: declared > avail,
+    sizeEstimated: false,
   };
 }
 
-function measurePsdFromFd(fd, startOffset, maxEnd) {
+function measurePsdFromFd(fd, startOffset, maxEnd, sectorSize = 512) {
   const hdr = Buffer.allocUnsafe(30);
-  if (fs.readSync(fd, hdr, 0, 30, startOffset) < 30) return null;
+  if (safeReadAligned(fd, hdr, 0, 30, startOffset, sectorSize) < 30) return null;
   const ver = hdr.readUInt16BE(4);
   if (ver !== 1 && ver !== 2) return null;
   const ext = ver === 2 ? 'psb' : 'psd';
@@ -303,17 +347,17 @@ function measurePsdFromFd(fd, startOffset, maxEnd) {
     const is8 = ver === 2 && sec === 2;
     const need = is8 ? 8 : 4;
     if (startOffset + pos + need > maxEnd) {
-      return { ext, size: maxEnd - startOffset, truncated: true };
+      return { ext, size: maxEnd - startOffset, truncated: true, sizeEstimated: true };
     }
-    if (fs.readSync(fd, lenBuf, 0, need, startOffset + pos) < need) {
-      return { ext, size: pos, truncated: true };
+    if (safeReadAligned(fd, lenBuf, 0, need, startOffset + pos, sectorSize) < need) {
+      return { ext, size: pos, truncated: true, sizeEstimated: true };
     }
     const secLen = is8
       ? lenBuf.readUInt32BE(0) * 4294967296 + lenBuf.readUInt32BE(4)
       : lenBuf.readUInt32BE(0);
     pos += need + secLen;
     if (startOffset + pos > maxEnd) {
-      return { ext, size: maxEnd - startOffset, truncated: true };
+      return { ext, size: maxEnd - startOffset, truncated: true, sizeEstimated: true };
     }
   }
   const chans = hdr.readUInt16BE(12);
@@ -322,33 +366,60 @@ function measurePsdFromFd(fd, startOffset, maxEnd) {
   const depth = hdr.readUInt16BE(22);
   const estImageData = Math.min(64 * 1024 * 1024, Math.max(4096, Math.floor((w * h * chans * Math.max(1, depth / 8)) / 3)));
   const total = Math.min(maxEnd - startOffset, pos + 2 + estImageData);
-  return { ext, size: total, truncated: false };
+  return { ext, size: total, truncated: true, sizeEstimated: true };
 }
 
-function measureTarFromFd(fd, startOffset, maxEnd) {
+function measureTarFromFd(fd, startOffset, maxEnd, sectorSize = 512) {
   const avail = Math.min(maxEnd - startOffset, 64 * 1024 * 1024);
   const hdr = Buffer.allocUnsafe(512);
   let pos = 0;
   let zeroBlocks = 0;
   while (pos + 512 <= avail) {
-    if (fs.readSync(fd, hdr, 0, 512, startOffset + pos) < 512) break;
+    if (safeReadAligned(fd, hdr, 0, 512, startOffset + pos, sectorSize) < 512) break;
     if (isSectorAllZero(hdr, 0)) {
       zeroBlocks++;
       pos += 512;
-      if (zeroBlocks >= 2) return { size: pos, truncated: false };
+      if (zeroBlocks >= 2) return { size: pos, truncated: false, sizeEstimated: false };
       continue;
     }
     zeroBlocks = 0;
     const magic = hdr.toString('ascii', 257, 262);
     if (magic !== 'ustar') {
-      return pos >= 512 ? { size: pos, truncated: true } : null;
+      return pos >= 512 ? { size: pos, truncated: true, sizeEstimated: true } : null;
     }
     const sizeOct = hdr.toString('ascii', 124, 136).replace(/\0.*$/, '').trim();
     const entryBytes = parseInt(sizeOct || '0', 8) || 0;
     const dataBlocks = Math.ceil(entryBytes / 512) * 512;
     pos += 512 + dataBlocks;
   }
-  return pos >= 512 ? { size: Math.min(avail, pos), truncated: true } : null;
+  return pos >= 512 ? { size: Math.min(avail, pos), truncated: true, sizeEstimated: true } : null;
+}
+
+function measurePstFromFd(fd, startOffset, maxEnd, sectorSize = 512) {
+  const avail = maxEnd - startOffset;
+  const hdr = Buffer.allocUnsafe(200);
+  const n = safeReadAligned(fd, hdr, 0, 200, startOffset, sectorSize);
+  if (n >= 192 && hdr.toString('ascii', 0, 4) === '!BDN') {
+    const wVer = hdr.readUInt16LE(10);
+    let eofSize = 0;
+    if (wVer >= 23 && n >= 192) {
+      eofSize = Number(hdr.readBigUInt64LE(0xb8));
+    } else if (wVer > 0 && wVer < 23 && n >= 176) {
+      eofSize = hdr.readUInt32LE(0xa8);
+    }
+    if (Number.isFinite(eofSize) && eofSize >= 512 && eofSize <= 32 * 1024 * 1024 * 1024) {
+      return {
+        size: Math.min(eofSize, avail),
+        truncated: eofSize > avail,
+        sizeEstimated: false,
+      };
+    }
+  }
+  return {
+    size: Math.min(64 * 1024 * 1024, avail),
+    truncated: true,
+    sizeEstimated: true,
+  };
 }
 
 function detectTiffRawFlavor(buf, offset, availLen) {
@@ -389,57 +460,98 @@ function detectTiffRawFlavor(buf, offset, availLen) {
   return 'tif';
 }
 
-async function runWorker() {
+async function scanRange({
+  devicePath,
+  rangeStart,
+  rangeEnd,
+  totalLimitBytes,
+  step = 512,
+  sectorSize: requestedSectorSize,
+  workerIndex = 0,
+  ctrlBuffer = null,
+  unallocatedOnly = false,
+  allocatedBitmaps = [],
+  emit = () => {},
+}) {
+  const ctrl = ctrlBuffer ? new Int32Array(ctrlBuffer) : null;
   let fd;
   try {
     fd = fs.openSync(devicePath, 'r');
   } catch (err) {
-    parentPort.postMessage({ type: 'error', message: err?.message || 'openSync failed' });
-    return;
+    emit({ type: 'error', workerIndex, message: err?.message || 'openSync failed' });
+    return { entries: [], skippedBytes: 0, skippedSectors: 0, skippedRanges: [], unverifiedCoverage: false };
   }
 
+  const sectorSize = requestedSectorSize
+    ? normalizeSectorSize(requestedSectorSize)
+    : detectSectorSizeSync(fd);
+  const scanStep = Math.max(512, Number(step) || 512);
   const chunkSize = 4 * 1024 * 1024;
   const chunkBuf = Buffer.allocUnsafe(chunkSize);
-  let cursor = Math.max(0, Math.floor(rangeStart / 512) * 512);
+  let cursor = Math.max(0, Math.floor(rangeStart / scanStep) * scanStep);
   let fileSeq = 1;
+  let unverifiedCoverage = Boolean(unallocatedOnly && (!allocatedBitmaps || allocatedBitmaps.length === 0));
+  let totalSkippedSectors = 0;
+  let totalSkippedBytes = 0;
+  const allSkippedRanges = [];
+  const collectedEntries = [];
 
   try {
-    while (cursor + 512 <= rangeEnd) {
-      if (ctrl) {
-        const st = Atomics.load(ctrl, 0);
-        if (st === 2) break;
-        while (Atomics.load(ctrl, 0) === 1) {
-          await new Promise((r) => setTimeout(r, 80));
-        }
-        if (Atomics.load(ctrl, 0) === 2) break;
-      }
+    while (cursor < rangeEnd) {
+      if (checkCtrlSync(ctrl)) break;
 
-      const windowLen = Math.min(chunkSize, Math.floor((rangeEnd - cursor) / 512) * 512);
-      if (windowLen < 512) break;
+      const remaining = rangeEnd - cursor;
+      const readStepAlign = Math.max(scanStep, sectorSize);
+      const rawWindow = Math.min(chunkSize, remaining);
+      const windowLen = rawWindow >= readStepAlign
+        ? Math.floor(rawWindow / readStepAlign) * readStepAlign
+        : Math.ceil(rawWindow / sectorSize) * sectorSize;
+      if (windowLen <= 0 || cursor >= totalLimitBytes) break;
 
-      let n = 0;
+      let readRes;
       try {
-        n = fs.readSync(fd, chunkBuf, 0, windowLen, cursor);
-      } catch {
+        readRes = readAlignedResilientSync(fd, chunkBuf, 0, Math.min(chunkSize, windowLen), cursor, sectorSize);
+      } catch (err) {
+        emit({ type: 'error', workerIndex, message: err?.message || 'Read failure' });
         break;
       }
-      if (n < 512) break;
+
+      if (readRes.skippedSectors > 0) {
+        totalSkippedSectors += readRes.skippedSectors;
+        totalSkippedBytes += readRes.skippedBytes;
+        for (const sr of readRes.skippedRanges) {
+          if (allSkippedRanges.length < 256) allSkippedRanges.push(sr);
+        }
+        emit({
+          type: 'bad-sectors',
+          workerIndex,
+          skippedSectors: readRes.skippedSectors,
+          skippedBytes: readRes.skippedBytes,
+          skippedRanges: readRes.skippedRanges,
+        });
+      }
+
+      const n = readRes.bytesRead;
+      if (n <= 0) break;
 
       let local = 0;
       const batch = [];
 
-      while (local + 16 <= n) {
-        if (ctrl && Atomics.load(ctrl, 0) === 2) break;
+      while (local + 16 <= n && cursor + local < rangeEnd) {
+        if (checkCtrlSync(ctrl)) break;
         const absOffset = cursor + local;
 
-        if (unallocatedOnly && isOffsetAllocated(absOffset)) {
-          local += step;
-          continue;
+        const allocCheck = checkOffsetAllocation(absOffset, unallocatedOnly, allocatedBitmaps);
+        if (unallocatedOnly) {
+          if (!allocCheck.verified) unverifiedCoverage = true;
+          if (allocCheck.allocated) {
+            local += scanStep;
+            continue;
+          }
         }
 
-        // 64-bit zero-sector skip for multi-TB throughput
-        if (step >= 512 && local + 512 <= n && isSectorAllZero(chunkBuf, local)) {
-          local += step;
+        if (scanStep >= 512 && local + 512 <= n && isSectorAllZero(chunkBuf, local)) {
+          local += scanStep;
           continue;
         }
 
@@ -448,38 +560,39 @@ async function runWorker() {
         const b2 = chunkBuf[local + 2];
         const b3 = chunkBuf[local + 3];
         const b4 = chunkBuf[local + 4];
+        const avail = Math.max(0, totalLimitBytes - absOffset);
 
         let matchedExt = null;
         let measured = null;
 
         if (b0 === 0xff && b1 === 0xd8 && b2 === 0xff && [0xe0, 0xe1, 0xe2, 0xdb, 0xee, 0xc0, 0xc2].includes(b3)) {
           matchedExt = 'jpg';
-          measured = measureJpgFromFd(fd, absOffset, totalLimitBytes);
+          measured = measureJpgFromFd(fd, absOffset, totalLimitBytes, sectorSize, ctrl);
         } else if (b0 === 0x89 && b1 === 0x50 && b2 === 0x4e && b3 === 0x47 && b4 === 0x0d) {
           matchedExt = 'png';
-          measured = measurePngFromFd(fd, absOffset, totalLimitBytes);
+          measured = measurePngFromFd(fd, absOffset, totalLimitBytes, sectorSize);
         } else if (b0 === 0x47 && b1 === 0x49 && b2 === 0x46 && b3 === 0x38) {
           matchedExt = 'gif';
-          measured = measureGifFromFd(fd, absOffset, totalLimitBytes);
+          measured = measureGifFromFd(fd, absOffset, totalLimitBytes, sectorSize, ctrl);
         } else if (b0 === 0x42 && b1 === 0x4d && local + 18 <= n) {
           const bfSize = chunkBuf.readUInt32LE(local + 2);
           const dibSize = chunkBuf.readUInt32LE(local + 14);
           if (bfSize > 54 && bfSize < 100 * 1024 * 1024 && [12, 40, 52, 56, 108, 124].includes(dibSize)) {
             matchedExt = 'bmp';
-            measured = { size: Math.min(bfSize, totalLimitBytes - absOffset), truncated: bfSize > totalLimitBytes - absOffset };
+            measured = { size: Math.min(bfSize, avail), truncated: bfSize > avail, sizeEstimated: false };
           }
         } else if (b0 === 0x38 && b1 === 0x42 && b2 === 0x50 && b3 === 0x53) {
-          const pRes = measurePsdFromFd(fd, absOffset, totalLimitBytes);
+          const pRes = measurePsdFromFd(fd, absOffset, totalLimitBytes, sectorSize);
           if (pRes) {
             matchedExt = pRes.ext;
-            measured = { size: pRes.size, truncated: pRes.truncated };
+            measured = { size: pRes.size, truncated: pRes.truncated, sizeEstimated: pRes.sizeEstimated };
           }
         } else if (b0 === 0x76 && b1 === 0x2f && b2 === 0x31 && b3 === 0x01) {
           matchedExt = 'exr';
-          measured = { size: Math.min(24 * 1024 * 1024, totalLimitBytes - absOffset), truncated: false };
+          measured = { size: Math.min(24 * 1024 * 1024, avail), truncated: true, sizeEstimated: true };
         } else if (b0 === 0x44 && b1 === 0x44 && b2 === 0x53 && b3 === 0x20) {
           matchedExt = 'dds';
-          measured = { size: Math.min(8 * 1024 * 1024, totalLimitBytes - absOffset), truncated: false };
+          measured = { size: Math.min(8 * 1024 * 1024, avail), truncated: true, sizeEstimated: true };
         } else if (b4 === 0x66 && chunkBuf[local + 5] === 0x74 && chunkBuf[local + 6] === 0x79 && chunkBuf[local + 7] === 0x70) {
           const brand = local + 12 <= n ? chunkBuf.toString('ascii', local + 8, local + 12) : '';
           if (brand === 'crx ') matchedExt = 'cr3';
@@ -492,18 +605,19 @@ async function runWorker() {
           else if (brand === 'avif' || brand === 'avis') matchedExt = 'avif';
           else if (brand === 'heic' || brand === 'mif1' || brand === 'heix') matchedExt = 'heic';
           else matchedExt = 'mp4';
-          measured = measureMp4FromFd(fd, absOffset, totalLimitBytes);
-          if (measured && measured.truncated && measured.size > step && ['mp4', 'mov', 'm4v', '3gp'].includes(matchedExt)) {
+          measured = measureMp4FromFd(fd, absOffset, totalLimitBytes, sectorSize);
+          if (measured && measured.truncated && measured.size > scanStep && ['mp4', 'mov', 'm4v', '3gp'].includes(matchedExt)) {
             const pBuf = Buffer.allocUnsafe(12);
             const maxScanEnd = Math.min(totalLimitBytes, absOffset + measured.size);
-            for (let probe = absOffset + step; probe + 12 <= maxScanEnd; probe += step) {
+            for (let probe = absOffset + scanStep; probe + 12 <= maxScanEnd; probe += scanStep) {
+              if (checkCtrlSync(ctrl)) break;
               let p0, p1, p2, p3, p4, p5, p6, p7;
               if (probe >= cursor && probe + 12 <= cursor + n) {
                 const rel = probe - cursor;
                 p0 = chunkBuf[rel]; p1 = chunkBuf[rel + 1]; p2 = chunkBuf[rel + 2]; p3 = chunkBuf[rel + 3];
                 p4 = chunkBuf[rel + 4]; p5 = chunkBuf[rel + 5]; p6 = chunkBuf[rel + 6]; p7 = chunkBuf[rel + 7];
               } else {
-                if (fs.readSync(fd, pBuf, 0, 12, probe) < 12) break;
+                if (safeReadAligned(fd, pBuf, 0, 12, probe, sectorSize) < 12) break;
                 p0 = pBuf[0]; p1 = pBuf[1]; p2 = pBuf[2]; p3 = pBuf[3];
                 p4 = pBuf[4]; p5 = pBuf[5]; p6 = pBuf[6]; p7 = pBuf[7];
               }
@@ -516,7 +630,7 @@ async function runWorker() {
                 (p0 === 0xd0 && p1 === 0xcf && p2 === 0x11 && p3 === 0xe0) ||
                 (p4 === 0x66 && p5 === 0x74 && p6 === 0x79 && p7 === 0x70);
               if (isForeign) {
-                measured = { size: probe - absOffset, truncated: true };
+                measured = { size: probe - absOffset, truncated: true, sizeEstimated: false };
                 break;
               }
             }
@@ -530,7 +644,7 @@ async function runWorker() {
           chunkBuf.toString('ascii', local, local + 16) === 'FUJIFILMCCD-RAW '
         ) {
           matchedExt = 'raf';
-          measured = { size: Math.min(48 * 1024 * 1024, totalLimitBytes - absOffset), truncated: false };
+          measured = { size: Math.min(48 * 1024 * 1024, avail), truncated: true, sizeEstimated: true };
         } else if (
           (b0 === 0x49 && b1 === 0x49 && ((b2 === 0x2a && b3 === 0x00) || (b2 === 0x52 && b3 === 0x4f) || (b2 === 0x55 && b3 === 0x00))) ||
           (b0 === 0x4d && b1 === 0x4d && b2 === 0x00 && b3 === 0x2a)
@@ -539,16 +653,16 @@ async function runWorker() {
           if (flavor) {
             matchedExt = flavor;
             const defaultSize = flavor === 'tif' ? 16 * 1024 * 1024 : 36 * 1024 * 1024;
-            measured = { size: Math.min(defaultSize, totalLimitBytes - absOffset), truncated: false };
+            measured = { size: Math.min(defaultSize, avail), truncated: true, sizeEstimated: true };
           }
         } else if (b0 === 0x1a && b1 === 0x45 && b2 === 0xdf && b3 === 0xa3) {
           matchedExt = chunkBuf.toString('latin1', local, Math.min(n, local + 64)).includes('webm') ? 'webm' : 'mkv';
-          measured = { size: Math.min(16 * 1024 * 1024, totalLimitBytes - absOffset), truncated: false };
+          measured = { size: Math.min(16 * 1024 * 1024, avail), truncated: true, sizeEstimated: true };
         } else if (b0 === 0x52 && b1 === 0x49 && b2 === 0x46 && b3 === 0x58) {
           const fourcc = chunkBuf.toString('ascii', local + 8, local + 12);
           if (fourcc === 'Egg!') {
             matchedExt = 'aep';
-            measured = measureRifxFromFd(fd, absOffset, totalLimitBytes);
+            measured = measureRifxFromFd(fd, absOffset, totalLimitBytes, sectorSize);
           }
         } else if (b0 === 0x52 && b1 === 0x49 && b2 === 0x46 && b3 === 0x46) {
           const fourcc = chunkBuf.toString('ascii', local + 8, local + 12);
@@ -556,8 +670,9 @@ async function runWorker() {
             matchedExt = fourcc === 'WAVE' ? 'wav' : fourcc === 'AVI ' ? 'avi' : fourcc === 'WEBP' ? 'webp' : fourcc === 'ACON' ? 'ani' : 'cdr';
             const riffSize = chunkBuf.readUInt32LE(local + 4) + 8;
             measured = {
-              size: Math.min(riffSize, totalLimitBytes - absOffset),
-              truncated: riffSize > totalLimitBytes - absOffset,
+              size: Math.min(riffSize, avail),
+              truncated: riffSize > avail,
+              sizeEstimated: false,
             };
           }
         } else if (b0 === 0x46 && b1 === 0x4f && b2 === 0x52 && b3 === 0x4d && local + 12 <= n) {
@@ -565,38 +680,38 @@ async function runWorker() {
           if (fc === 'AIFF' || fc === 'AIFC') {
             matchedExt = 'aiff';
             const sz = chunkBuf.readUInt32BE(local + 4) + 8;
-            measured = { size: Math.min(sz, totalLimitBytes - absOffset), truncated: sz > totalLimitBytes - absOffset };
+            measured = { size: Math.min(sz, avail), truncated: sz > avail, sizeEstimated: false };
           }
         } else if (b0 === 0x30 && b1 === 0x26 && b2 === 0xb2 && b3 === 0x75) {
           matchedExt = 'wmv';
-          measured = { size: Math.min(16 * 1024 * 1024, totalLimitBytes - absOffset), truncated: false };
+          measured = { size: Math.min(16 * 1024 * 1024, avail), truncated: true, sizeEstimated: true };
         } else if (b0 === 0x46 && b1 === 0x4c && b2 === 0x56 && b3 === 0x01) {
           matchedExt = 'flv';
-          measured = { size: Math.min(16 * 1024 * 1024, totalLimitBytes - absOffset), truncated: false };
+          measured = { size: Math.min(16 * 1024 * 1024, avail), truncated: true, sizeEstimated: true };
         } else if (b0 === 0x06 && b1 === 0x0e && b2 === 0x2b && b3 === 0x34) {
           matchedExt = 'mxf';
-          measured = { size: Math.min(32 * 1024 * 1024, totalLimitBytes - absOffset), truncated: false };
+          measured = { size: Math.min(32 * 1024 * 1024, avail), truncated: true, sizeEstimated: true };
         } else if (b0 === 0x25 && b1 === 0x50 && b2 === 0x44 && b3 === 0x46 && b4 === 0x2d) {
           matchedExt = 'pdf';
-          measured = measurePdfFromFd(fd, absOffset, totalLimitBytes);
+          measured = measurePdfFromFd(fd, absOffset, totalLimitBytes, sectorSize, ctrl);
         } else if (b0 === 0x50 && b1 === 0x4b && b2 === 0x03 && b3 === 0x04) {
-          matchedExt = detectZipFlavorFromFd(fd, absOffset, totalLimitBytes);
-          measured = measureZipFromFd(fd, absOffset, totalLimitBytes);
+          matchedExt = detectZipFlavorFromFd(fd, absOffset, totalLimitBytes, sectorSize);
+          measured = measureZipFromFd(fd, absOffset, totalLimitBytes, sectorSize, ctrl);
         } else if (b0 === 0xd0 && b1 === 0xcf && b2 === 0x11 && b3 === 0xe0) {
-          matchedExt = detectOle2FlavorFromFd(fd, absOffset, totalLimitBytes);
-          measured = { size: Math.min(4 * 1024 * 1024, totalLimitBytes - absOffset), truncated: false };
+          matchedExt = detectOle2FlavorFromFd(fd, absOffset, totalLimitBytes, sectorSize);
+          measured = { size: Math.min(4 * 1024 * 1024, avail), truncated: true, sizeEstimated: true };
         } else if (b0 === 0x21 && b1 === 0x42 && b2 === 0x44 && b3 === 0x4e && local + 12 <= n) {
           const magic2 = chunkBuf.toString('ascii', local + 8, local + 10);
           if (magic2 === 'SM' || magic2 === 'SO') {
             matchedExt = magic2 === 'SO' ? 'ost' : 'pst';
-            measured = { size: Math.min(64 * 1024 * 1024, totalLimitBytes - absOffset), truncated: false };
+            measured = measurePstFromFd(fd, absOffset, totalLimitBytes, sectorSize);
           }
         } else if (b0 === 0x7b && b1 === 0x5c && b2 === 0x72 && b3 === 0x74 && b4 === 0x66) {
           matchedExt = 'rtf';
-          measured = { size: Math.min(2 * 1024 * 1024, totalLimitBytes - absOffset), truncated: false };
+          measured = { size: Math.min(2 * 1024 * 1024, avail), truncated: true, sizeEstimated: true };
         } else if (b0 === 0x53 && b1 === 0x51 && b2 === 0x4c && b3 === 0x69 && local + 15 <= n && chunkBuf.toString('ascii', local, local + 15) === 'SQLite format 3') {
           matchedExt = 'sqlite';
-          measured = measureSqliteFromFd(fd, absOffset, totalLimitBytes);
+          measured = measureSqliteFromFd(fd, absOffset, totalLimitBytes, sectorSize);
         } else if (b0 === 0x49 && b1 === 0x44 && b2 === 0x33 && local + 10 <= n) {
           const tagSz =
             ((chunkBuf[local + 6] & 0x7f) << 21) |
@@ -605,93 +720,100 @@ async function runWorker() {
             (chunkBuf[local + 9] & 0x7f);
           if (tagSz > 0) {
             matchedExt = 'mp3';
-            measured = { size: Math.min(tagSz + 4 * 1024 * 1024, totalLimitBytes - absOffset), truncated: false };
+            measured = { size: Math.min(tagSz + 4 * 1024 * 1024, avail), truncated: true, sizeEstimated: true };
           }
         } else if (b0 === 0x66 && b1 === 0x4c && b2 === 0x61 && b3 === 0x43) {
           matchedExt = 'flac';
-          measured = { size: Math.min(16 * 1024 * 1024, totalLimitBytes - absOffset), truncated: false };
+          measured = { size: Math.min(16 * 1024 * 1024, avail), truncated: true, sizeEstimated: true };
         } else if (b0 === 0x4f && b1 === 0x67 && b2 === 0x67 && b3 === 0x53) {
           matchedExt = chunkBuf.toString('latin1', local, Math.min(n, local + 64)).includes('OpusHead') ? 'opus' : 'ogg';
-          measured = { size: Math.min(8 * 1024 * 1024, totalLimitBytes - absOffset), truncated: false };
+          measured = { size: Math.min(8 * 1024 * 1024, avail), truncated: true, sizeEstimated: true };
         } else if (b0 === 0x4d && b1 === 0x54 && b2 === 0x68 && b3 === 0x64) {
           matchedExt = 'mid';
-          measured = { size: Math.min(256 * 1024, totalLimitBytes - absOffset), truncated: false };
+          measured = { size: Math.min(256 * 1024, avail), truncated: true, sizeEstimated: true };
         } else if (b0 === 0x52 && b1 === 0x61 && b2 === 0x72 && b3 === 0x21) {
           matchedExt = 'rar';
-          measured = { size: Math.min(16 * 1024 * 1024, totalLimitBytes - absOffset), truncated: false };
+          measured = { size: Math.min(16 * 1024 * 1024, avail), truncated: true, sizeEstimated: true };
         } else if (b0 === 0x37 && b1 === 0x7a && b2 === 0xbc && b3 === 0xaf && b4 === 0x27) {
           matchedExt = '7z';
-          measured = { size: Math.min(16 * 1024 * 1024, totalLimitBytes - absOffset), truncated: false };
+          measured = { size: Math.min(16 * 1024 * 1024, avail), truncated: true, sizeEstimated: true };
         } else if (b0 === 0x1f && b1 === 0x8b && b2 === 0x08) {
           matchedExt = 'gz';
-          measured = { size: Math.min(8 * 1024 * 1024, totalLimitBytes - absOffset), truncated: false };
+          measured = { size: Math.min(8 * 1024 * 1024, avail), truncated: true, sizeEstimated: true };
         } else if (b0 === 0x42 && b1 === 0x5a && b2 === 0x68 && chunkBuf[local + 3] >= 0x31 && chunkBuf[local + 3] <= 0x39) {
           matchedExt = 'bz2';
-          measured = { size: Math.min(8 * 1024 * 1024, totalLimitBytes - absOffset), truncated: false };
+          measured = { size: Math.min(8 * 1024 * 1024, avail), truncated: true, sizeEstimated: true };
         } else if (b0 === 0xfd && b1 === 0x37 && b2 === 0x7a && b3 === 0x58 && b4 === 0x5a && chunkBuf[local + 5] === 0x00) {
           matchedExt = 'xz';
-          measured = { size: Math.min(8 * 1024 * 1024, totalLimitBytes - absOffset), truncated: false };
+          measured = { size: Math.min(8 * 1024 * 1024, avail), truncated: true, sizeEstimated: true };
         } else if (b0 === 0x28 && b1 === 0xb5 && b2 === 0x2f && b3 === 0xfd) {
           matchedExt = 'zst';
-          measured = { size: Math.min(8 * 1024 * 1024, totalLimitBytes - absOffset), truncated: false };
+          measured = { size: Math.min(8 * 1024 * 1024, avail), truncated: true, sizeEstimated: true };
         } else if (b0 === 0x04 && b1 === 0x22 && b2 === 0x4d && b3 === 0x18) {
           matchedExt = 'lz4';
-          measured = { size: Math.min(8 * 1024 * 1024, totalLimitBytes - absOffset), truncated: false };
+          measured = { size: Math.min(8 * 1024 * 1024, avail), truncated: true, sizeEstimated: true };
         } else if (b0 === 0x4d && b1 === 0x53 && b2 === 0x43 && b3 === 0x46 && local + 12 <= n) {
           const cabLen = chunkBuf.readUInt32LE(local + 8);
           if (cabLen > 32 && cabLen < 256 * 1024 * 1024) {
             matchedExt = 'cab';
-            measured = { size: Math.min(cabLen, totalLimitBytes - absOffset), truncated: cabLen > totalLimitBytes - absOffset };
+            measured = { size: Math.min(cabLen, avail), truncated: cabLen > avail, sizeEstimated: false };
           }
         } else if (local + 265 <= n && chunkBuf[local + 257] === 0x75 && chunkBuf.toString('ascii', local + 257, local + 262) === 'ustar') {
           matchedExt = 'tar';
-          measured = measureTarFromFd(fd, absOffset, totalLimitBytes);
+          measured = measureTarFromFd(fd, absOffset, totalLimitBytes, sectorSize);
         } else if (b0 === 0x42 && b1 === 0x4c && b2 === 0x45 && b3 === 0x4e && local + 12 <= n && chunkBuf.toString('ascii', local, local + 7) === 'BLENDER') {
           matchedExt = 'blend';
-          measured = { size: Math.min(32 * 1024 * 1024, totalLimitBytes - absOffset), truncated: false };
+          measured = { size: Math.min(32 * 1024 * 1024, avail), truncated: true, sizeEstimated: true };
         } else if (b0 === 0x67 && b1 === 0x6c && b2 === 0x54 && b3 === 0x46 && local + 12 <= n) {
           const glbLen = chunkBuf.readUInt32LE(local + 8);
           if (glbLen >= 20 && glbLen < 256 * 1024 * 1024) {
             matchedExt = 'glb';
-            measured = { size: Math.min(glbLen, totalLimitBytes - absOffset), truncated: glbLen > totalLimitBytes - absOffset };
+            measured = { size: Math.min(glbLen, avail), truncated: glbLen > avail, sizeEstimated: false };
           }
         } else if (b0 === 0x41 && b1 === 0x43 && b2 === 0x31 && b3 === 0x30 && local + 6 <= n && /^AC10\d\d$/.test(chunkBuf.toString('ascii', local, local + 6))) {
           matchedExt = 'dwg';
-          measured = { size: Math.min(16 * 1024 * 1024, totalLimitBytes - absOffset), truncated: false };
+          measured = { size: Math.min(16 * 1024 * 1024, avail), truncated: true, sizeEstimated: true };
         } else if (b0 === 0x52 && b1 === 0x50 && b2 === 0x41 && b3 === 0x2d && local + 8 <= n) {
           const hdrStr = chunkBuf.toString('ascii', local, local + 7);
           if (hdrStr === 'RPA-3.0' || hdrStr === 'RPA-2.0') {
             matchedExt = 'rpa';
-            measured = { size: Math.min(64 * 1024 * 1024, totalLimitBytes - absOffset), truncated: false };
+            measured = { size: Math.min(64 * 1024 * 1024, avail), truncated: true, sizeEstimated: true };
           }
         } else if (b0 === 0x52 && b1 === 0x45 && b2 === 0x4e && b3 === 0x50 && local + 10 <= n && chunkBuf.toString('ascii', local, local + 10) === 'RENPY RPC2') {
           matchedExt = 'rpyc';
-          measured = { size: Math.min(512 * 1024, totalLimitBytes - absOffset), truncated: false };
+          measured = { size: Math.min(512 * 1024, avail), truncated: true, sizeEstimated: true };
         } else if (b0 === 0x45 && b1 === 0x6c && b2 === 0x66 && b3 === 0x46 && local + 8 <= n && chunkBuf.toString('ascii', local, local + 8) === 'ElfFile\0') {
           matchedExt = 'evtx';
-          measured = { size: Math.min(20 * 1024 * 1024, totalLimitBytes - absOffset), truncated: false };
+          measured = { size: Math.min(20 * 1024 * 1024, avail), truncated: true, sizeEstimated: true };
         } else if (b0 === 0x4c && b1 === 0x00 && b2 === 0x00 && b3 === 0x00 && local + 20 <= n && b4 === 0x01 && chunkBuf[local + 5] === 0x14) {
           matchedExt = 'lnk';
-          measured = { size: Math.min(16384, totalLimitBytes - absOffset), truncated: false };
+          measured = { size: Math.min(16384, avail), truncated: true, sizeEstimated: true };
         } else if (b0 === 0x0a && b1 === 0x0d && b2 === 0x0d && b3 === 0x0a && local + 16 <= n) {
           matchedExt = 'pcapng';
-          measured = { size: Math.min(16 * 1024 * 1024, totalLimitBytes - absOffset), truncated: false };
+          measured = { size: Math.min(16 * 1024 * 1024, avail), truncated: true, sizeEstimated: true };
         } else if ((b0 === 0xd4 && b1 === 0xc3 && b2 === 0xb2 && b3 === 0xa1) || (b0 === 0xa1 && b1 === 0xb2 && b2 === 0xc3 && b3 === 0xd4)) {
           matchedExt = 'pcap';
-          measured = { size: Math.min(16 * 1024 * 1024, totalLimitBytes - absOffset), truncated: false };
+          measured = { size: Math.min(16 * 1024 * 1024, avail), truncated: true, sizeEstimated: true };
         } else if (b0 === 0x03 && b1 === 0xd9 && b2 === 0xa2 && b3 === 0x9a) {
           matchedExt = 'kdbx';
-          measured = { size: Math.min(4 * 1024 * 1024, totalLimitBytes - absOffset), truncated: false };
+          measured = { size: Math.min(4 * 1024 * 1024, avail), truncated: true, sizeEstimated: true };
         } else if (b0 === 0x00 && b1 === 0x61 && b2 === 0x73 && b3 === 0x6d && local + 8 <= n) {
           matchedExt = 'wasm';
-          measured = { size: Math.min(8 * 1024 * 1024, totalLimitBytes - absOffset), truncated: false };
+          measured = { size: Math.min(8 * 1024 * 1024, avail), truncated: true, sizeEstimated: true };
         } else if (b0 === 0x4f && b1 === 0x54 && b2 === 0x54 && b3 === 0x4f) {
           matchedExt = 'otf';
-          measured = { size: Math.min(2 * 1024 * 1024, totalLimitBytes - absOffset), truncated: false };
+          measured = { size: Math.min(2 * 1024 * 1024, avail), truncated: true, sizeEstimated: true };
         } else if (b0 === 0x77 && b1 === 0x4f && b2 === 0x46 && (b3 === 0x46 || b3 === 0x32)) {
           matchedExt = b3 === 0x32 ? 'woff2' : 'woff';
-          const wLen = local + 12 <= n ? chunkBuf.readUInt32BE(local + 8) : 512 * 1024;
-          measured = { size: Math.min(Math.max(1024, wLen), totalLimitBytes - absOffset), truncated: false };
+          if (local + 12 <= n) {
+            const wLen = chunkBuf.readUInt32BE(local + 8);
+            if (wLen >= 44 && wLen <= 64 * 1024 * 1024) {
+              measured = { size: Math.min(wLen, avail), truncated: wLen > avail, sizeEstimated: false };
+            }
+          }
+          if (!measured) {
+            measured = { size: Math.min(512 * 1024, avail), truncated: true, sizeEstimated: true };
+          }
         }
 
         if (matchedExt && measured && measured.size >= 32) {
@@ -699,44 +821,53 @@ async function runWorker() {
           const filename = `${matchedExt.toUpperCase()}_W${workerIndex}_${pad}.${matchedExt}`;
           const headerLen = Math.min(65536, measured.size);
           const hdrSample = Buffer.allocUnsafe(headerLen);
-          const hRead = fs.readSync(fd, hdrSample, 0, headerLen, absOffset);
+          const hRead = safeReadAligned(fd, hdrSample, 0, headerLen, absOffset, sectorSize);
           const discoveryCrc32 = computeCrc32Buf(hdrSample, hRead);
+          const isEstimated = Boolean(measured.sizeEstimated);
+          const isTruncated = Boolean(measured.truncated || isEstimated);
 
-          batch.push({
+          const entry = {
             id: `drv-${absOffset}-${matchedExt}`,
             filename,
-            originalPath: `${devicePath} @ sector ${Math.floor(absOffset / 512)}`,
+            originalPath: `${devicePath} @ sector ${Math.floor(absOffset / sectorSize)}`,
             extensionHint: matchedExt,
             size: measured.size,
             calculatedSize: measured.size,
-            truncated: measured.truncated,
-            modifiedAt: Date.now(),
+            truncated: isTruncated,
+            sizeEstimated: isEstimated,
+            modifiedAt: undefined,
             sourceKind: 'carved',
-            isDeleted: true,
+            isDeleted: unallocatedOnly && allocCheck.verified ? true : undefined,
             scanPhase: 'deep',
             offset: absOffset,
-            sector: Math.floor(absOffset / 512),
+            sector: Math.floor(absOffset / sectorSize),
             devicePath,
             discoveryCrc32,
             headerSample: new Uint8Array(hdrSample.buffer, hdrSample.byteOffset, hRead),
-          });
+          };
+          batch.push(entry);
+          collectedEntries.push(entry);
           fileSeq++;
-          const alignedSkip = Math.max(step, Math.ceil(measured.size / step) * step);
+          // Never skip ahead by an unverified guessed size; otherwise real adjacent/embedded files are missed.
+          const alignedSkip = isEstimated
+            ? scanStep
+            : Math.max(scanStep, Math.ceil(measured.size / scanStep) * scanStep);
           local += alignedSkip;
           continue;
         }
 
-        local += step;
+        local += scanStep;
       }
 
       if (batch.length > 0) {
-        parentPort.postMessage({ type: 'batch', entries: batch });
+        emit({ type: 'batch', entries: batch });
       }
-      cursor += n;
-      parentPort.postMessage({
+      const delta = Math.min(n, Math.max(0, rangeEnd - cursor));
+      cursor += delta;
+      emit({
         type: 'progress',
         workerIndex,
-        deltaBytes: n,
+        deltaBytes: delta,
         currentOffset: cursor,
         latestName: batch.length > 0 ? batch[batch.length - 1].filename : undefined,
       });
@@ -744,12 +875,50 @@ async function runWorker() {
       await new Promise((r) => setTimeout(r, 0));
     }
 
-    parentPort.postMessage({ type: 'done', workerIndex });
+    emit({
+      type: 'done',
+      workerIndex,
+      skippedSectors: totalSkippedSectors,
+      skippedBytes: totalSkippedBytes,
+      unverifiedCoverage,
+    });
+    return {
+      entries: collectedEntries,
+      skippedSectors: totalSkippedSectors,
+      skippedBytes: totalSkippedBytes,
+      skippedRanges: allSkippedRanges,
+      unverifiedCoverage,
+    };
   } finally {
     fs.closeSync(fd);
   }
 }
 
-runWorker().catch((err) => {
-  parentPort.postMessage({ type: 'error', message: err?.message || 'worker error' });
-});
+if (!isMainThread && parentPort && workerData) {
+  scanRange({
+    ...workerData,
+    emit: (msg) => parentPort.postMessage(msg),
+  }).catch((err) => {
+    parentPort.postMessage({
+      type: 'error',
+      workerIndex: workerData?.workerIndex ?? 0,
+      message: err?.message || 'worker error',
+    });
+  });
+}
+
+module.exports = {
+  scanRange,
+  checkOffsetAllocation,
+  measureMp4FromFd,
+  measureJpgFromFd,
+  measurePngFromFd,
+  measurePdfFromFd,
+  measureZipFromFd,
+  measureGifFromFd,
+  measureSqliteFromFd,
+  measurePsdFromFd,
+  measureTarFromFd,
+  measurePstFromFd,
+  detectTiffRawFlavor,
+};

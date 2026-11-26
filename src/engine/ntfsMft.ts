@@ -24,7 +24,7 @@ export interface MftDeletedRecord {
   inUse: boolean;
   isDeleted: boolean;
   fileSize: number;
-  modifiedAtMs: number;
+  modifiedAtMs?: number;
   residentData: Uint8Array | null;
   runs: NtfsClusterRun[];
   extents: NtfsByteExtent[];
@@ -40,14 +40,14 @@ export interface MftDeletedRecord {
 
 const WINDOWS_EPOCH_DIFF_MS = 11644473600000;
 
-function filetimeToUnixMs(dv: DataView, pos: number): number {
-  if (pos + 8 > dv.byteLength) return Date.now();
+function filetimeToUnixMs(dv: DataView, pos: number): number | undefined {
+  if (pos + 8 > dv.byteLength) return undefined;
   const lo = dv.getUint32(pos, true);
   const hi = dv.getUint32(pos + 4, true);
   const ticks = hi * 4294967296 + lo;
-  if (ticks <= 0) return Date.now();
+  if (ticks <= 0) return undefined;
   const ms = Math.floor(ticks / 10000 - WINDOWS_EPOCH_DIFF_MS);
-  return ms > 0 ? ms : Date.now();
+  return ms > 0 ? ms : undefined;
 }
 
 function decodeUtf16Le(buf: Uint8Array, pos: number, charCount: number): string {
@@ -130,7 +130,7 @@ export function parseSingleMftRecord(
   parentRecord: number;
   filename: string;
   fileSize: number;
-  modifiedAtMs: number;
+  modifiedAtMs?: number;
   residentData: Uint8Array | null;
   runs: NtfsClusterRun[];
 } | null {
@@ -185,7 +185,7 @@ export function parseSingleMftRecord(
   let filename = '';
   let nameScore = -1;
   let parentRecord = 5;
-  let modifiedAtMs = Date.now();
+  let modifiedAtMs: number | undefined;
   let fileSize = 0;
   let residentData: Uint8Array | null = null;
   let runs: NtfsClusterRun[] = [];
@@ -203,7 +203,8 @@ export function parseSingleMftRecord(
       const valOffset = dv.getUint16(pos + 20, true);
       const valLen = dv.getUint32(pos + 16, true);
       if (pos + valOffset + 32 <= pos + attrLen && valLen >= 32) {
-        modifiedAtMs = filetimeToUnixMs(dv, pos + valOffset + 8);
+        const siMod = filetimeToUnixMs(dv, pos + valOffset + 8);
+        if (siMod !== undefined) modifiedAtMs = siMod;
       }
     } else if (attrType === 0x30 && form === 0 && pos + 24 <= usedBytes) {
       const valOffset = dv.getUint16(pos + 20, true);
@@ -219,7 +220,7 @@ export function parseSingleMftRecord(
           filename = candidate;
           parentRecord = dv.getUint32(fnBase, true);
           const fnModified = filetimeToUnixMs(dv, fnBase + 16);
-          if (fnModified > 0) modifiedAtMs = fnModified;
+          if (fnModified !== undefined) modifiedAtMs = fnModified;
           const fnSizeLo = dv.getUint32(fnBase + 48, true);
           const fnSizeHi = dv.getUint32(fnBase + 52, true);
           const fnSize = fnSizeHi * 4294967296 + fnSizeLo;
@@ -530,7 +531,7 @@ export function scanNtfsMftRecordsInBuffer(
             : `\\$Recycle.Bin\\${meta.originalName}`;
         rec.filename = meta.originalName;
         rec.originalWindowsPath = meta.originalPath;
-        if (meta.deletedAtMs > 0) rec.modifiedAtMs = meta.deletedAtMs;
+        if (meta.deletedAtMs && meta.deletedAtMs > 0) rec.modifiedAtMs = meta.deletedAtMs;
       }
     }
     results.push(rec);

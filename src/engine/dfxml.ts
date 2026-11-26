@@ -22,12 +22,12 @@ export function buildDfxmlReport(params: {
 
   const lines: string[] = [
     '<?xml version="1.0" encoding="UTF-8"?>',
-    '<dfxml version="1.2">',
-    '  <metadata xmlns="http://www.forensicswiki.org/wiki/Category:Digital_Forensics_XML">',
+    '<dfxml version="1.2" xmlns="http://www.forensicswiki.org/wiki/Category:Digital_Forensics_XML" xmlns:dc="http://purl.org/dc/elements/1.1/">',
+    '  <metadata>',
     '    <dc:type>Recovery &amp; Carving Report</dc:type>',
     '  </metadata>',
     '  <creator>',
-    '    <program>TestDisk &amp; PhotoRec Recovery Suite</program>',
+    '    <program>Disk &amp; Partition Recovery Explorer</program>',
     `    <execution_environment><start_time>${nowIso}</start_time></execution_environment>`,
     '  </creator>',
     '  <source>',
@@ -42,7 +42,9 @@ export function buildDfxmlReport(params: {
     lines.push(`      <filename>${escapeXml(item.originalPath || item.filename)}</filename>`);
     lines.push(`      <partition>${escapeXml(item.partitionName)}</partition>`);
     lines.push(`      <filesize>${item.size}</filesize>`);
-    lines.push(`      <mtime>${new Date(item.modifiedAt).toISOString()}</mtime>`);
+    if (typeof item.modifiedAt === 'number' && Number.isFinite(item.modifiedAt) && item.modifiedAt > 0) {
+      lines.push(`      <mtime>${new Date(item.modifiedAt).toISOString()}</mtime>`);
+    }
     lines.push(`      <meta_type>${escapeXml(item.sourceKind)}</meta_type>`);
     lines.push(`      <libmagic>${escapeXml(item.description)}</libmagic>`);
     if (item.metadata.camera) {

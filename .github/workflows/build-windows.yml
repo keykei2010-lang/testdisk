@@ -22,54 +22,54 @@ jobs:
         with:
           node-version: 22
 
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+
       - name: Install project dependencies
-        run: npm install
+        run: bun install --frozen-lockfile
 
-      - name: Install Electron & electron-builder
-        run: npm install --no-save electron electron-builder
+      - name: Run Type-check, ESLint & Unit Tests
+        run: |
+          npm run lint
+          npx tsx --test tests/recoveryEngine.test.ts
 
-      - name: Download & Bundle Recovery Engines (Sleuth Kit, TestDisk/PhotoRec, FFmpeg)
+      - name: Install Electron & electron-builder (Pinned)
+        run: npm install --no-save electron@45.5.0 electron-builder@26.18.0
+
+      - name: Download, Verify SHA-256 & Bundle Recovery Engines (Sleuth Kit, FFmpeg)
         shell: pwsh
         run: |
-          $ErrorActionPreference = 'Continue'
+          $ErrorActionPreference = 'Stop'
           $ProgressPreference = 'SilentlyContinue'
-          New-Item -ItemType Directory -Force -Path "electron/bin/sleuthkit", "electron/bin/testdisk", "electron/bin/ffmpeg", "$env:TEMP/td_engines" | Out-Null
+          New-Item -ItemType Directory -Force -Path "electron/bin/sleuthkit", "electron/bin/ffmpeg", "$env:TEMP/td_engines" | Out-Null
 
-          try {
-            Write-Host "Downloading The Sleuth Kit 4.15.0..."
-            $tskZip = "$env:TEMP/td_engines/tsk.zip"
-            Invoke-WebRequest -Uri "https://github.com/sleuthkit/sleuthkit/releases/download/sleuthkit-4.15.0/sleuthkit-4.15.0-win32.zip" -OutFile $tskZip -UseBasicParsing
-            Expand-Archive -Path $tskZip -DestinationPath "$env:TEMP/td_engines/tsk" -Force
-            Get-ChildItem -Path "$env:TEMP/td_engines/tsk" -Recurse -File | Where-Object {
-              $_.Name -in @("fls.exe", "icat.exe", "istat.exe", "mmls.exe") -or $_.Extension -eq ".dll"
-            } | ForEach-Object { Copy-Item $_.FullName -Destination "electron/bin/sleuthkit/" -Force }
-          } catch {
-            Write-Warning "Sleuth Kit download skipped: $_"
+          $tskUrl = "https://github.com/sleuthkit/sleuthkit/releases/download/sleuthkit-4.15.0/sleuthkit-4.15.0-win32.zip"
+          $tskExpectedSha256 = "c2ebab8105b893d97bd8ce35b88e01985e2a106efc97f03adf95840a631b20ce"
+          Write-Host "Downloading The Sleuth Kit 4.15.0..."
+          $tskZip = "$env:TEMP/td_engines/tsk.zip"
+          Invoke-WebRequest -Uri $tskUrl -OutFile $tskZip -UseBasicParsing
+          $tskActualSha256 = (Get-FileHash -Path $tskZip -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($tskActualSha256 -ne $tskExpectedSha256) {
+            throw "Sleuth Kit SHA-256 mismatch! Expected $tskExpectedSha256, got $tskActualSha256"
           }
+          Expand-Archive -Path $tskZip -DestinationPath "$env:TEMP/td_engines/tsk" -Force
+          Get-ChildItem -Path "$env:TEMP/td_engines/tsk" -Recurse -File | Where-Object {
+            $_.Name -in @("fls.exe", "icat.exe", "istat.exe", "mmls.exe") -or $_.Extension -eq ".dll"
+          } | ForEach-Object { Copy-Item $_.FullName -Destination "electron/bin/sleuthkit/" -Force }
 
-          try {
-            Write-Host "Downloading CGSecurity TestDisk / PhotoRec 7.2 Win64..."
-            $tdZip = "$env:TEMP/td_engines/testdisk.zip"
-            Invoke-WebRequest -Uri "https://www.cgsecurity.org/testdisk-7.2.win64.zip" -OutFile $tdZip -UseBasicParsing
-            Expand-Archive -Path $tdZip -DestinationPath "$env:TEMP/td_engines/td" -Force
-            Get-ChildItem -Path "$env:TEMP/td_engines/td" -Recurse -File | Where-Object {
-              $_.Name -in @("photorec_win.exe", "testdisk_win.exe", "fidentify_win.exe") -or $_.Extension -eq ".dll"
-            } | ForEach-Object { Copy-Item $_.FullName -Destination "electron/bin/testdisk/" -Force }
-          } catch {
-            Write-Warning "TestDisk/PhotoRec download skipped: $_"
+          $ffUrl = "https://github.com/GyanD/codexffmpeg/releases/download/9.1/ffmpeg-9.1-essentials_build.zip"
+          $ffExpectedSha256 = "b9bbbb3acece000cbeec994f856649354e52c773807841e78908374b24d658fd"
+          Write-Host "Downloading FFmpeg 9.1 Essentials Win64..."
+          $ffZip = "$env:TEMP/td_engines/ffmpeg.zip"
+          Invoke-WebRequest -Uri $ffUrl -OutFile $ffZip -UseBasicParsing
+          $ffActualSha256 = (Get-FileHash -Path $ffZip -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($ffActualSha256 -ne $ffExpectedSha256) {
+            throw "FFmpeg SHA-256 mismatch! Expected $ffExpectedSha256, got $ffActualSha256"
           }
-
-          try {
-            Write-Host "Downloading FFmpeg / FFprobe Win64..."
-            $ffZip = "$env:TEMP/td_engines/ffmpeg.zip"
-            Invoke-WebRequest -Uri "https://github.com/FFmpeg-Builds/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl.zip" -OutFile $ffZip -UseBasicParsing
-            Expand-Archive -Path $ffZip -DestinationPath "$env:TEMP/td_engines/ff" -Force
-            Get-ChildItem -Path "$env:TEMP/td_engines/ff" -Recurse -File | Where-Object {
-              $_.Name -in @("ffmpeg.exe", "ffprobe.exe")
-            } | ForEach-Object { Copy-Item $_.FullName -Destination "electron/bin/ffmpeg/" -Force }
-          } catch {
-            Write-Warning "FFmpeg download skipped: $_"
-          }
+          Expand-Archive -Path $ffZip -DestinationPath "$env:TEMP/td_engines/ff" -Force
+          Get-ChildItem -Path "$env:TEMP/td_engines/ff" -Recurse -File | Where-Object {
+            $_.Name -in @("ffmpeg.exe", "ffprobe.exe")
+          } | ForEach-Object { Copy-Item $_.FullName -Destination "electron/bin/ffmpeg/" -Force }
 
           Get-ChildItem -Path "electron/bin" -Recurse -File | Select-Object FullName, Length
 
@@ -81,15 +81,15 @@ jobs:
         run: |
           $zip = Get-ChildItem -Path release -Filter "*.zip" | Select-Object -First 1
           if ($zip) {
-            Copy-Item $zip.FullName -Destination "TestDisk-PhotoRec-Windows-Portable.zip"
+            Copy-Item $zip.FullName -Destination "Disk-Partition-Recovery-Explorer-Windows-Portable.zip"
           }
 
       - name: Upload Windows Portable ZIP
         uses: actions/upload-artifact@v4
         with:
-          name: TestDisk-PhotoRec-Windows-Portable
+          name: Disk-Partition-Recovery-Explorer-Windows-Portable
           path: |
-            TestDisk-PhotoRec-Windows-Portable.zip
+            Disk-Partition-Recovery-Explorer-Windows-Portable.zip
             release/*.exe
           if-no-files-found: error
 
@@ -114,7 +114,7 @@ jobs:
           prerelease: true
           make_latest: false
           files: |
-            TestDisk-PhotoRec-Windows-Portable.zip
+            Disk-Partition-Recovery-Explorer-Windows-Portable.zip
             release/*.exe
 
       - name: Publish GitHub Release on tag
@@ -122,5 +122,5 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            TestDisk-PhotoRec-Windows-Portable.zip
+            Disk-Partition-Recovery-Explorer-Windows-Portable.zip
             release/*.exe

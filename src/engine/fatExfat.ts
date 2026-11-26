@@ -6,7 +6,7 @@ export interface FsDeletedRecord {
   filename: string;
   reconstructedPath: string;
   fileSize: number;
-  modifiedAtMs: number;
+  modifiedAtMs?: number;
   extents: { offset: number; length: number }[];
   partitionId: string;
   partitionName: string;
@@ -16,8 +16,8 @@ export interface FsDeletedRecord {
   reconstructedBytes: Uint8Array;
 }
 
-function dosDateTimeToMs(dateVal: number, timeVal: number): number {
-  if (dateVal === 0) return Date.now();
+function dosDateTimeToMs(dateVal: number, timeVal: number): number | undefined {
+  if (dateVal === 0) return undefined;
   const year = 1980 + ((dateVal >> 9) & 0x7f);
   const month = Math.max(1, (dateVal >> 5) & 0x0f);
   const day = Math.max(1, dateVal & 0x1f);
@@ -25,7 +25,7 @@ function dosDateTimeToMs(dateVal: number, timeVal: number): number {
   const min = (timeVal >> 5) & 0x3f;
   const sec = (timeVal & 0x1f) * 2;
   const ms = Date.UTC(year, month - 1, day, hour, min, sec);
-  return Number.isFinite(ms) ? ms : Date.now();
+  return Number.isFinite(ms) && ms > 0 ? ms : undefined;
 }
 
 function extractLfnChars(entry: Uint8Array): string {

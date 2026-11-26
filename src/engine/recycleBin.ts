@@ -1,17 +1,18 @@
 export interface RecycleBinMeta {
   version: number;
   originalSize: number;
-  deletedAtMs: number;
+  deletedAtMs?: number;
   originalPath: string;
   originalName: string;
 }
 
 const WINDOWS_EPOCH_DIFF_MS = 11644473600000;
 
-function filetimeToUnixMs(lo: number, hi: number): number {
+function filetimeToUnixMs(lo: number, hi: number): number | undefined {
   const ticks = hi * 4294967296 + lo;
-  if (ticks <= 0) return Date.now();
-  return Math.floor(ticks / 10000 - WINDOWS_EPOCH_DIFF_MS);
+  if (ticks <= 0) return undefined;
+  const ms = Math.floor(ticks / 10000 - WINDOWS_EPOCH_DIFF_MS);
+  return ms > 0 ? ms : undefined;
 }
 
 function readUtf16LeNullTerm(bytes: Uint8Array, start: number, maxBytes: number): string {

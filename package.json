@@ -1,6 +1,6 @@
 {
   "name": "testdisk-photorec-web",
-  "version": "7.2.0",
+  "version": "1.0.0",
   "private": true,
   "type": "module",
   "main": "electron/main.cjs",
@@ -13,8 +13,8 @@
     "dist:win": "vite build --mode electron && electron-builder --win --x64"
   },
   "build": {
-    "appId": "org.cgsecurity.testdisk.explorer",
-    "productName": "TestDisk-PhotoRec",
+    "appId": "com.datarecovery.explorer",
+    "productName": "Disk-Partition-Recovery-Explorer",
     "files": [
       "dist/**/*",
       "electron/**/*",
@@ -27,6 +27,7 @@
       }
     ],
     "win": {
+      "requestedExecutionLevel": "requireAdministrator",
       "target": [
         {
           "target": "zip",

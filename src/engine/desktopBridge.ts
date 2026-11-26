@@ -26,7 +26,7 @@ export interface NativeScannedEntry {
   originalPath: string;
   extensionHint: string;
   size: number;
-  modifiedAt: number;
+  modifiedAt?: number;
   sourceKind: 'recycle-bin' | 'folder' | 'carved' | 'ntfs-mft';
   isDeleted?: boolean;
   scanPhase?: 'quick' | 'deep' | 'vss' | 'usn';
@@ -36,6 +36,9 @@ export interface NativeScannedEntry {
   headerSample: Uint8Array;
   calculatedSize?: number | null;
   truncated?: boolean;
+  sizeEstimated?: boolean;
+  ntfsCompressed?: boolean;
+  ntfsEncrypted?: boolean;
   runs?: { offset: number; length: number }[];
   tskInode?: string;
   tskOffset?: number;
@@ -56,6 +59,10 @@ export interface NativeScanProgressEvent {
   foundCount: number;
   foundBytes: number;
   latestName?: string;
+  incomplete?: boolean;
+  skippedSectors?: number;
+  skippedBytes?: number;
+  warnings?: string[];
 }
 
 export interface NativeScanBatchEvent {
@@ -63,10 +70,25 @@ export interface NativeScanBatchEvent {
   entries: NativeScannedEntry[];
 }
 
+export interface DriveScanResult {
+  entries: NativeScannedEntry[];
+  warnings: string[];
+  incomplete: boolean;
+  skippedSectors: number;
+  skippedBytes: number;
+}
+
+export interface LostPartitionScanResponse {
+  partitions: import('./partitions').PartitionEntry[];
+  sectorSize: number;
+  limitBytes: number;
+  warnings: string[];
+}
+
 export interface LocationScanResponse {
   entries: NativeScannedEntry[];
   path?: string;
-  deletedLookupStatus?: 'scanned' | 'partial' | 'needs-admin' | 'unsupported';
+  deletedLookupStatus?: 'scanned' | 'partial' | 'needs-admin' | 'io-error' | 'unsupported';
   backingDrive?:
     | string
     | {
@@ -184,6 +206,10 @@ export interface DesktopBridge {
   scanFolder: (folderPath: string) => Promise<LocationScanResponse>;
   scanRecycleBin: () => Promise<LocationScanResponse>;
   scanDesktop: () => Promise<LocationScanResponse>;
+  scanLostPartitions: (params: {
+    devicePath: string;
+    totalBytes?: number;
+  }) => Promise<LostPartitionScanResponse>;
   startDriveScan: (params: {
     scanId: string;
     devicePath: string;
@@ -195,7 +221,7 @@ export interface DesktopBridge {
     includeExisting?: boolean;
     pathFilter?: string;
     resumeOffset?: number;
-  }) => Promise<NativeScannedEntry[]>;
+  }) => Promise<DriveScanResult>;
   pauseDriveScan: (scanId: string) => Promise<void>;
   resumeDriveScan: (scanId: string) => Promise<void>;
   cancelDriveScan: (scanId: string) => Promise<void>;
@@ -205,14 +231,18 @@ export interface DesktopBridge {
     destinationDir: string | null;
     items: NativeRecoverRequestItem[];
     scannedDevicePath?: string;
+    keepOriginalOnRepair?: boolean;
+    allowUnverifiedDestination?: boolean;
   }) => Promise<{
     canceled?: boolean;
     savedCount: number;
     verifiedCount?: number;
+    originalKeptCount?: number;
     destinationDir: string;
     repairedCount: number;
     reportPath?: string;
     failures?: NativeRecoverFailure[];
+    unverifiedDestination?: boolean;
     error?: string;
   }>;
   saveTextReport: (params: {
@@ -220,7 +250,14 @@ export interface DesktopBridge {
     title: string;
     filters: { name: string; extensions: string[] }[];
     content: string;
-  }) => Promise<{ canceled: boolean; filePath?: string }>;
+    scannedDevicePath?: string;
+    allowUnverifiedDestination?: boolean;
+  }) => Promise<{
+    canceled: boolean;
+    filePath?: string;
+    unverifiedDestination?: boolean;
+    error?: string;
+  }>;
 }
 
 export function getDesktopBridge(): DesktopBridge | null {

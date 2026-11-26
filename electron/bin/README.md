@@ -9,6 +9,5 @@ The desktop recovery app runs 100% natively without external executables using b
 To also enable optional external engines during packaging (`npm run dist:win`):
 - `electron/bin/ffmpeg/` -> `ffmpeg.exe`, `ffprobe.exe` (Tier 1/2/3 remux & salvage decode, H.265/MKV/WEBM frame probing)
 - `electron/bin/sleuthkit/` -> `fls.exe`, `icat.exe`, `mmls.exe`, `istat.exe` + runtime DLLs (Linux ext2/3/4 & HFS+ volume browsing)
-- `electron/bin/testdisk/` -> `photorec_win.exe`, `testdisk_win.exe`, `fidentify_win.exe` + Cygwin DLLs
 
-Run `npm run setup:engines` on Windows to download and stage the official binaries into `electron/bin/`, or install FFmpeg / TestDisk / Sleuth Kit anywhere on `PATH` (WinGet, Scoop, Chocolatey, or `C:\ffmpeg\bin`).
+Run `npm run setup:engines` on Windows to download and stage FFmpeg and Sleuth Kit binaries into `electron/bin/`, or install FFmpeg / Sleuth Kit anywhere on `PATH` (WinGet, Scoop, Chocolatey, or `C:\ffmpeg\bin`).

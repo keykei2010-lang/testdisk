@@ -78,6 +78,9 @@ export function computeRecoveryLikelihood(params: {
   mftResident?: boolean;
   mftOverwritten?: boolean;
   mftBitmapIntact?: boolean;
+  sizeEstimated?: boolean;
+  ntfsCompressed?: boolean;
+  ntfsEncrypted?: boolean;
 }): RecoveryLikelihoodAssessment {
   const {
     status,
@@ -91,6 +94,9 @@ export function computeRecoveryLikelihood(params: {
     mftResident,
     mftOverwritten,
     mftBitmapIntact,
+    sizeEstimated,
+    ntfsCompressed,
+    ntfsEncrypted,
   } = params;
   const hasRichMeta = Boolean(metadata.width || metadata.subExtension || metadata.details);
   const inUnallocated = partitionId === 'unallocated';
@@ -102,15 +108,25 @@ export function computeRecoveryLikelihood(params: {
   if (mftOverwritten) {
     chance = 24;
     reason = 'Filesystem record recovered, but disk clusters were reallocated/overwritten';
+  } else if (ntfsEncrypted) {
+    chance = 35;
+    reason = 'NTFS EFS-encrypted $DATA (raw ciphertext cannot be read without user key)';
+  } else if (ntfsCompressed) {
+    chance = 55;
+    reason = 'NTFS LZNT1/WOF-compressed $DATA requires OS decompression on restore';
   } else if (mftResident) {
     chance = 98;
     reason = 'Resident NTFS MFT payload (stored intact inside MFT record)';
-  } else if (mftBitmapIntact && status === 'OK') {
+  } else if (mftBitmapIntact && status === 'OK' && !sizeEstimated) {
     chance = 98;
     reason = 'Deleted filesystem entry verified intact via cluster bitmap (0 clusters overwritten)';
   } else if (repaired) {
     chance = 86;
     reason = 'Structural footer/header patched for recovery';
+  } else if (sizeEstimated) {
+    chance = hasRichMeta ? 72 : 66;
+    if (inUnallocated) chance -= 5;
+    reason = 'Header matched; size is estimated (payload boundary unframed)';
   } else if (status === 'OK' && !isTruncatedBySize) {
     chance = 93;
     if (calculatedSize !== null && calculatedSize === size) {
@@ -144,20 +160,20 @@ export function computeRecoveryLikelihood(params: {
   }
 
   // Real binary integrity checks on payload bytes (PNG CRC32 + JPEG structural markers + zero-wipe density)
-  if (!mftOverwritten && !mftResident && metadata.jpegValid && (extension === 'jpg' || extension === 'jpeg')) {
+  if (!mftOverwritten && !mftResident && !ntfsEncrypted && metadata.jpegValid && (extension === 'jpg' || extension === 'jpeg')) {
     const { hasDqt, hasSof, hasDht } = metadata.jpegValid;
     if (!hasDqt || !hasSof) {
       chance -= 18;
       reason = 'JPEG header missing DQT/SOF frame tables (partial image risk)';
-    } else if (hasDht && status === 'OK') {
+    } else if (hasDht && status === 'OK' && !sizeEstimated) {
       chance = Math.min(100, chance + 1);
     }
   }
 
-  if (data) {
+  if (data && !ntfsEncrypted) {
     if (extension === 'png') {
       const crcOk = verifyPngIhdrCrc(data);
-      if (crcOk === true && status === 'OK') {
+      if (crcOk === true && status === 'OK' && !sizeEstimated) {
         chance = Math.min(100, chance + 1);
       } else if (crcOk === false) {
         chance -= 28;
@@ -173,6 +189,9 @@ export function computeRecoveryLikelihood(params: {
   }
 
   chance = Math.min(100, Math.max(10, Math.round(chance)));
+  if (ntfsEncrypted) chance = Math.min(35, chance);
+  else if (ntfsCompressed) chance = Math.min(55, chance);
+  else if (sizeEstimated) chance = Math.min(74, chance);
 
   const tier: RecoveryLikelihoodTier =
     chance >= 85 ? 'high' : chance >= 50 ? 'medium' : 'low';
@@ -182,23 +201,12 @@ export function computeRecoveryLikelihood(params: {
   return { chance, tier, label, reason };
 }
 
-/**
- * Deterministic timestamp derived from sector offset when carving raw sectors
- * without directory-entry timestamps.
- */
-export function deriveCarvedTimestamp(sector: number, partitionId: string): number {
-  const baseMs = Date.UTC(2026, 10, 18, 18, 30, 0);
-  const partShiftHours = partitionId.startsWith('lost-')
-    ? 96
-    : partitionId === 'unallocated'
-      ? 168
-      : 12;
-  const sectorSpreadMins = (sector % 720) * 3;
-  return baseMs - (partShiftHours * 60 + sectorSpreadMins) * 60 * 1000;
-}
-
-export function formatShortDate(ms: number): string {
+export function formatShortDate(ms?: number): string {
+  if (typeof ms !== 'number' || !Number.isFinite(ms) || ms <= 0) {
+    return 'Unknown';
+  }
   const d = new Date(ms);
+  if (Number.isNaN(d.getTime())) return 'Unknown';
   const yyyy = d.getFullYear();
   const mm = String(d.getMonth() + 1).padStart(2, '0');
   const dd = String(d.getDate()).padStart(2, '0');

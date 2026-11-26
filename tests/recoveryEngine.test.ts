@@ -16,6 +16,7 @@ import {
   diagnoseMediaFile,
   extractEmbeddedJpegPreview,
   formatCompactCount,
+  formatShortDate,
   repairAviBuffer,
   repairFileBuffer,
   repairJpegBuffer,
@@ -23,6 +24,7 @@ import {
   resolvePreferredExtension,
   runRecoverySelfTest,
 } from '../src/engine/recoveryHealth';
+import { buildDfxmlReport } from '../src/engine/dfxml';
 import { buildFolderTreeForPartition } from '../src/engine/folderTree';
 import { ExplorerFileItem, itemMatchesNode } from '../src/engine/explorerTypes';
 import { parseUsnJournalBuffer, USN_REASON_FILE_DELETE } from '../src/engine/ntfsJournal';
@@ -1417,6 +1419,415 @@ test('audit fixes: multi-byte UTF-8 text not corrupted, RTF brace repair, OST vs
     if (fs.existsSync(imgPath)) fs.unlinkSync(imgPath);
   }
 });
+
+test('alignedIoCjs: sector-aligned reads and resilient bad-sector retry skip unreadable sectors safely', () => {
+  const req = createRequire(import.meta.url);
+  const {
+    normalizeSectorSize,
+    readAlignedSync,
+    readAlignedResilientSync,
+  } = req('../electron/alignedIoCjs.cjs');
+
+  assert.equal(normalizeSectorSize(512), 512);
+  assert.equal(normalizeSectorSize(4096), 4096);
+  assert.equal(normalizeSectorSize(128), 512);
+
+  const tmpFile = path.join(os.tmpdir(), `aligned_io_${Date.now()}.bin`);
+  const payload = Buffer.alloc(16384);
+  for (let i = 0; i < payload.length; i++) payload[i] = i & 0xff;
+  fs.writeFileSync(tmpFile, payload);
+
+  const fd = fs.openSync(tmpFile, 'r');
+  try {
+    // Read unaligned slice across 4096-byte sector boundaries
+    const out = Buffer.alloc(3000);
+    const readN = readAlignedSync(fd, out, 0, 3000, 123, 4096);
+    assert.equal(readN, 3000);
+    assert.deepEqual(out, payload.subarray(123, 3123));
+
+    // Simulate bulk EIO followed by single bad sector at offset 512
+    const origReadSync = fs.readSync;
+    (fs as unknown as { readSync: typeof fs.readSync }).readSync = ((
+      _fd: number,
+      buf: NodeJS.ArrayBufferView,
+      offset: number,
+      length: number,
+      position: number | null,
+    ) => {
+      const pos = Number(position ?? 0);
+      if (length > 512 && pos <= 512 && pos + length > 512) {
+        const err = Object.assign(new Error('EIO simulated bulk failure'), { code: 'EIO' });
+        throw err;
+      }
+      if (pos === 512 && length === 512) {
+        const err = Object.assign(new Error('EIO simulated bad sector 1'), { code: 'EIO' });
+        throw err;
+      }
+      return origReadSync(_fd, buf, offset, length, position);
+    }) as typeof fs.readSync;
+
+    try {
+      const resBuf = Buffer.alloc(2048, 0xaa);
+      const res = readAlignedResilientSync(fd, resBuf, 0, 2048, 0, 512);
+      assert.equal(res.bytesRead, 2048);
+      assert.equal(res.skippedSectors, 1);
+      assert.equal(res.skippedBytes, 512);
+      assert.deepEqual(res.skippedRanges, [{ offset: 512, length: 512 }]);
+      assert.deepEqual(resBuf.subarray(0, 512), payload.subarray(0, 512));
+      assert.ok(resBuf.subarray(512, 1024).every((b) => b === 0), 'Expected bad sector zero-filled');
+      assert.deepEqual(resBuf.subarray(1024, 2048), payload.subarray(1024, 2048));
+    } finally {
+      (fs as unknown as { readSync: typeof fs.readSync }).readSync = origReadSync;
+    }
+  } finally {
+    fs.closeSync(fd);
+    if (fs.existsSync(tmpFile)) fs.unlinkSync(tmpFile);
+  }
+});
+
+test('scannerWorker & signatures: sizeEstimated cursors advance by step so adjacent files are never skipped', async () => {
+  const req = createRequire(import.meta.url);
+  const { scanRange, checkOffsetAllocation } = req('../electron/scannerWorker.cjs');
+
+  // Verify checkOffsetAllocation against bitmap
+  const bitmap = Buffer.from([0b00000101]); // clusters 0 & 2 allocated, cluster 1 free
+  const bmMeta = [{ volStart: 4096, volEnd: 65536, clusterBytes: 4096, bitmap }];
+  assert.deepEqual(checkOffsetAllocation(4096, true, bmMeta), { allocated: true, verified: true });
+  assert.deepEqual(checkOffsetAllocation(4096 + 4096, true, bmMeta), { allocated: false, verified: true });
+  assert.deepEqual(checkOffsetAllocation(4096 + 8192, true, bmMeta), { allocated: true, verified: true });
+
+  // Put an unframed header-only signature (RTF) at sector 1 (offset 512) and a real JPEG at sector 2 (offset 1024)
+  const disk = Buffer.alloc(4096);
+  Buffer.from('{\\rtf1\\ansi Recovered RTF stream', 'utf8').copy(disk, 512);
+  const jpg = Buffer.from([
+    0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10, 0x4a, 0x46, 0x49, 0x46, 0x00, 0x01, 0x01, 0x00, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00,
+    0xff, 0xdb, 0x00, 0x04, 0x00, 0x00,
+    0xff, 0xc0, 0x00, 0x0b, 0x08, 0x00, 0x01, 0x00, 0x01, 0x01, 0x01, 0x11, 0x00,
+    0xff, 0xda, 0x00, 0x08, 0x01, 0x01, 0x00, 0x00, 0x3f, 0x00, 0xaa, 0xff, 0xd9,
+  ]);
+  jpg.copy(disk, 1024);
+
+  const tsCarved = carveDiskBuffer(new Uint8Array(disk), { startByte: 0, endByte: disk.length, blockSize: 512 });
+  const tsRtf = tsCarved.find((c) => c.extension === 'rtf');
+  const tsJpg = tsCarved.find((c) => c.extension === 'jpg');
+  assert.ok(tsRtf && tsRtf.sizeEstimated === true && tsRtf.status === 'OK_TRUNCATED');
+  assert.ok(tsJpg, 'Expected adjacent JPEG after sizeEstimated RTF not to be skipped in TS carver');
+
+  const imgPath = path.join(os.tmpdir(), `worker_step_${Date.now()}.img`);
+  fs.writeFileSync(imgPath, disk);
+  try {
+    const res = await scanRange({
+      devicePath: imgPath,
+      rangeStart: 0,
+      rangeEnd: disk.length,
+      totalLimitBytes: disk.length,
+      step: 512,
+      sectorSize: 512,
+    });
+    const wJpg = res.entries.find((e: { extensionHint: string }) => e.extensionHint === 'jpg');
+    assert.ok(wJpg, 'Expected adjacent JPEG not to be skipped in scannerWorker.cjs');
+  } finally {
+    if (fs.existsSync(imgPath)) fs.unlinkSync(imgPath);
+  }
+});
+
+test('main.cjs security & integrity helpers: BitLocker env vars, same-disk block, exact FD slice, CRC verification & keepOriginalOnRepair', async () => {
+  const req = createRequire(import.meta.url);
+  const {
+    buildBitLockerUnlockSpec,
+    checkSameSourcePaths,
+    readDiskBytesFromFdSync,
+    recoverFilesImpl,
+    scanLostPartitionsFromFd,
+  } = req('../electron/main.cjs');
+  const { getCandidateEngineDirs } = req('../electron/enginesHelper.cjs');
+
+  // 1. Engine lookup excludes user-writable paths when elevated or packaged
+  const elevatedDirs = getCandidateEngineDirs({ elevated: true, packaged: true });
+  assert.equal(elevatedDirs.some((d: string) => /AppData|scoop|WinGet/i.test(d)), false);
+
+  // 2. BitLocker secrets passed via envPatch instead of CLI arguments
+  const blSpec = buildBitLockerUnlockSpec({
+    driveLetter: 'e:',
+    recoveryKey: '111111-222222-333333-444444-555555-666666-777777-888888',
+  });
+  assert.equal(blSpec.ok, true);
+  assert.equal(blSpec.args.join(' ').includes('111111-222222'), false);
+  assert.equal(blSpec.envPatch.TD_BL_KEY, '111111-222222-333333-444444-555555-666666-777777-888888');
+  assert.equal(blSpec.envPatch.TD_BL_LETTER, 'E');
+
+  // 3. Same-source path blocking & unverified PhysicalDrive guard
+  const sameVol = await checkSameSourcePaths({
+    targetPath: 'D:\\RecoveryOut',
+    sourcePaths: ['\\\\.\\D:'],
+    platform: 'win32',
+  });
+  assert.equal(sameVol.blocked, true);
+
+  const sameDisk = await checkSameSourcePaths({
+    targetPath: 'D:\\RecoveryOut',
+    sourcePaths: ['\\\\.\\PhysicalDrive1'],
+    platform: 'win32',
+    resolveBackingDriveFn: async () => ({ devicePath: '\\\\.\\PhysicalDrive1' }),
+  });
+  assert.equal(sameDisk.blocked, true);
+
+  const unverified = await checkSameSourcePaths({
+    targetPath: 'Z:\\NetworkShare',
+    sourcePaths: ['\\\\.\\PhysicalDrive1'],
+    platform: 'win32',
+    resolveBackingDriveFn: async () => null,
+    allowUnverifiedDestination: false,
+  });
+  assert.equal(unverified.blocked, true);
+  assert.equal(unverified.unverified, true);
+
+  // 4. readDiskBytesFromFdSync exact slice + scanLostPartitionsFromFd at LBA 2048 (> 1 MiB) + strict CRC & keepOriginalOnRepair
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'td_main_test_'));
+  try {
+    const imgPath = path.join(tmpDir, 'disk.img');
+    const diskBuf = Buffer.alloc(2 * 1024 * 1024);
+    Buffer.from('EXACT_SLICE_MARKER').copy(diskBuf, 100);
+    // Lost NTFS boot sector at LBA 2048 (1 MiB offset)
+    const lba2048 = 2048 * 512;
+    diskBuf[lba2048] = 0xeb; diskBuf[lba2048 + 1] = 0x52; diskBuf[lba2048 + 2] = 0x90;
+    diskBuf.write('NTFS    ', lba2048 + 3, 'ascii');
+    diskBuf.writeUInt16LE(512, lba2048 + 11);
+    diskBuf[lba2048 + 13] = 8;
+    diskBuf.writeBigUInt64LE(4096n, lba2048 + 40);
+    diskBuf[lba2048 + 510] = 0x55; diskBuf[lba2048 + 511] = 0xaa;
+
+    // Truncated JSON payload at offset 4096 (missing closing brace)
+    const truncJson = Buffer.from('{"recovered":true\0\0\0', 'utf8');
+    truncJson.copy(diskBuf, 4096);
+    fs.writeFileSync(imgPath, diskBuf);
+
+    const fd = fs.openSync(imgPath, 'r');
+    try {
+      const slice = readDiskBytesFromFdSync(fd, 100, 18, 512);
+      assert.equal(slice.toString('ascii'), 'EXACT_SLICE_MARKER');
+
+      const lostParts = scanLostPartitionsFromFd(fd, diskBuf.length, 512);
+      assert.ok(lostParts.some((p: { fsType: string; startLba: number }) => p.fsType === 'NTFS' && p.startLba === 2048));
+    } finally {
+      fs.closeSync(fd);
+    }
+
+    const goodCrc = computeCrc32(new Uint8Array(truncJson));
+    const destDir = path.join(tmpDir, 'out');
+    fs.mkdirSync(destDir);
+
+    // Strict CRC mismatch must refuse to commit file
+    const badRes = await recoverFilesImpl({
+      targetRoot: destDir,
+      keepOriginalOnRepair: true,
+      items: [
+        {
+          filename: 'bad.json',
+          folder: 'Documents',
+          sourceKind: 'native-device',
+          devicePath: imgPath,
+          offset: 4096,
+          size: truncJson.length,
+          discoveryCrc32: goodCrc ^ 0xffffffff,
+          extension: 'json',
+          repairIfTruncated: false,
+        },
+      ],
+    });
+    assert.equal(badRes.savedCount, 0);
+    assert.equal(badRes.failures.length, 1);
+
+    // Valid CRC + repair keeps untouched original when keepOriginalOnRepair=true
+    const okRes = await recoverFilesImpl({
+      targetRoot: destDir,
+      keepOriginalOnRepair: true,
+      items: [
+        {
+          filename: 'doc.json',
+          folder: 'Documents',
+          sourceKind: 'native-device',
+          devicePath: imgPath,
+          offset: 4096,
+          size: truncJson.length,
+          discoveryCrc32: goodCrc,
+          extension: 'json',
+          repairIfTruncated: true,
+        },
+      ],
+    });
+    assert.equal(okRes.savedCount, 1);
+    assert.equal(okRes.verifiedCount, 1);
+    assert.equal(okRes.repairedCount, 1);
+    assert.equal(okRes.originalKeptCount, 1);
+    assert.ok(okRes.reportPath?.endsWith('Recovery-Audit-Report.txt'));
+    const outSubdir = path.join(destDir, 'Documents');
+    const filesOut = fs.readdirSync(outSubdir);
+    assert.ok(filesOut.some((f) => f === 'doc.json'));
+    assert.ok(filesOut.some((f) => f === 'doc_original.json'));
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test('main.cjs NTFS 4K MFT record + $ATTRIBUTE_LIST + compression/EFS + missing timestamp safety + GPT refusal', () => {
+  const req = createRequire(import.meta.url);
+  const { parseMftRecordBuffer, applyMftUsaFixup } = req('../electron/main.cjs');
+
+  // Construct an image containing Base Record 100 (4096-byte) with $ATTRIBUTE_LIST pointing to Ext Record 101 for $DATA
+  const recSize = 4096;
+  const clusterBytes = 4096;
+  const imgBuf = Buffer.alloc(65536);
+
+  const buildMftRec = (recNum: number, baseRec: number, attrs: Buffer[]) => {
+    const rec = Buffer.alloc(recSize);
+    rec.write('FILE', 0, 'ascii');
+    rec.writeUInt16LE(48, 4); // USA offset (48..65 for 1+8 words)
+    rec.writeUInt16LE(1 + recSize / 512, 6);
+    rec.writeUInt16LE(1, 16); // seq
+    rec.writeUInt32LE(72, 20); // first attr offset past USA
+    rec.writeUInt16LE(0x0000, 22); // deleted file
+    rec.writeUInt32LE(baseRec, 32); // base file record ref
+    rec.writeUInt32LE(recNum, 44);
+    const usn = 0x0007;
+    rec.writeUInt16LE(usn, 48);
+    let pos = 72;
+    for (const a of attrs) {
+      a.copy(rec, pos);
+      pos += a.length;
+    }
+    rec.writeUInt32LE(0xffffffff, pos);
+    rec.writeUInt32LE(pos + 8, 24);
+    for (let s = 1; s <= recSize / 512; s++) {
+      const se = s * 512 - 2;
+      rec.writeUInt16LE(rec.readUInt16LE(se), 48 + s * 2);
+      rec.writeUInt16LE(usn, se);
+    }
+    return rec;
+  };
+
+  // $FILE_NAME attr (0x30) for "secret.txt"
+  const fnName = Buffer.from('secret.txt', 'utf16le');
+  const fnAttr = Buffer.alloc(Math.ceil((24 + 66 + fnName.length) / 8) * 8);
+  fnAttr.writeUInt32LE(0x30, 0);
+  fnAttr.writeUInt32LE(fnAttr.length, 4);
+  fnAttr.writeUInt32LE(66 + fnName.length, 16);
+  fnAttr.writeUInt16LE(24, 20);
+  fnAttr.writeUInt32LE(5, 24); // parent = 5
+  fnAttr[24 + 64] = 'secret.txt'.length;
+  fnAttr[24 + 65] = 3;
+  fnName.copy(fnAttr, 24 + 66);
+
+  // $ATTRIBUTE_LIST (0x20) entry pointing to record 1 for $DATA (0x80)
+  const alEntry = Buffer.alloc(32);
+  alEntry.writeUInt32LE(0x80, 0);
+  alEntry.writeUInt16LE(26, 4);
+  alEntry[6] = 0; // nameLen
+  alEntry[7] = 26; // nameOff
+  alEntry.writeUInt32LE(1, 16); // ext record 1
+  const alAttr = Buffer.alloc(24 + 32);
+  alAttr.writeUInt32LE(0x20, 0);
+  alAttr.writeUInt32LE(alAttr.length, 4);
+  alAttr.writeUInt32LE(32, 16);
+  alAttr.writeUInt16LE(24, 20);
+  alEntry.copy(alAttr, 24);
+
+  // Extension record 1 with compressed + encrypted flags on resident $DATA
+  const payload = Buffer.from('COMPRESSED_EFS_BYTES', 'utf8');
+  const dataAttr = Buffer.alloc(Math.ceil((24 + payload.length) / 8) * 8);
+  dataAttr.writeUInt32LE(0x80, 0);
+  dataAttr.writeUInt32LE(dataAttr.length, 4);
+  dataAttr.writeUInt16LE(0x4001, 12); // Compressed (0x0001) + Encrypted (0x4000)
+  dataAttr.writeUInt32LE(payload.length, 16);
+  dataAttr.writeUInt16LE(24, 20);
+  payload.copy(dataAttr, 24);
+
+  const mftStartOffset = 8192;
+  // Place rec 0 at slot 0, rec 1 at slot 1 inside mftRuns
+  const baseRecBuf = buildMftRec(0, 0, [fnAttr, alAttr]);
+  const extRecBuf = buildMftRec(1, 1, [dataAttr]);
+  baseRecBuf.copy(imgBuf, mftStartOffset);
+  extRecBuf.copy(imgBuf, mftStartOffset + recSize);
+
+  const tmpImg = path.join(os.tmpdir(), `mft_4k_${Date.now()}.img`);
+  fs.writeFileSync(tmpImg, imgBuf);
+  const fd = fs.openSync(tmpImg, 'r');
+  try {
+    const part = { volStart: 0, volEnd: imgBuf.length, clusterBytes, sectorSize: 512, mftRecSize: recSize };
+    const mftRuns = [{ lcn: Math.floor(mftStartOffset / clusterBytes), clusterCount: 4 }];
+    assert.equal(applyMftUsaFixup(Buffer.from(baseRecBuf), recSize), true);
+    const parsed = parseMftRecordBuffer(
+      baseRecBuf,
+      mftStartOffset,
+      [part],
+      fd,
+      imgBuf.length,
+      new Map(),
+      new Map(),
+      true,
+      { mftRuns, mftRecSize: recSize, sectorSize: 512 },
+    );
+    assert.ok(parsed?.entry);
+    assert.equal(parsed.entry.filename, 'secret.txt');
+    assert.equal(parsed.entry.ntfsCompressed, true);
+    assert.equal(parsed.entry.ntfsEncrypted, true);
+    assert.equal(parsed.entry.modifiedAt, undefined);
+  } finally {
+    fs.closeSync(fd);
+    if (fs.existsSync(tmpImg)) fs.unlinkSync(tmpImg);
+  }
+
+  // Missing timestamps format as Unknown and omit <mtime> in DFXML
+  assert.equal(formatShortDate(undefined), 'Unknown');
+  assert.equal(formatShortDate(0), 'Unknown');
+
+  // Likelihood caps on encrypted / compressed / estimated
+  assert.ok(computeRecoveryLikelihood({ status: 'OK', size: 100, calculatedSize: 100, partitionId: 'p1', metadata: {}, ntfsEncrypted: true }).chance <= 35);
+  assert.ok(computeRecoveryLikelihood({ status: 'OK', size: 100, calculatedSize: 100, partitionId: 'p1', metadata: {}, ntfsCompressed: true }).chance <= 55);
+  assert.ok(computeRecoveryLikelihood({ status: 'OK_TRUNCATED', size: 100, calculatedSize: 100, partitionId: 'p1', metadata: {}, sizeEstimated: true }).chance <= 74);
+
+  const dfxml = buildDfxmlReport({
+    diskName: 'TestDisk.img',
+    diskSizeBytes: 4096,
+    items: [
+      {
+        id: '1',
+        filename: 'sparse.bin',
+        extension: 'bin',
+        family: 'Others',
+        mimeType: 'application/octet-stream',
+        size: 8192,
+        calculatedSize: 8192,
+        status: 'OK',
+        sourceKind: 'ntfs-mft',
+        partitionId: 'p1',
+        partitionName: 'NTFS',
+        offset: 4096,
+        sector: 8,
+        matchedOffset: 0,
+        matchedLength: 0,
+        metadata: {},
+        description: 'Sparse test',
+        data: new Uint8Array(0),
+        sourceRef: { kind: 'native-runs', offset: 4096, size: 8192, runs: [{ offset: 4096, length: 4096 }, { offset: -1, length: 4096 }] },
+        recoveryChance: 80,
+        recoveryTier: 'medium',
+        recoveryReason: 'Test',
+      },
+    ],
+  });
+  assert.equal(dfxml.includes('<mtime>'), false);
+  assert.ok(dfxml.includes('fill="0"'));
+  assert.equal(/cgsecurity/i.test(dfxml), false);
+
+  // writeMbrPartitionTable refuses EFI GPT protective MBR disks
+  const gptDisk = new Uint8Array(4096);
+  gptDisk[0x1be + 4] = 0xee;
+  gptDisk[510] = 0x55;
+  gptDisk[511] = 0xaa;
+  assert.throws(() => writeMbrPartitionTable(gptDisk, []), /GPT/);
+});
+
 
 
 

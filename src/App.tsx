@@ -71,7 +71,6 @@ import {
   buildCsvReport,
   computeContentFingerprint,
   computeRecoveryLikelihood,
-  deriveCarvedTimestamp,
   formatShortDate,
   isNonMediaRepairableExtension,
   repairFileBuffer,
@@ -263,6 +262,9 @@ function getGroupLabel(item: ExplorerFileItem, groupBy: GroupByKey, nowMs: numbe
     case 'origin':
       return item.partitionName;
     case 'date': {
+      if (typeof item.modifiedAt !== 'number' || !Number.isFinite(item.modifiedAt) || item.modifiedAt <= 0) {
+        return 'Unknown Timestamp';
+      }
       const ageHours = (nowMs - item.modifiedAt) / 3600000;
       if (ageHours <= 24) return 'Last 24 Hours';
       if (ageHours <= 120) return 'Earlier This Week';
@@ -352,6 +354,12 @@ export const App: React.FC = () => {
   const [useNativeScan, setUseNativeScan] = useState<boolean>(false);
   const [isScanning, setIsScanning] = useState<boolean>(false);
   const [isPaused, setIsPaused] = useState<boolean>(false);
+  const [scanWarnings, setScanWarnings] = useState<string[]>([]);
+  const [scanIncomplete, setScanIncomplete] = useState<boolean>(false);
+  const [skippedBadSectors, setSkippedBadSectors] = useState<number>(0);
+  const [skippedBadBytes, setSkippedBadBytes] = useState<number>(0);
+  const [extraLostPartitions, setExtraLostPartitions] = useState<PartitionEntry[]>([]);
+  const [sessionReadOnly, setSessionReadOnly] = useState<boolean>(false);
   const isPausedRef = useRef<boolean>(false);
   const activeNativeScanIdRef = useRef<string | null>(null);
   const nativeDriveTargetRef = useRef<{
@@ -413,10 +421,37 @@ export const App: React.FC = () => {
     }
   }, []);
 
-  const analysis = useMemo(
-    () => analyzeDiskImage(diskName, diskBytes),
-    [diskName, diskBytes],
-  );
+  const analysis = useMemo(() => {
+    const base = analyzeDiskImage(diskName, diskBytes);
+    if (extraLostPartitions.length === 0) return base;
+    const seenLba = new Set(base.partitions.map((p) => p.startLba));
+    const merged = [...base.partitions];
+    for (const extra of extraLostPartitions) {
+      if (!seenLba.has(extra.startLba)) {
+        seenLba.add(extra.startLba);
+        merged.push(extra);
+      }
+    }
+    merged.sort((a, b) => a.startLba - b.startLba);
+    return {
+      ...base,
+      partitions: merged,
+    };
+  }, [diskName, diskBytes, extraLostPartitions]);
+
+  const canRestoreMbr =
+    analysis.arch !== 'EFI GPT' &&
+    diskBytes.length > 0 &&
+    diskBytes.length >= analysis.diskSizeBytes &&
+    !useNativeScan &&
+    !sessionReadOnly;
+
+  const restoreDisabledReason =
+    analysis.arch === 'EFI GPT'
+      ? 'MBR partition restore is disabled on EFI GPT disks'
+      : sessionReadOnly
+        ? 'Loaded session is read-only'
+        : 'MBR partition export requires a full in-memory disk image';
 
   const lostPartitions = useMemo(
     () => analysis.partitions.filter((p) => p.status === 'Deleted / Lost'),
@@ -478,6 +513,7 @@ export const App: React.FC = () => {
         metadata: c.metadata,
         extension: c.extension,
         data: c.data,
+        sizeEstimated: c.sizeEstimated,
       });
       return {
         id: c.id,
@@ -506,7 +542,8 @@ export const App: React.FC = () => {
           size: c.size,
           runs: c.runs && c.runs.length > 0 ? c.runs : undefined,
         },
-        modifiedAt: c.metadata.takenAtMs ?? deriveCarvedTimestamp(c.sector, origin.partitionId),
+        modifiedAt: c.metadata.takenAtMs,
+        sizeEstimated: c.sizeEstimated,
         recoveryChance: assessment.chance,
         recoveryTier: assessment.tier,
         recoveryReason: assessment.reason,
@@ -868,6 +905,12 @@ export const App: React.FC = () => {
     if (bytes.length === 0) return;
     setActiveScreen('explorer');
     setUseNativeScan(false);
+    setSessionReadOnly(false);
+    setScanWarnings([]);
+    setScanIncomplete(false);
+    setSkippedBadSectors(0);
+    setSkippedBadBytes(0);
+    setExtraLostPartitions([]);
     setScannedDevicePath(null);
     nativeDriveTargetRef.current = null;
     isPausedRef.current = false;
@@ -965,6 +1008,9 @@ export const App: React.FC = () => {
         mftResident: entry.mftResident,
         mftOverwritten: entry.mftOverwritten,
         mftBitmapIntact: entry.mftBitmapIntact,
+        sizeEstimated: entry.sizeEstimated,
+        ntfsCompressed: entry.ntfsCompressed,
+        ntfsEncrypted: entry.ntfsEncrypted,
       });
 
       return {
@@ -1028,7 +1074,12 @@ export const App: React.FC = () => {
           tskInode: entry.tskInode,
           tskOffset: entry.tskOffset,
         },
-        modifiedAt: res?.metadata.takenAtMs ?? (entry.modifiedAt || Date.now()),
+        modifiedAt:
+          res?.metadata.takenAtMs ??
+          (entry.modifiedAt && entry.modifiedAt > 0 ? entry.modifiedAt : undefined),
+        sizeEstimated: entry.sizeEstimated,
+        ntfsCompressed: entry.ntfsCompressed,
+        ntfsEncrypted: entry.ntfsEncrypted,
         recoveryChance: assessment.chance,
         recoveryTier: assessment.tier,
         recoveryReason: assessment.reason,
@@ -1082,6 +1133,12 @@ export const App: React.FC = () => {
 
     setActiveScreen('explorer');
     setUseNativeScan(true);
+    setSessionReadOnly(false);
+    setScanWarnings([]);
+    setScanIncomplete(false);
+    setSkippedBadSectors(0);
+    setSkippedBadBytes(0);
+    setExtraLostPartitions([]);
     setDiskName(label);
     setDiskBytes(headBytes);
     setRepairedDiskBytes(null);
@@ -1106,6 +1163,16 @@ export const App: React.FC = () => {
     const unsubProgress = bridge.onDriveScanProgress((ev) => {
       if (ev.scanId !== scanId) return;
       if (ev.phase) setScanPhase(ev.phase);
+      if (ev.incomplete) setScanIncomplete(true);
+      if (typeof ev.skippedSectors === 'number' && ev.skippedSectors > 0) {
+        setSkippedBadSectors(ev.skippedSectors);
+      }
+      if (typeof ev.skippedBytes === 'number' && ev.skippedBytes > 0) {
+        setSkippedBadBytes(ev.skippedBytes);
+      }
+      if (Array.isArray(ev.warnings) && ev.warnings.length > 0) {
+        setScanWarnings((prev) => Array.from(new Set([...prev, ...ev.warnings!])));
+      }
       setScanProgress({
         currentSector: Math.floor(ev.currentBytes / 512),
         totalSectors: Math.max(1, Math.floor(ev.totalBytes / 512)),
@@ -1154,8 +1221,24 @@ export const App: React.FC = () => {
       setLostModalOpen(true);
     }
 
+    void bridge
+      .scanLostPartitions({ devicePath, totalBytes })
+      .then((lostRes) => {
+        if (nativeDriveTargetRef.current?.devicePath !== devicePath) return;
+        if (lostRes.partitions && lostRes.partitions.length > 0) {
+          setExtraLostPartitions(lostRes.partitions);
+          if (lostRes.partitions.some((p) => p.status === 'Deleted / Lost')) {
+            setLostModalOpen(true);
+          }
+        }
+        if (lostRes.warnings && lostRes.warnings.length > 0) {
+          setScanWarnings((prev) => Array.from(new Set([...prev, ...lostRes.warnings])));
+        }
+      })
+      .catch(() => {});
+
     try {
-      const entries = await bridge.startDriveScan({
+      const scanRes = await bridge.startDriveScan({
         scanId,
         devicePath,
         totalBytes,
@@ -1166,6 +1249,15 @@ export const App: React.FC = () => {
         includeExisting: true,
       });
       if (activeNativeScanIdRef.current !== scanId) return;
+      const entries = Array.isArray(scanRes) ? scanRes : scanRes.entries;
+      if (!Array.isArray(scanRes)) {
+        if (scanRes.incomplete) setScanIncomplete(true);
+        if (scanRes.skippedSectors > 0) setSkippedBadSectors(scanRes.skippedSectors);
+        if (scanRes.skippedBytes > 0) setSkippedBadBytes(scanRes.skippedBytes);
+        if (scanRes.warnings.length > 0) {
+          setScanWarnings((prev) => Array.from(new Set([...prev, ...scanRes.warnings])));
+        }
+      }
       const mapped = entries.map((e) => mapNativeEntryToExplorerItem(e, resolveLocalPart));
       setCarvedItems((prev) => {
         if (effectiveStartPhase === 'deep' && prev.length > 0) {
@@ -1257,7 +1349,7 @@ export const App: React.FC = () => {
       await runNativeStreamingScan(drive.devicePath, drive.sizeBytes, label);
     } catch {
       setLoadError(
-        `Could not read ${drive.devicePath}. Make sure you launched TestDisk-PhotoRec.exe as Administrator.`,
+        `Could not read ${drive.devicePath}. Make sure you launched the application as Administrator.`,
       );
       setIsScanning(false);
     }
@@ -1292,6 +1384,10 @@ export const App: React.FC = () => {
             : res.backingDrive?.devicePath || 'the backing drive';
         setMbrActionNotice(
           `Indexed ${mapped.length} live/Shadow Copy files in "${folderPath}". Run as Administrator to also inspect deleted $MFT / $UsnJrnl records on ${driveLabel}.`,
+        );
+      } else if (res.deletedLookupStatus === 'io-error') {
+        setMbrActionNotice(
+          `Indexed ${mapped.length} live/Shadow Copy files in "${folderPath}", but raw NTFS metadata lookup failed with an I/O or volume lock error.`,
         );
       } else if (mapped.length === 0) {
         setMbrActionNotice(`No files found inside "${folderPath}".`);
@@ -1329,6 +1425,10 @@ export const App: React.FC = () => {
         setMbrActionNotice(
           `Indexed ${mapped.length} Desktop / Shadow Copy files. Run as Administrator to also search emptied deleted files on ${driveLabel}.`,
         );
+      } else if (res.deletedLookupStatus === 'io-error') {
+        setMbrActionNotice(
+          `Indexed ${mapped.length} Desktop / Shadow Copy files, but raw NTFS metadata lookup failed with an I/O or volume lock error.`,
+        );
       } else if (mapped.length === 0) {
         setMbrActionNotice('No files found inside Windows Desktop.');
       }
@@ -1362,6 +1462,10 @@ export const App: React.FC = () => {
         setMbrActionNotice(
           `Found ${mapped.length} live/Shadow Copy items in $Recycle.Bin. Run as Administrator to also scan emptied Recycle Bin $MFT / $UsnJrnl records on ${drvList}.`,
         );
+      } else if (res.deletedLookupStatus === 'io-error') {
+        setMbrActionNotice(
+          `Found ${mapped.length} live/Shadow Copy items in $Recycle.Bin, but raw NTFS metadata lookup encountered an I/O or volume lock error.`,
+        );
       } else if (res.deletedLookupStatus === 'partial') {
         setMbrActionNotice(
           `Recycle Bin scan recovered ${mapped.length} items (${res.liveCount ?? 0} in-bin, ${res.vssCount ?? 0} Shadow Copy, ${res.emptiedCount ?? 0} emptied from ${res.scannedVolumes?.join(', ') || 'NTFS'}). Run as Administrator to also scan ${res.needsAdminVolumes?.join(', ')}.`,
@@ -1377,7 +1481,7 @@ export const App: React.FC = () => {
       }
     } catch {
       setLoadError(
-        'Could not scan Windows $Recycle.Bin. Try launching TestDisk-PhotoRec.exe as Administrator.',
+        'Could not scan Windows $Recycle.Bin. Try launching the application as Administrator.',
       );
     }
   };
@@ -1508,7 +1612,10 @@ export const App: React.FC = () => {
           size: file.size,
           browserFile: file,
         },
-        modifiedAt: res?.metadata.takenAtMs ?? recycleMeta?.deletedAtMs ?? (file.lastModified || Date.now()),
+        modifiedAt:
+          res?.metadata.takenAtMs ??
+          recycleMeta?.deletedAtMs ??
+          (file.lastModified > 0 ? file.lastModified : undefined),
         recoveryChance: assessment.chance,
         recoveryTier: assessment.tier,
         recoveryReason: assessment.reason,
@@ -1604,7 +1711,7 @@ export const App: React.FC = () => {
         matchedLength: res?.matchedLength ?? 0,
         metadata: res?.metadata ?? {
           details: detectedExt
-            ? `Identified via bundled PhotoRec fidentify (.${detectedExt})`
+            ? `Identified via offline fidentify (.${detectedExt})`
             : 'Unrecognized binary header',
         },
         description:
@@ -1618,11 +1725,12 @@ export const App: React.FC = () => {
           size: file.size,
           browserFile: file,
         },
-        modifiedAt: res?.metadata.takenAtMs ?? (file.lastModified || Date.now()),
+        modifiedAt:
+          res?.metadata.takenAtMs ?? (file.lastModified > 0 ? file.lastModified : undefined),
         recoveryChance: assessment.chance,
         recoveryTier: assessment.tier,
         recoveryReason: detectedExt && !res
-          ? `Identified via PhotoRec fidentify (.${detectedExt})`
+          ? `Identified via offline fidentify (.${detectedExt})`
           : assessment.reason,
         contentFingerprint: computeContentFingerprint(file.size, buf),
       });
@@ -1636,6 +1744,10 @@ export const App: React.FC = () => {
   };
 
   const handleRestorePartitionToMbr = (targetPart?: PartitionEntry) => {
+    if (!canRestoreMbr) {
+      setLoadError(restoreDisabledReason);
+      return;
+    }
     const activeEntries = analysis.partitions.filter((p) => p.status !== 'Deleted / Lost');
     const toRestore = targetPart ? [targetPart] : lostPartitions;
     const merged = [...activeEntries, ...toRestore]
@@ -1643,13 +1755,17 @@ export const App: React.FC = () => {
       .sort((a, b) => a.startLba - b.startLba)
       .slice(0, 4);
 
-    const patched = writeMbrPartitionTable(diskBytes, merged);
-    setDiskBytes(patched);
-    setRepairedDiskBytes(patched);
-    setLostBannerDismissed(true);
-    setMbrActionNotice(
-      `Partition table patched in memory (${merged.length} primary MBR entries). Export the repaired .img or recover files.`,
-    );
+    try {
+      const patched = writeMbrPartitionTable(diskBytes, merged, analysis.sectorSize);
+      setDiskBytes(patched);
+      setRepairedDiskBytes(patched);
+      setLostBannerDismissed(true);
+      setMbrActionNotice(
+        `Partition table patched in memory (${merged.length} primary MBR entries). Export the repaired .img or recover files.`,
+      );
+    } catch (err) {
+      setLoadError(err instanceof Error ? err.message : 'Failed to patch MBR partition table.');
+    }
   };
 
   const handleRepairFile = async (
@@ -1749,6 +1865,8 @@ export const App: React.FC = () => {
       extension: target.extension,
       data: repairedData,
       repaired: true,
+      ntfsCompressed: target.ntfsCompressed,
+      ntfsEncrypted: target.ntfsEncrypted,
     });
     const updater = (list: ExplorerFileItem[]) =>
       list.map((item) =>
@@ -1759,6 +1877,7 @@ export const App: React.FC = () => {
               size: repairedData!.length,
               calculatedSize: repairedData!.length,
               status: 'OK' as const,
+              sizeEstimated: false,
               repaired: true,
               sourceRef: {
                 kind: 'memory' as const,
@@ -1777,6 +1896,10 @@ export const App: React.FC = () => {
   };
 
   const handleDownloadRepairedImg = () => {
+    if (!repairedDiskBytes && (diskBytes.length === 0 || useNativeScan || sessionReadOnly)) {
+      setLoadError('Repaired disk image export is only available for full in-memory disk images.');
+      return;
+    }
     const src = repairedDiskBytes ?? diskBytes;
     const blob = new Blob([src.slice().buffer], { type: 'application/octet-stream' });
     const url = URL.createObjectURL(blob);
@@ -1864,7 +1987,7 @@ export const App: React.FC = () => {
           cmp = a.filename.localeCompare(b.filename);
           break;
         case 'date':
-          cmp = a.modifiedAt - b.modifiedAt;
+          cmp = (a.modifiedAt ?? -1) - (b.modifiedAt ?? -1);
           break;
         case 'origin':
           cmp = a.partitionName.localeCompare(b.partitionName);
@@ -1921,8 +2044,11 @@ export const App: React.FC = () => {
         title: 'Export Recovery Inventory CSV',
         filters: [{ name: 'CSV Spreadsheet', extensions: ['csv'] }],
         content: csv,
+        scannedDevicePath: scannedDevicePath ?? undefined,
       });
-      if (!res.canceled && res.filePath) {
+      if (res.error) {
+        setLoadError(res.error);
+      } else if (!res.canceled && res.filePath) {
         setMbrActionNotice(`CSV inventory exported to ${res.filePath}`);
       }
       return;
@@ -1953,8 +2079,11 @@ export const App: React.FC = () => {
         title: 'Export DFXML Forensic Report',
         filters: [{ name: 'DFXML Report', extensions: ['xml', 'dfxml'] }],
         content: xml,
+        scannedDevicePath: scannedDevicePath ?? undefined,
       });
-      if (!res.canceled && res.filePath) {
+      if (res.error) {
+        setLoadError(res.error);
+      } else if (!res.canceled && res.filePath) {
         setMbrActionNotice(`DFXML report exported to ${res.filePath}`);
       }
       return;
@@ -1970,7 +2099,7 @@ export const App: React.FC = () => {
 
   const handleExportSession = async () => {
     if (allItems.length === 0) return;
-    const serialized: SerializedScanSessionItem[] = allItems.slice(0, 5000).map((item) => ({
+    const serialized: SerializedScanSessionItem[] = allItems.map((item) => ({
       id: item.id,
       filename: item.filename,
       extension: item.extension,
@@ -1998,15 +2127,21 @@ export const App: React.FC = () => {
             offset: item.sourceRef.offset,
             size: item.sourceRef.size,
             runs: item.sourceRef.runs,
+            tskInode: item.sourceRef.tskInode,
+            tskOffset: item.sourceRef.tskOffset,
           }
         : undefined,
       modifiedAt: item.modifiedAt,
+      sizeEstimated: item.sizeEstimated,
+      ntfsCompressed: item.ntfsCompressed,
+      ntfsEncrypted: item.ntfsEncrypted,
       recoveryChance: item.recoveryChance,
       recoveryTier: item.recoveryTier,
       recoveryReason: item.recoveryReason,
       contentFingerprint: item.contentFingerprint,
+      discoveryCrc32: item.discoveryCrc32,
       headerSampleHex:
-        item.size <= 131072
+        item.size <= 262144
           ? bytesToHexSample(item.data, item.data.length)
           : bytesToHexSample(item.data, 4096),
     }));
@@ -2016,8 +2151,10 @@ export const App: React.FC = () => {
       savedAt: new Date().toISOString(),
       diskName,
       diskSizeBytes: analysis.diskSizeBytes,
-      devicePath: nativeDriveTargetRef.current?.devicePath,
+      devicePath: nativeDriveTargetRef.current?.devicePath ?? scannedDevicePath ?? undefined,
       resumeOffset: scanProgress.currentSector * 512,
+      readOnly: true,
+      warnings: scanWarnings.length > 0 ? scanWarnings : undefined,
       items: serialized,
     };
 
@@ -2029,11 +2166,14 @@ export const App: React.FC = () => {
       const res = await bridge.saveTextReport({
         defaultName,
         title: 'Save Scan Session (.tdscan.json)',
-        filters: [{ name: 'TestDisk Scan Session', extensions: ['json', 'tdscan.json'] }],
+        filters: [{ name: 'Recovery Scan Session', extensions: ['json', 'tdscan.json'] }],
         content: json,
+        scannedDevicePath: scannedDevicePath ?? undefined,
       });
-      if (!res.canceled && res.filePath) {
-        setMbrActionNotice(`Scan session saved to ${res.filePath}`);
+      if (res.error) {
+        setLoadError(res.error);
+      } else if (!res.canceled && res.filePath) {
+        setMbrActionNotice(`Scan session saved (${serialized.length} files) to ${res.filePath}`);
       }
       return;
     }
@@ -2079,15 +2219,32 @@ export const App: React.FC = () => {
         description: s.description,
         data: hexSampleToBytes(s.headerSampleHex),
         sourceRef: s.sourceRef,
-        modifiedAt: s.modifiedAt,
+        modifiedAt:
+          typeof s.modifiedAt === 'number' && Number.isFinite(s.modifiedAt) && s.modifiedAt > 0
+            ? s.modifiedAt
+            : undefined,
+        sizeEstimated: s.sizeEstimated,
+        ntfsCompressed: s.ntfsCompressed,
+        ntfsEncrypted: s.ntfsEncrypted,
         recoveryChance: s.recoveryChance,
         recoveryTier: s.recoveryTier,
         recoveryReason: s.recoveryReason,
         contentFingerprint: s.contentFingerprint,
+        discoveryCrc32: s.discoveryCrc32,
       }));
 
       setActiveScreen('explorer');
-      setUseNativeScan(true);
+      setUseNativeScan(false);
+      setSessionReadOnly(true);
+      nativeDriveTargetRef.current = null;
+      setScannedDevicePath(parsed.devicePath ?? null);
+      setDiskBytes(EMPTY_DISK_BYTES);
+      setRepairedDiskBytes(null);
+      setExtraLostPartitions([]);
+      setScanWarnings(Array.isArray(parsed.warnings) ? parsed.warnings : []);
+      setScanIncomplete(false);
+      setSkippedBadSectors(0);
+      setSkippedBadBytes(0);
       setIsScanning(false);
       setIsPaused(false);
       setDiskName(parsed.diskName);
@@ -2104,7 +2261,7 @@ export const App: React.FC = () => {
         foundBytes: restored.reduce((sum, x) => sum + x.size, 0),
       });
       setMbrActionNotice(
-        `Loaded saved scan session (${restored.length} files from ${parsed.diskName}).`,
+        `Loaded read-only saved scan session (${restored.length} files from ${parsed.diskName}). Re-open the drive/image to re-scan or recover uncached sectors.`,
       );
     } catch {
       setLoadError('Could not parse scan session JSON file.');
@@ -2408,7 +2565,7 @@ export const App: React.FC = () => {
             <HardDrive className="w-3.5 h-3.5 text-white" />
           </div>
           <span className="text-[13px] font-semibold tracking-tight text-slate-100 whitespace-nowrap">
-            TestDisk &amp; PhotoRec
+            Disk &amp; Partition Recovery Explorer
           </span>
           {activeScreen === 'explorer' && diskName && (
             <button
@@ -2858,6 +3015,46 @@ export const App: React.FC = () => {
             </div>
           )}
 
+          {(scanIncomplete || skippedBadSectors > 0 || scanWarnings.length > 0) && (
+            <div className="mx-3 mt-2.5 px-3.5 py-2 rounded-md bg-amber-500/10 border border-amber-500/30 text-amber-200 text-xs flex items-start justify-between gap-3 animate-slide-down">
+              <div className="flex items-start gap-2.5 min-w-0">
+                <ShieldAlert className="w-4 h-4 text-amber-400 shrink-0 mt-0.5" />
+                <div className="space-y-0.5 min-w-0">
+                  <div className="font-semibold text-amber-100">
+                    {scanIncomplete
+                      ? 'Partial Scan / Bad Sectors Encountered'
+                      : skippedBadSectors > 0
+                        ? `Skipped ${skippedBadSectors} Unreadable Sector${skippedBadSectors === 1 ? '' : 's'} (${formatBytes(skippedBadBytes)})`
+                        : 'Scan Diagnostics & Limits'}
+                  </div>
+                  {skippedBadSectors > 0 && (
+                    <div className="text-[11px] text-amber-200/90">
+                      Skipped {skippedBadSectors.toLocaleString()} damaged/unreadable disk sector{skippedBadSectors === 1 ? '' : 's'} ({formatBytes(skippedBadBytes)}) after retry backoff.
+                    </div>
+                  )}
+                  {scanWarnings.map((w, idx) => (
+                    <div key={idx} className="text-[11px] text-amber-200/90">
+                      {w}
+                    </div>
+                  ))}
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={() => {
+                  setScanWarnings([]);
+                  setScanIncomplete(false);
+                  setSkippedBadSectors(0);
+                  setSkippedBadBytes(0);
+                }}
+                className="text-amber-200 hover:text-white shrink-0"
+                aria-label="Dismiss scan diagnostics"
+              >
+                <X className="w-3.5 h-3.5" />
+              </button>
+            </div>
+          )}
+
           {bitlockerPartitions.length > 0 && (
             <div className="mx-3 mt-2.5 px-3.5 py-2 rounded-md bg-amber-500/10 border border-amber-500/30 text-amber-200 text-xs flex flex-wrap items-center justify-between gap-3 animate-slide-down">
               <div className="flex items-center gap-2.5">
@@ -3251,14 +3448,16 @@ export const App: React.FC = () => {
                   >
                     Details
                   </button>
-                  <button
-                    type="button"
-                    onClick={() => handleRestorePartitionToMbr(lostPartitions[0])}
-                    className="inline-flex items-center gap-1 px-2.5 py-1 rounded bg-[#3A7AFE] hover:bg-[#2F6EEB] text-white font-medium transition-colors"
-                  >
-                    <Wrench className="w-3 h-3" />
-                    Restore to MBR
-                  </button>
+                  {canRestoreMbr && (
+                    <button
+                      type="button"
+                      onClick={() => handleRestorePartitionToMbr(lostPartitions[0])}
+                      className="inline-flex items-center gap-1 px-2.5 py-1 rounded bg-[#3A7AFE] hover:bg-[#2F6EEB] text-white font-medium transition-colors"
+                    >
+                      <Wrench className="w-3 h-3" />
+                      Restore to MBR
+                    </button>
+                  )}
                   <button
                     type="button"
                     onClick={() => setLostBannerDismissed(true)}
@@ -3412,22 +3611,24 @@ export const App: React.FC = () => {
                   Reading sector: {scanProgress.currentSector.toLocaleString()}/
                   {scanProgress.totalSectors.toLocaleString()}
                 </span>
-                {!isScanning && (diskBytes.length > 0 || useNativeScan) && (
+                {!isScanning && (diskBytes.length > 0 || (useNativeScan && Boolean(scannedDevicePath))) && (
                   <div className="inline-flex items-center gap-2 shrink-0 ml-1">
-                    <button
-                      type="button"
-                      onClick={() => {
-                        if (nativeDriveTargetRef.current) {
-                          const t = nativeDriveTargetRef.current;
-                          void runNativeStreamingScan(t.devicePath, t.totalBytes, t.label);
-                        } else {
-                          startFreshScanState(diskBytes);
-                        }
-                      }}
-                      className="inline-flex items-center gap-1 text-[#4C8DFF] hover:underline font-sans shrink-0"
-                    >
-                      <RotateCcw className="w-3 h-3" /> Re-scan
-                    </button>
+                    {!(sessionReadOnly && diskBytes.length === 0 && !useNativeScan) && (
+                      <button
+                        type="button"
+                        onClick={() => {
+                          if (nativeDriveTargetRef.current) {
+                            const t = nativeDriveTargetRef.current;
+                            void runNativeStreamingScan(t.devicePath, t.totalBytes, t.label);
+                          } else {
+                            startFreshScanState(diskBytes);
+                          }
+                        }}
+                        className="inline-flex items-center gap-1 text-[#4C8DFF] hover:underline font-sans shrink-0"
+                      >
+                        <RotateCcw className="w-3 h-3" /> Re-scan
+                      </button>
+                    )}
                     {completedQuickOnly && (
                       <button
                         type="button"
@@ -3621,6 +3822,8 @@ export const App: React.FC = () => {
       {lostModalOpen && lostPartitions.length > 0 && (
         <LostPartitionsModal
           lostPartitions={lostPartitions}
+          canRestoreMbr={canRestoreMbr}
+          restoreDisabledReason={restoreDisabledReason}
           onInspectLostPartition={(p) => {
             navigateToNode({ kind: 'partition', partitionId: p.id });
             setFocusedFileId(null);

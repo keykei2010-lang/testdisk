@@ -56,7 +56,10 @@ export interface ExplorerFileItem {
   description: string;
   data: Uint8Array;
   sourceRef?: FileSourceRef;
-  modifiedAt: number;
+  modifiedAt?: number;
+  sizeEstimated?: boolean;
+  ntfsCompressed?: boolean;
+  ntfsEncrypted?: boolean;
   recoveryChance: number;
   recoveryTier: RecoveryLikelihoodTier;
   recoveryReason: string;
@@ -189,11 +192,15 @@ export interface SerializedScanSessionItem {
   metadata: IdentifyMetadata;
   description: string;
   sourceRef?: Omit<FileSourceRef, 'browserFile'>;
-  modifiedAt: number;
+  modifiedAt?: number;
+  sizeEstimated?: boolean;
+  ntfsCompressed?: boolean;
+  ntfsEncrypted?: boolean;
   recoveryChance: number;
   recoveryTier: RecoveryLikelihoodTier;
   recoveryReason: string;
   contentFingerprint?: string;
+  discoveryCrc32?: number;
   headerSampleHex?: string;
 }
 
@@ -204,5 +211,7 @@ export interface SavedScanSession {
   diskSizeBytes: number;
   devicePath?: string;
   resumeOffset?: number;
+  readOnly?: boolean;
+  warnings?: string[];
   items: SerializedScanSessionItem[];
 }

@@ -28,7 +28,8 @@ function parseRecycleIFileBufferCjs(buf) {
   const ftLo = buf.readUInt32LE(16);
   const ftHi = buf.readUInt32LE(20);
   const ticks = ftHi * 4294967296 + ftLo;
-  const deletedAtMs = ticks > 0 ? Math.floor(ticks / 10000 - WINDOWS_EPOCH_DIFF_MS) : Date.now();
+  const parsedMs = ticks > 0 ? Math.floor(ticks / 10000 - WINDOWS_EPOCH_DIFF_MS) : undefined;
+  const deletedAtMs = parsedMs && parsedMs > 0 ? parsedMs : undefined;
 
   let rawPath = '';
   if (verLo === 1) {

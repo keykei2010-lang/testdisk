@@ -1,4 +1,5 @@
 const fs = require('node:fs');
+const { detectSectorSizeSync, readAlignedSync, normalizeSectorSize } = require('./alignedIoCjs.cjs');
 
 // IEEE 802.3 CRC-32 for PNG chunk verification & recalculation
 const CRC_TABLE = new Uint32Array(256);
@@ -1558,17 +1559,18 @@ function scoreVideoClusterCjs(chunk) {
  */
 function stitchFragmentedVideosFromFdCjs(devicePath, results, limitBytes, blockSize = 4096) {
   if (!devicePath || !Array.isArray(results) || results.length === 0) return [];
-  const step = Math.max(512, Math.floor(blockSize / 512) * 512);
   const nonVideoRanges = results
     .filter((r) => !['mp4', 'mov', 'm4v', '3gp'].includes(String(r.extensionHint || '').toLowerCase()))
-    .map((r) => ({ start: r.offset || 0, end: (r.offset || 0) + Math.max(step, r.size || 0) }));
+    .map((r) => ({ start: r.offset || 0, end: (r.offset || 0) + Math.max(512, r.size || 0) }));
   const insideNonVid = (off) => nonVideoRanges.some((rg) => off >= rg.start && off < rg.end);
 
   let fd;
   const updated = [];
-  const secBuf = Buffer.allocUnsafe(step);
   try {
     fd = fs.openSync(devicePath, 'r');
+    const sectorSize = detectSectorSizeSync(fd);
+    const step = Math.max(normalizeSectorSize(sectorSize), Math.floor(blockSize / 512) * 512);
+    const secBuf = Buffer.allocUnsafe(step);
     for (const entry of results) {
       const ext = String(entry.extensionHint || '').toLowerCase();
       if ((entry.sourceKind !== 'carved' && entry.sourceKind !== 'native-device') || !['mp4', 'mov', 'm4v', '3gp'].includes(ext)) continue;
@@ -1583,7 +1585,12 @@ function stitchFragmentedVideosFromFdCjs(devicePath, results, limitBytes, blockS
 
       for (let pos = baseOff + step; pos + step <= declaredEnd; pos += step) {
         if (insideNonVid(pos)) { interrupted = true; break; }
-        const n = fs.readSync(fd, secBuf, 0, step, pos);
+        let n = 0;
+        try {
+          n = readAlignedSync(fd, secBuf, 0, step, pos, sectorSize);
+        } catch {
+          n = 0;
+        }
         if (n < 64) { interrupted = true; break; }
         const slice = secBuf.subarray(0, n);
         if (isForeignHeaderCjs(slice, 0)) { interrupted = true; break; }
@@ -1610,7 +1617,12 @@ function stitchFragmentedVideosFromFdCjs(devicePath, results, limitBytes, blockS
           if (activeStart !== -1) { runs.push({ offset: activeStart, length: activeEnd - activeStart }); activeStart = -1; }
           continue;
         }
-        const n = fs.readSync(fd, secBuf, 0, step, pos);
+        let n = 0;
+        try {
+          n = readAlignedSync(fd, secBuf, 0, step, pos, sectorSize);
+        } catch {
+          n = 0;
+        }
         if (n < 64) break;
         const probe = scoreVideoClusterCjs(secBuf.subarray(0, n));
         if (probe.isVideo) {
@@ -1639,7 +1651,14 @@ function stitchFragmentedVideosFromFdCjs(devicePath, results, limitBytes, blockS
           if (hPos >= sampleTarget) break;
           const want = Math.min(r.length, sampleTarget - hPos);
           if (want <= 0) continue;
-          const rn = r.offset >= 0 ? fs.readSync(fd, hdrBuf, hPos, want, r.offset) : 0;
+          let rn = 0;
+          if (r.offset >= 0) {
+            try {
+              rn = readAlignedSync(fd, hdrBuf, hPos, want, r.offset, sectorSize);
+            } catch {
+              rn = 0;
+            }
+          }
           if (rn < want) hdrBuf.fill(0, hPos + Math.max(0, rn), hPos + want);
           hPos += want;
         }

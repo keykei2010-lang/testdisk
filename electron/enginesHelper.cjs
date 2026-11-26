@@ -27,60 +27,101 @@ function findExecutableInPathSync(binName) {
   return found;
 }
 
-function getCandidateEngineDirs() {
+function isProcessElevatedSync() {
+  if (process.platform !== 'win32') {
+    return typeof process.getuid === 'function' ? process.getuid() === 0 : false;
+  }
+  try {
+    execFileSync('net.exe', ['session'], {
+      windowsHide: true,
+      timeout: 1500,
+      stdio: 'ignore',
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function getCandidateEngineDirs(options = {}) {
+  const isElevated = options.elevated !== undefined ? Boolean(options.elevated) : isProcessElevatedSync();
+  const isPackaged =
+    options.packaged !== undefined
+      ? Boolean(options.packaged)
+      : Boolean(!process.defaultApp && process.resourcesPath);
+
   const dirs = [];
   if (process.resourcesPath) {
     dirs.push(path.join(process.resourcesPath, 'engines'));
   }
   dirs.push(path.join(__dirname, 'bin'));
 
-  const appData = process.env.APPDATA || (process.platform === 'win32' ? path.join(os.homedir(), 'AppData', 'Roaming') : path.join(os.homedir(), '.config'));
-  dirs.push(path.join(appData, 'TestDisk-PhotoRec', 'engines'));
-  dirs.push(path.join(appData, 'testdisk-photorec-web', 'engines'));
-
   if (process.platform === 'win32') {
-    const localAppData = process.env.LOCALAPPDATA || path.join(os.homedir(), 'AppData', 'Local');
     const progFiles = process.env.ProgramFiles || 'C:\\Program Files';
     const progFilesX86 = process.env['ProgramFiles(x86)'] || 'C:\\Program Files (x86)';
-    const userProfile = process.env.USERPROFILE || os.homedir();
-    const choco = process.env.ChocolateyInstall || 'C:\\ProgramData\\chocolatey';
 
     dirs.push(
-      'C:\\ffmpeg\\bin',
       path.join(progFiles, 'ffmpeg', 'bin'),
       path.join(progFilesX86, 'ffmpeg', 'bin'),
       path.join(progFiles, 'The Sleuth Kit', 'bin'),
       path.join(progFilesX86, 'The Sleuth Kit', 'bin'),
       path.join(progFiles, 'TestDisk'),
       path.join(progFilesX86, 'TestDisk'),
-      path.join(userProfile, 'scoop', 'shims'),
-      path.join(userProfile, 'scoop', 'apps', 'ffmpeg', 'current', 'bin'),
-      path.join(choco, 'bin'),
     );
+  }
 
-    const wingetRoot = path.join(localAppData, 'Microsoft', 'WinGet', 'Packages');
-    if (fs.existsSync(wingetRoot)) {
-      try {
-        for (const pkg of fs.readdirSync(wingetRoot).slice(0, 40)) {
-          if (/ffmpeg|testdisk|sleuthkit/i.test(pkg)) {
-            dirs.push(path.join(wingetRoot, pkg));
-            dirs.push(path.join(wingetRoot, pkg, 'bin'));
+  // Only allow user-writable/per-user package directories when NOT elevated and NOT packaged
+  if (!isElevated && !isPackaged) {
+    const appData =
+      process.env.APPDATA ||
+      (process.platform === 'win32'
+        ? path.join(os.homedir(), 'AppData', 'Roaming')
+        : path.join(os.homedir(), '.config'));
+    dirs.push(path.join(appData, 'Disk-Partition-Recovery-Explorer', 'engines'));
+
+    if (process.platform === 'win32') {
+      const localAppData = process.env.LOCALAPPDATA || path.join(os.homedir(), 'AppData', 'Local');
+      const userProfile = process.env.USERPROFILE || os.homedir();
+      const choco = process.env.ChocolateyInstall || 'C:\\ProgramData\\chocolatey';
+
+      dirs.push(
+        'C:\\ffmpeg\\bin',
+        path.join(userProfile, 'scoop', 'shims'),
+        path.join(userProfile, 'scoop', 'apps', 'ffmpeg', 'current', 'bin'),
+        path.join(choco, 'bin'),
+      );
+
+      const wingetRoot = path.join(localAppData, 'Microsoft', 'WinGet', 'Packages');
+      if (fs.existsSync(wingetRoot)) {
+        try {
+          for (const pkg of fs.readdirSync(wingetRoot).slice(0, 40)) {
+            if (/ffmpeg|testdisk|sleuthkit/i.test(pkg)) {
+              dirs.push(path.join(wingetRoot, pkg));
+              dirs.push(path.join(wingetRoot, pkg, 'bin'));
+            }
           }
+        } catch {
+          // ignore unreadable WinGet folder
         }
-      } catch {
-        // ignore unreadable WinGet folder
       }
     }
   }
+
   return dirs;
 }
 
 /**
- * Resolves engine binaries from packaged `process.resourcesPath/engines`, local `electron/bin`,
- * `userData/engines`, Windows standard/package-manager folders, and system PATH.
+ * Resolves engine binaries from trusted application directories (and System/ProgramFiles).
+ * Skips user-writable folders and PATH lookup when running elevated or packaged.
  */
-function findBinary(subFolder, baseNames) {
-  const roots = getCandidateEngineDirs();
+function findBinary(subFolder, baseNames, options = {}) {
+  const isElevated = options.elevated !== undefined ? Boolean(options.elevated) : isProcessElevatedSync();
+  const isPackaged =
+    options.packaged !== undefined
+      ? Boolean(options.packaged)
+      : Boolean(!process.defaultApp && process.resourcesPath);
+
+  const roots = getCandidateEngineDirs({ elevated: isElevated, packaged: isPackaged });
   for (const root of roots) {
     if (!fs.existsSync(root)) continue;
     for (const name of baseNames) {
@@ -90,30 +131,32 @@ function findBinary(subFolder, baseNames) {
       if (fs.existsSync(p2)) return p2;
     }
   }
-  for (const name of baseNames) {
-    const inPath = findExecutableInPathSync(name);
-    if (inPath) return inPath;
+  if (!isElevated && !isPackaged) {
+    for (const name of baseNames) {
+      const inPath = findExecutableInPathSync(name);
+      if (inPath) return inPath;
+    }
   }
   return null;
 }
 
-function getEnginePaths() {
+function getEnginePaths(options = {}) {
   const ext = process.platform === 'win32' ? '.exe' : '';
   return {
-    fls: findBinary('sleuthkit', [`fls${ext}`]),
-    icat: findBinary('sleuthkit', [`icat${ext}`]),
-    istat: findBinary('sleuthkit', [`istat${ext}`]),
-    mmls: findBinary('sleuthkit', [`mmls${ext}`]),
-    photorec: findBinary('testdisk', [`photorec_win${ext}`, `photorec${ext}`]),
-    testdisk: findBinary('testdisk', [`testdisk_win${ext}`, `testdisk${ext}`]),
-    fidentify: findBinary('testdisk', [`fidentify_win${ext}`, `fidentify${ext}`]),
-    ffmpeg: findBinary('ffmpeg', [`ffmpeg${ext}`]),
-    ffprobe: findBinary('ffmpeg', [`ffprobe${ext}`]),
+    fls: findBinary('sleuthkit', [`fls${ext}`], options),
+    icat: findBinary('sleuthkit', [`icat${ext}`], options),
+    istat: findBinary('sleuthkit', [`istat${ext}`], options),
+    mmls: findBinary('sleuthkit', [`mmls${ext}`], options),
+    photorec: findBinary('testdisk', [`photorec_win${ext}`, `photorec${ext}`], options),
+    testdisk: findBinary('testdisk', [`testdisk_win${ext}`, `testdisk${ext}`], options),
+    fidentify: findBinary('testdisk', [`fidentify_win${ext}`, `fidentify${ext}`], options),
+    ffmpeg: findBinary('ffmpeg', [`ffmpeg${ext}`], options),
+    ffprobe: findBinary('ffmpeg', [`ffprobe${ext}`], options),
   };
 }
 
 function getEngineCapabilitiesSync(isAdmin) {
-  const bins = getEnginePaths();
+  const bins = getEnginePaths(isAdmin !== undefined ? { elevated: Boolean(isAdmin) } : {});
   return {
     isAdmin: Boolean(isAdmin),
     sleuthkit: Boolean(bins.fls && bins.icat),
@@ -218,14 +261,36 @@ async function runMmlsPartitions(devicePath, sectorSize = 512) {
 
 /**
  * Runs Sleuth Kit `fls` recursively in body-file format (`-m /`) for NTFS, FAT, exFAT, ext2/3/4, or HFS+.
- * Returns normalized deleted & active file records with TSK inode IDs for `icat` extraction.
+ * Returns normalized deleted & active file records with TSK inode IDs for `icat` extraction,
+ * attaching `warnings` / `truncatedByLimit` / `partialError` metadata on the returned array.
  */
-async function runTskFlsScan(devicePath, partOffsetBytes, fsTypeHint = 'auto', includeExisting = true, maxEntries = 8000) {
+async function runTskFlsScan(
+  devicePath,
+  partOffsetBytes,
+  fsTypeHint = 'auto',
+  includeExisting = true,
+  maxEntries = 25000,
+  sectorSize = 512,
+) {
   const { fls } = getEnginePaths();
-  if (!fls) return [];
+  const warnings = [];
+  const out = [];
+  const attachMeta = (arr, extra = {}) => {
+    Object.defineProperties(arr, {
+      warnings: { value: warnings, enumerable: false },
+      truncatedByLimit: { value: Boolean(extra.truncatedByLimit), enumerable: false },
+      partialError: { value: Boolean(extra.partialError), enumerable: false },
+    });
+    return arr;
+  };
+  if (!fls) return attachMeta(out);
 
-  const sectorOffset = Math.max(0, Math.floor(partOffsetBytes / 512));
+  const sec = Math.max(512, Number(sectorSize) || 512);
+  const sectorOffset = Math.max(0, Math.floor(partOffsetBytes / sec));
   const args = ['-r', '-p', '-m', '/'];
+  if (sec !== 512) {
+    args.push('-b', String(sec));
+  }
   if (!includeExisting) args.push('-d');
   if (sectorOffset > 0) {
     args.push('-o', String(sectorOffset));
@@ -233,15 +298,23 @@ async function runTskFlsScan(devicePath, partOffsetBytes, fsTypeHint = 'auto', i
   args.push(devicePath);
 
   const res = await execBinaryText(fls, args, {
-    timeout: 45000,
-    maxBuffer: 48 * 1024 * 1024,
+    timeout: 60000,
+    maxBuffer: 64 * 1024 * 1024,
   });
-  if (!res.stdout) return [];
+  if (!res.ok) {
+    const reason = (res.stderr || 'Sleuth Kit fls exited with a non-zero status').trim().split(/\r?\n/)[0];
+    warnings.push(`Sleuth Kit fls (${fsTypeHint}) reported an error${res.stdout ? ' (partial output only)' : ''}: ${reason}`);
+  }
+  if (!res.stdout) return attachMeta(out, { partialError: !res.ok });
 
-  const out = [];
   const seen = new Set();
+  let truncatedByLimit = false;
   for (const rawLine of res.stdout.split(/\r?\n/)) {
-    if (!rawLine || out.length >= maxEntries) continue;
+    if (!rawLine) continue;
+    if (out.length >= maxEntries) {
+      truncatedByLimit = true;
+      break;
+    }
     // mactime body format: MD5|name|inode|mode|UID|GID|size|atime|mtime|ctime|crtime
     const fields = rawLine.split('|');
     if (fields.length < 11) continue;
@@ -280,27 +353,33 @@ async function runTskFlsScan(devicePath, partOffsetBytes, fsTypeHint = 'auto', i
       offset: partOffsetBytes,
       tskInode: inode,
       tskOffset: partOffsetBytes,
-      modifiedAtMs: mtimeSec > 0 ? mtimeSec * 1000 : Date.now(),
+      modifiedAtMs: mtimeSec > 0 ? mtimeSec * 1000 : undefined,
       isDeleted,
       scanPhase: 'quick',
       details: `Sleuth Kit ${fsTypeHint.toUpperCase()} inode ${inode}${isDeleted ? ' (deleted)' : ' (existing)'}`,
     });
   }
-  return out;
+  if (truncatedByLimit) {
+    warnings.push(`Sleuth Kit fls reached the ${maxEntries.toLocaleString()} entry safety limit on ${fsTypeHint}.`);
+  }
+  return attachMeta(out, { truncatedByLimit, partialError: !res.ok });
 }
 
 /**
  * Extracts a single TSK inode directly to a destination path using `icat`.
+ * Verifies destination stream errors and expected byte length when supplied.
  */
-function extractTskInodeToFile(devicePath, partOffsetBytes, inode, destPath) {
+function extractTskInodeToFile(devicePath, partOffsetBytes, inode, destPath, expectedSize = 0, sectorSize = 512) {
   return new Promise((resolve) => {
     const { icat } = getEnginePaths();
     if (!icat || !/^[0-9]+(?:-[0-9]+-[0-9]+)?$/.test(String(inode))) {
       resolve({ ok: false, bytesWritten: 0, error: 'TSK icat binary unavailable or invalid inode.' });
       return;
     }
-    const sectorOffset = Math.max(0, Math.floor((partOffsetBytes || 0) / 512));
+    const sec = Math.max(512, Number(sectorSize) || 512);
+    const sectorOffset = Math.max(0, Math.floor((partOffsetBytes || 0) / sec));
     const args = [];
+    if (sec !== 512) args.push('-b', String(sec));
     if (sectorOffset > 0) args.push('-o', String(sectorOffset));
     args.push('-r', devicePath, String(inode));
 
@@ -308,6 +387,44 @@ function extractTskInodeToFile(devicePath, partOffsetBytes, inode, destPath) {
     const child = spawn(icat, args, { windowsHide: true });
     let bytesWritten = 0;
     let errText = '';
+    let childCode = null;
+    let childClosed = false;
+    let streamFinished = false;
+    let streamError = null;
+    let settled = false;
+
+    const finishOnce = () => {
+      if (settled) return;
+      if (streamError) {
+        settled = true;
+        resolve({
+          ok: false,
+          bytesWritten,
+          error: `Destination write failed: ${streamError.message}`,
+        });
+        return;
+      }
+      if (!childClosed || !streamFinished) return;
+      settled = true;
+      const expected = Number.isFinite(Number(expectedSize)) ? Math.max(0, Number(expectedSize)) : 0;
+      const shortWrite = expected > 0 && bytesWritten < expected;
+      const emptyWrite = bytesWritten <= 0;
+      const ok = childCode === 0 && !emptyWrite && !shortWrite;
+      let error;
+      if (childCode !== 0) {
+        error = errText.trim() || `icat exited with code ${childCode}`;
+      } else if (emptyWrite) {
+        error = 'Sleuth Kit icat extracted 0 bytes.';
+      } else if (shortWrite) {
+        error = `Short TSK extraction: wrote ${bytesWritten} of ${expected} expected bytes.`;
+      }
+      resolve({
+        ok,
+        bytesWritten,
+        incomplete: shortWrite,
+        error,
+      });
+    };
 
     child.stdout.on('data', (chunk) => {
       bytesWritten += chunk.length;
@@ -316,21 +433,31 @@ function extractTskInodeToFile(devicePath, partOffsetBytes, inode, destPath) {
     child.stderr.on('data', (chunk) => {
       errText += chunk.toString('utf8');
     });
-    child.on('error', (err) => {
-      outStream.destroy();
-      resolve({ ok: false, bytesWritten, error: err.message });
+    outStream.on('error', (err) => {
+      streamError = err;
+      try {
+        child.kill();
+      } catch {
+        // ignore
+      }
+      finishOnce();
     });
     outStream.on('finish', () => {
-      // Wait for exit code via closed event or resolve once stream flushed cleanly
+      streamFinished = true;
+      finishOnce();
+    });
+    child.on('error', (err) => {
+      streamError = streamError || err;
+      outStream.destroy();
+      finishOnce();
     });
     child.on('close', (code) => {
-      outStream.end(() => {
-        resolve({
-          ok: code === 0 && bytesWritten > 0,
-          bytesWritten,
-          error: code === 0 ? undefined : errText.trim() || `icat exited with code ${code}`,
-        });
-      });
+      childCode = code;
+      childClosed = true;
+      if (!streamError && !streamFinished) {
+        outStream.end();
+      }
+      finishOnce();
     });
   });
 }
@@ -338,15 +465,17 @@ function extractTskInodeToFile(devicePath, partOffsetBytes, inode, destPath) {
 /**
  * Reads bounded bytes from a TSK inode for in-app preview / header identification.
  */
-function readTskInodeHead(devicePath, partOffsetBytes, inode, maxBytes = 256 * 1024) {
+function readTskInodeHead(devicePath, partOffsetBytes, inode, maxBytes = 256 * 1024, sectorSize = 512) {
   return new Promise((resolve) => {
     const { icat } = getEnginePaths();
     if (!icat || !/^[0-9]+(?:-[0-9]+-[0-9]+)?$/.test(String(inode))) {
       resolve(null);
       return;
     }
-    const sectorOffset = Math.max(0, Math.floor((partOffsetBytes || 0) / 512));
+    const sec = Math.max(512, Number(sectorSize) || 512);
+    const sectorOffset = Math.max(0, Math.floor((partOffsetBytes || 0) / sec));
     const args = [];
+    if (sec !== 512) args.push('-b', String(sec));
     if (sectorOffset > 0) args.push('-o', String(sectorOffset));
     args.push('-r', devicePath, String(inode));
 
@@ -897,6 +1026,9 @@ async function ffmpegRepairVideoFile(srcPath, dstPath, options = {}) {
 }
 
 module.exports = {
+  isProcessElevatedSync,
+  getCandidateEngineDirs,
+  findBinary,
   getEnginePaths,
   getEngineCapabilitiesSync,
   checkWindowsIsAdmin,

@@ -531,6 +531,25 @@ export const ExplorerInspector: React.FC<ExplorerInspectorProps> = ({
                         ? 'Deleted (NTFS Journal History)'
                         : 'Deleted · Recoverable'}
                 </div>
+                {(focusedFile.ntfsEncrypted || focusedFile.ntfsCompressed || focusedFile.sizeEstimated) && (
+                  <div className="flex flex-wrap gap-1 mt-1.5">
+                    {focusedFile.ntfsEncrypted && (
+                      <span className="px-1.5 py-0.5 rounded bg-rose-500/15 border border-rose-500/30 text-[10px] text-rose-200">
+                        NTFS Encrypted (EFS)
+                      </span>
+                    )}
+                    {focusedFile.ntfsCompressed && (
+                      <span className="px-1.5 py-0.5 rounded bg-amber-500/15 border border-amber-500/30 text-[10px] text-amber-200">
+                        NTFS Compressed
+                      </span>
+                    )}
+                    {focusedFile.sizeEstimated && (
+                      <span className="px-1.5 py-0.5 rounded bg-sky-500/15 border border-sky-500/30 text-[10px] text-sky-200">
+                        Estimated Size
+                      </span>
+                    )}
+                  </div>
+                )}
               </div>
 
               <div>
@@ -638,7 +657,7 @@ export const ExplorerInspector: React.FC<ExplorerInspectorProps> = ({
 
               {focusedFile.discoveryCrc32 !== undefined && (
                 <div>
-                  <div className="text-slate-400 text-[11px]">Discovery CRC-32</div>
+                  <div className="text-slate-400 text-[11px]">64 KiB Discovery CRC-32</div>
                   <div className="text-emerald-300 font-mono mt-0.5 tabular-nums">
                     0x{focusedFile.discoveryCrc32.toString(16).padStart(8, '0').toUpperCase()}
                   </div>
@@ -988,6 +1007,13 @@ export const ExplorerInspector: React.FC<ExplorerInspectorProps> = ({
   const sectorSlice = diskBytes.subarray(sectorOffset, sectorOffset + analysis.sectorSize);
   const isLost = focusedPartition?.status === 'Deleted / Lost';
 
+  const canRestoreMbr =
+    isLost &&
+    Boolean(focusedPartition) &&
+    analysis.arch !== 'EFI GPT' &&
+    diskBytes.length >= analysis.diskSizeBytes &&
+    diskBytes.length > 0;
+
   return (
     <aside className="w-72 xl:w-[304px] shrink-0 bg-[#1E2129] border-l border-[#2A2E39] flex flex-col relative">
       <div className="flex-1 overflow-y-auto p-4 pb-16 space-y-4 animate-row-fade">
@@ -999,17 +1025,29 @@ export const ExplorerInspector: React.FC<ExplorerInspectorProps> = ({
 
         <button
           type="button"
+          disabled={isLost && Boolean(focusedPartition) && !canRestoreMbr}
           onClick={() => {
             if (isLost && focusedPartition) {
-              onRestorePartitionToMbr(focusedPartition);
+              if (canRestoreMbr) onRestorePartitionToMbr(focusedPartition);
             } else {
               setShowHex((v) => !v);
             }
           }}
-          className="w-full py-2 px-4 rounded-md text-xs font-medium bg-[#2B303C] hover:bg-[#343B49] text-slate-100 transition-colors"
+          title={
+            isLost && focusedPartition && !canRestoreMbr
+              ? analysis.arch === 'EFI GPT'
+                ? 'MBR partition restore is disabled on EFI GPT disks'
+                : 'MBR partition export is available only for full in-memory disk images'
+              : undefined
+          }
+          className="w-full py-2 px-4 rounded-md text-xs font-medium bg-[#2B303C] hover:bg-[#343B49] disabled:opacity-45 disabled:cursor-not-allowed text-slate-100 transition-colors"
         >
           {isLost && focusedPartition
-            ? 'Restore Partition'
+            ? canRestoreMbr
+              ? 'Restore Partition'
+              : analysis.arch === 'EFI GPT'
+                ? 'GPT Disk (Inspect & Recover Files)'
+                : 'Streamed Drive (Recover Files Directly)'
             : showHex
               ? 'Hide Sector Hex'
               : 'Inspect Sector Hex'}
@@ -1134,7 +1172,7 @@ export const ExplorerInspector: React.FC<ExplorerInspectorProps> = ({
       <button
         type="button"
         onClick={() => {
-          if (isLost && focusedPartition) {
+          if (isLost && focusedPartition && canRestoreMbr) {
             onRestorePartitionToMbr(focusedPartition);
           } else {
             setShowHex((v) => !v);

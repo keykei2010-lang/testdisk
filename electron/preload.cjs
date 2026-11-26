@@ -19,6 +19,7 @@ contextBridge.exposeInMainWorld('desktopBridge', {
   scanFolder: (folderPath) => ipcRenderer.invoke('win:scan-folder', folderPath),
   scanRecycleBin: () => ipcRenderer.invoke('win:scan-recycle-bin'),
   scanDesktop: () => ipcRenderer.invoke('win:scan-desktop'),
+  scanLostPartitions: (params) => ipcRenderer.invoke('win:scan-lost-partitions', params),
   startDriveScan: (params) => ipcRenderer.invoke('win:start-drive-scan', params),
   pauseDriveScan: (scanId) => ipcRenderer.invoke('win:pause-drive-scan', scanId),
   resumeDriveScan: (scanId) => ipcRenderer.invoke('win:resume-drive-scan', scanId),

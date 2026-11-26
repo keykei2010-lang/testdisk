@@ -41,6 +41,7 @@ export interface IdentifyResult {
   matchedOffset: number;
   matchedLength: number;
   calculatedSize: number | null;
+  sizeEstimated?: boolean;
   status: 'OK' | 'OK_TRUNCATED' | 'HEADER_ONLY';
   metadata: IdentifyMetadata;
 }
@@ -58,6 +59,7 @@ export interface CarvedFile {
   sector: number;
   size: number;
   calculatedSize: number | null;
+  sizeEstimated?: boolean;
   status: 'OK' | 'OK_TRUNCATED';
   metadata: IdentifyMetadata;
   data: Uint8Array;
@@ -1654,6 +1656,7 @@ export function identifyBuffer(
         matchedOffset: 0,
         matchedLength: 8,
         calculatedSize: buf.length,
+        sizeEstimated: true,
         status: 'HEADER_ONLY',
         metadata: { subExtension: def.extension, details: `OLE2 Compound (${def.extension.toUpperCase()})` },
       };
@@ -1701,6 +1704,7 @@ export function identifyBuffer(
       matchedOffset: 0,
       matchedLength: 3,
       calculatedSize: buf.length,
+      sizeEstimated: true,
       status: 'HEADER_ONLY',
       metadata: { details: `Deflate stream (FLG=0x${buf[3].toString(16).padStart(2, '0')})` },
     };
@@ -1727,6 +1731,7 @@ export function identifyBuffer(
       matchedOffset: 0,
       matchedLength: 6,
       calculatedSize: buf.length,
+      sizeEstimated: true,
       status: 'HEADER_ONLY',
       metadata: { details: buf[6] === 0x01 ? 'RAR5 format' : 'RAR4 format' },
     };
@@ -1748,6 +1753,7 @@ export function identifyBuffer(
       matchedOffset: 0,
       matchedLength: 16,
       calculatedSize: calc > 0 ? calc : buf.length,
+      sizeEstimated: calc <= 0,
       status: calc > 0 && calc <= buf.length ? 'OK' : calc > buf.length ? 'OK_TRUNCATED' : 'HEADER_ONLY',
       metadata: { details: `Page size ${pageSize} B · ${pageCount} pages` },
     };
@@ -1844,6 +1850,7 @@ export function identifyBuffer(
       matchedOffset: 0,
       matchedLength: 3,
       calculatedSize: buf.length,
+      sizeEstimated: true,
       status: 'HEADER_ONLY',
       metadata: { details: `ID3v2.${buf[3]} tag (${tagSize} B)` },
     };
@@ -1861,6 +1868,7 @@ export function identifyBuffer(
       matchedOffset: 0,
       matchedLength: 4,
       calculatedSize: buf.length,
+      sizeEstimated: true,
       status: 'HEADER_ONLY',
       metadata: { details: 'FLAC lossless audio stream' },
     };
@@ -1878,6 +1886,7 @@ export function identifyBuffer(
       matchedOffset: 0,
       matchedLength: 4,
       calculatedSize: buf.length,
+      sizeEstimated: true,
       status: 'HEADER_ONLY',
       metadata: { details: 'Ogg bitstream page container' },
     };
@@ -1896,6 +1905,7 @@ export function identifyBuffer(
       matchedOffset: 0,
       matchedLength: 4,
       calculatedSize: buf.length,
+      sizeEstimated: true,
       status: 'HEADER_ONLY',
       metadata: { details: `ELF ${elfClass} binary` },
     };
@@ -1915,6 +1925,7 @@ export function identifyBuffer(
         matchedOffset: 0,
         matchedLength: 2,
         calculatedSize: buf.length,
+        sizeEstimated: true,
         status: 'HEADER_ONLY',
         metadata: { details: `PE/COFF header @ +0x${peOff.toString(16)}` },
       };
@@ -1939,6 +1950,7 @@ export function identifyBuffer(
           matchedOffset: 0,
           matchedLength: 6,
           calculatedSize: buf.length,
+          sizeEstimated: true,
           status: 'HEADER_ONLY',
           metadata: { width: w, height: h, details: `Photoshop ${w}x${h} px (${id.toUpperCase()})` },
         };
@@ -1964,6 +1976,7 @@ export function identifyBuffer(
         matchedOffset: 0,
         matchedLength: 4,
         calculatedSize: calc > 512 ? Math.min(calc, 500 * MB) : buf.length,
+        sizeEstimated: calc <= 512,
         status: calc > 512 && calc <= buf.length ? 'OK' : calc > buf.length ? 'OK_TRUNCATED' : 'HEADER_ONLY',
         metadata: { details: `Outlook ${id.toUpperCase()} (NDB v${wVer})` },
       };
@@ -1982,6 +1995,7 @@ export function identifyBuffer(
       matchedOffset: 0,
       matchedLength: 4,
       calculatedSize: buf.length,
+      sizeEstimated: true,
       status: 'HEADER_ONLY',
       metadata: { subExtension: docType, details: `EBML Matroska (${docType.toUpperCase()})` },
     };
@@ -1998,6 +2012,7 @@ export function identifyBuffer(
       matchedOffset: 0,
       matchedLength: 6,
       calculatedSize: buf.length,
+      sizeEstimated: true,
       status: 'HEADER_ONLY',
       metadata: { details: `AutoCAD ${readAscii(buf, 0, 6)}` },
     };
@@ -2014,6 +2029,7 @@ export function identifyBuffer(
       matchedOffset: 0,
       matchedLength: 7,
       calculatedSize: buf.length,
+      sizeEstimated: true,
       status: 'HEADER_ONLY',
       metadata: { details: `Blender ${readAscii(buf, 9, 3)} project` },
     };
@@ -2047,6 +2063,7 @@ export function identifyBuffer(
       matchedOffset: 0,
       matchedLength: 7,
       calculatedSize: buf.length,
+      sizeEstimated: true,
       status: 'HEADER_ONLY',
       metadata: { details: `Ren'Py Archive (${readAscii(buf, 0, 7)})` },
     };
@@ -2063,6 +2080,7 @@ export function identifyBuffer(
       matchedOffset: 0,
       matchedLength: 10,
       calculatedSize: buf.length,
+      sizeEstimated: true,
       status: 'HEADER_ONLY',
       metadata: { details: "Ren'Py Compiled RPC2 Script" },
     };
@@ -2079,6 +2097,7 @@ export function identifyBuffer(
       matchedOffset: 0,
       matchedLength: 8,
       calculatedSize: buf.length,
+      sizeEstimated: true,
       status: 'HEADER_ONLY',
       metadata: { details: 'Windows XML Event Log' },
     };
@@ -2095,6 +2114,7 @@ export function identifyBuffer(
       matchedOffset: 0,
       matchedLength: 8,
       calculatedSize: Math.min(buf.length, 65536),
+      sizeEstimated: true,
       status: 'OK',
       metadata: { details: 'Windows Shell Shortcut (.lnk)' },
     };
@@ -2102,22 +2122,22 @@ export function identifyBuffer(
 
   if (isEnabled('pcap') && buf.length >= 24 && ((buf[0] === 0xd4 && buf[1] === 0xc3 && buf[2] === 0xb2 && buf[3] === 0xa1) || (buf[0] === 0xa1 && buf[1] === 0xb2 && buf[2] === 0xc3 && buf[3] === 0xd4))) {
     const def = FORMAT_MAP.get('pcap')!;
-    return { formatId: 'pcap', extension: 'pcap', description: def.description, family: def.family, mimeType: def.mimeType, matchedOffset: 0, matchedLength: 4, calculatedSize: buf.length, status: 'HEADER_ONLY', metadata: { details: 'libpcap Network Capture' } };
+    return { formatId: 'pcap', extension: 'pcap', description: def.description, family: def.family, mimeType: def.mimeType, matchedOffset: 0, matchedLength: 4, calculatedSize: buf.length, sizeEstimated: true, status: 'HEADER_ONLY', metadata: { details: 'libpcap Network Capture' } };
   }
 
   if (isEnabled('pcapng') && buf.length >= 12 && buf[0] === 0x0a && buf[1] === 0x0d && buf[2] === 0x0d && buf[3] === 0x0a) {
     const def = FORMAT_MAP.get('pcapng')!;
-    return { formatId: 'pcapng', extension: 'pcapng', description: def.description, family: def.family, mimeType: def.mimeType, matchedOffset: 0, matchedLength: 4, calculatedSize: buf.length, status: 'HEADER_ONLY', metadata: { details: 'PCAP-NG Network Capture' } };
+    return { formatId: 'pcapng', extension: 'pcapng', description: def.description, family: def.family, mimeType: def.mimeType, matchedOffset: 0, matchedLength: 4, calculatedSize: buf.length, sizeEstimated: true, status: 'HEADER_ONLY', metadata: { details: 'PCAP-NG Network Capture' } };
   }
 
   if (isEnabled('flv') && buf.length >= 9 && buf[0] === 0x46 && buf[1] === 0x4c && buf[2] === 0x56 && buf[3] === 0x01) {
     const def = FORMAT_MAP.get('flv')!;
-    return { formatId: 'flv', extension: 'flv', description: def.description, family: def.family, mimeType: def.mimeType, matchedOffset: 0, matchedLength: 4, calculatedSize: buf.length, status: 'HEADER_ONLY', metadata: { details: 'Adobe Flash Video' } };
+    return { formatId: 'flv', extension: 'flv', description: def.description, family: def.family, mimeType: def.mimeType, matchedOffset: 0, matchedLength: 4, calculatedSize: buf.length, sizeEstimated: true, status: 'HEADER_ONLY', metadata: { details: 'Adobe Flash Video' } };
   }
 
   if ((isEnabled('wmv') || isEnabled('wma')) && buf.length >= 30 && buf[0] === 0x30 && buf[1] === 0x26 && buf[2] === 0xb2 && buf[3] === 0x75 && buf[4] === 0x8e && buf[5] === 0x66 && buf[6] === 0xcf && buf[7] === 0x11) {
     const def = FORMAT_MAP.get('wmv')!;
-    return { formatId: 'wmv', extension: 'wmv', description: def.description, family: def.family, mimeType: def.mimeType, matchedOffset: 0, matchedLength: 8, calculatedSize: buf.length, status: 'HEADER_ONLY', metadata: { details: 'Microsoft ASF / WMV Stream' } };
+    return { formatId: 'wmv', extension: 'wmv', description: def.description, family: def.family, mimeType: def.mimeType, matchedOffset: 0, matchedLength: 8, calculatedSize: buf.length, sizeEstimated: true, status: 'HEADER_ONLY', metadata: { details: 'Microsoft ASF / WMV Stream' } };
   }
 
   if (isEnabled('cab') && buf.length >= 36 && readAscii(buf, 0, 4) === 'MSCF' && readUint32LE(buf, 8) > 36) {
@@ -2128,64 +2148,64 @@ export function identifyBuffer(
 
   if (isEnabled('zst') && buf.length >= 8 && buf[0] === 0x28 && buf[1] === 0xb5 && buf[2] === 0x2f && buf[3] === 0xfd) {
     const def = FORMAT_MAP.get('zst')!;
-    return { formatId: 'zst', extension: 'zst', description: def.description, family: def.family, mimeType: def.mimeType, matchedOffset: 0, matchedLength: 4, calculatedSize: buf.length, status: 'HEADER_ONLY', metadata: { details: 'Zstandard Frame Stream' } };
+    return { formatId: 'zst', extension: 'zst', description: def.description, family: def.family, mimeType: def.mimeType, matchedOffset: 0, matchedLength: 4, calculatedSize: buf.length, sizeEstimated: true, status: 'HEADER_ONLY', metadata: { details: 'Zstandard Frame Stream' } };
   }
 
   if (isEnabled('xz') && buf.length >= 12 && buf[0] === 0xfd && buf[1] === 0x37 && buf[2] === 0x7a && buf[3] === 0x58 && buf[4] === 0x5a && buf[5] === 0x00) {
     const def = FORMAT_MAP.get('xz')!;
-    return { formatId: 'xz', extension: 'xz', description: def.description, family: def.family, mimeType: def.mimeType, matchedOffset: 0, matchedLength: 6, calculatedSize: buf.length, status: 'HEADER_ONLY', metadata: { details: 'XZ / LZMA2 Archive' } };
+    return { formatId: 'xz', extension: 'xz', description: def.description, family: def.family, mimeType: def.mimeType, matchedOffset: 0, matchedLength: 6, calculatedSize: buf.length, sizeEstimated: true, status: 'HEADER_ONLY', metadata: { details: 'XZ / LZMA2 Archive' } };
   }
 
   if (isEnabled('bz2') && buf.length >= 10 && buf[0] === 0x42 && buf[1] === 0x5a && buf[2] === 0x68 && buf[3] >= 0x31 && buf[3] <= 0x39) {
     const def = FORMAT_MAP.get('bz2')!;
-    return { formatId: 'bz2', extension: 'bz2', description: def.description, family: def.family, mimeType: def.mimeType, matchedOffset: 0, matchedLength: 3, calculatedSize: buf.length, status: 'HEADER_ONLY', metadata: { details: `Bzip2 Block Level ${String.fromCharCode(buf[3])}` } };
+    return { formatId: 'bz2', extension: 'bz2', description: def.description, family: def.family, mimeType: def.mimeType, matchedOffset: 0, matchedLength: 3, calculatedSize: buf.length, sizeEstimated: true, status: 'HEADER_ONLY', metadata: { details: `Bzip2 Block Level ${String.fromCharCode(buf[3])}` } };
   }
 
   if (isEnabled('tar') && buf.length >= 512 && readAscii(buf, 257, 5) === 'ustar') {
     const def = FORMAT_MAP.get('tar')!;
-    return { formatId: 'tar', extension: 'tar', description: def.description, family: def.family, mimeType: def.mimeType, matchedOffset: 257, matchedLength: 5, calculatedSize: buf.length, status: 'HEADER_ONLY', metadata: { details: 'POSIX USTAR Tape Archive' } };
+    return { formatId: 'tar', extension: 'tar', description: def.description, family: def.family, mimeType: def.mimeType, matchedOffset: 257, matchedLength: 5, calculatedSize: buf.length, sizeEstimated: true, status: 'HEADER_ONLY', metadata: { details: 'POSIX USTAR Tape Archive' } };
   }
 
   if (isEnabled('exr') && buf.length >= 8 && buf[0] === 0x76 && buf[1] === 0x2f && buf[2] === 0x31 && buf[3] === 0x01) {
     const def = FORMAT_MAP.get('exr')!;
-    return { formatId: 'exr', extension: 'exr', description: def.description, family: def.family, mimeType: def.mimeType, matchedOffset: 0, matchedLength: 4, calculatedSize: buf.length, status: 'HEADER_ONLY', metadata: { details: 'OpenEXR High Dynamic Range' } };
+    return { formatId: 'exr', extension: 'exr', description: def.description, family: def.family, mimeType: def.mimeType, matchedOffset: 0, matchedLength: 4, calculatedSize: buf.length, sizeEstimated: true, status: 'HEADER_ONLY', metadata: { details: 'OpenEXR High Dynamic Range' } };
   }
 
   if (isEnabled('dds') && buf.length >= 128 && readAscii(buf, 0, 4) === 'DDS ' && readUint32LE(buf, 4) === 124) {
     const def = FORMAT_MAP.get('dds')!;
-    return { formatId: 'dds', extension: 'dds', description: def.description, family: def.family, mimeType: def.mimeType, matchedOffset: 0, matchedLength: 8, calculatedSize: buf.length, status: 'HEADER_ONLY', metadata: { width: readUint32LE(buf, 16), height: readUint32LE(buf, 12), details: 'DirectDraw Surface Texture' } };
+    return { formatId: 'dds', extension: 'dds', description: def.description, family: def.family, mimeType: def.mimeType, matchedOffset: 0, matchedLength: 8, calculatedSize: buf.length, sizeEstimated: true, status: 'HEADER_ONLY', metadata: { width: readUint32LE(buf, 16), height: readUint32LE(buf, 12), details: 'DirectDraw Surface Texture' } };
   }
 
   if (isEnabled('otf') && buf.length >= 12 && readAscii(buf, 0, 4) === 'OTTO') {
     const def = FORMAT_MAP.get('otf')!;
-    return { formatId: 'otf', extension: 'otf', description: def.description, family: def.family, mimeType: def.mimeType, matchedOffset: 0, matchedLength: 4, calculatedSize: buf.length, status: 'HEADER_ONLY', metadata: { details: 'OpenType CFF Font' } };
+    return { formatId: 'otf', extension: 'otf', description: def.description, family: def.family, mimeType: def.mimeType, matchedOffset: 0, matchedLength: 4, calculatedSize: buf.length, sizeEstimated: true, status: 'HEADER_ONLY', metadata: { details: 'OpenType CFF Font' } };
   }
 
   if ((isEnabled('woff') || isEnabled('woff2')) && buf.length >= 12 && (readAscii(buf, 0, 4) === 'wOFF' || readAscii(buf, 0, 4) === 'wOF2')) {
     const id = readAscii(buf, 0, 4) === 'wOF2' ? 'woff2' : 'woff';
     const def = FORMAT_MAP.get(id)!;
     const calc = readUint32BE(buf, 8);
-    return { formatId: id, extension: id, description: def.description, family: def.family, mimeType: def.mimeType, matchedOffset: 0, matchedLength: 4, calculatedSize: calc || buf.length, status: calc && calc <= buf.length ? 'OK' : 'OK_TRUNCATED', metadata: { details: `${id.toUpperCase()} Web Font` } };
+    return { formatId: id, extension: id, description: def.description, family: def.family, mimeType: def.mimeType, matchedOffset: 0, matchedLength: 4, calculatedSize: calc || buf.length, sizeEstimated: !calc, status: calc && calc <= buf.length ? 'OK' : 'OK_TRUNCATED', metadata: { details: `${id.toUpperCase()} Web Font` } };
   }
 
   if (isEnabled('ts') && buf.length >= 564 && buf[0] === 0x47 && buf[188] === 0x47 && buf[376] === 0x47) {
     const def = FORMAT_MAP.get('ts')!;
-    return { formatId: 'ts', extension: 'ts', description: def.description, family: def.family, mimeType: def.mimeType, matchedOffset: 0, matchedLength: 1, calculatedSize: buf.length, status: 'HEADER_ONLY', metadata: { details: 'MPEG-2 Transport Stream (188-byte sync)' } };
+    return { formatId: 'ts', extension: 'ts', description: def.description, family: def.family, mimeType: def.mimeType, matchedOffset: 0, matchedLength: 1, calculatedSize: buf.length, sizeEstimated: true, status: 'HEADER_ONLY', metadata: { details: 'MPEG-2 Transport Stream (188-byte sync)' } };
   }
 
   if (isEnabled('rtf') && buf.length >= 8 && readAscii(buf, 0, 6) === '{\\rtf1') {
     const def = FORMAT_MAP.get('rtf')!;
-    return { formatId: 'rtf', extension: 'rtf', description: def.description, family: def.family, mimeType: def.mimeType, matchedOffset: 0, matchedLength: 6, calculatedSize: buf.length, status: 'OK', metadata: { details: 'Rich Text Format Document' } };
+    return { formatId: 'rtf', extension: 'rtf', description: def.description, family: def.family, mimeType: def.mimeType, matchedOffset: 0, matchedLength: 6, calculatedSize: buf.length, sizeEstimated: true, status: 'HEADER_ONLY', metadata: { details: 'Rich Text Format Document' } };
   }
 
   if (isEnabled('torrent') && buf.length >= 16 && readAscii(buf, 0, 11) === 'd8:announce') {
     const def = FORMAT_MAP.get('torrent')!;
-    return { formatId: 'torrent', extension: 'torrent', description: def.description, family: def.family, mimeType: def.mimeType, matchedOffset: 0, matchedLength: 11, calculatedSize: buf.length, status: 'OK', metadata: { details: 'BitTorrent Metainfo' } };
+    return { formatId: 'torrent', extension: 'torrent', description: def.description, family: def.family, mimeType: def.mimeType, matchedOffset: 0, matchedLength: 11, calculatedSize: buf.length, sizeEstimated: true, status: 'HEADER_ONLY', metadata: { details: 'BitTorrent Metainfo' } };
   }
 
   if (isEnabled('kdbx') && buf.length >= 12 && buf[0] === 0x03 && buf[1] === 0xd9 && buf[2] === 0xa2 && buf[3] === 0x9a) {
     const def = FORMAT_MAP.get('kdbx')!;
-    return { formatId: 'kdbx', extension: 'kdbx', description: def.description, family: def.family, mimeType: def.mimeType, matchedOffset: 0, matchedLength: 4, calculatedSize: buf.length, status: 'HEADER_ONLY', metadata: { details: 'KeePass Password Database' } };
+    return { formatId: 'kdbx', extension: 'kdbx', description: def.description, family: def.family, mimeType: def.mimeType, matchedOffset: 0, matchedLength: 4, calculatedSize: buf.length, sizeEstimated: true, status: 'HEADER_ONLY', metadata: { details: 'KeePass Password Database' } };
   }
 
   // 19. Printable UTF-8 / JSON / XML / AEPX / RPY / EML
@@ -2245,6 +2265,7 @@ export function identifyBuffer(
           matchedOffset: 0,
           matchedLength: 0,
           calculatedSize: buf.length,
+          sizeEstimated: true,
           status: 'OK',
           metadata: { details: `${buf.length} bytes printable text` },
         };
@@ -2252,7 +2273,7 @@ export function identifyBuffer(
     }
   }
 
-  // 19b. Windows UTF-16LE Text / INI / REG / Log (adapted from apfs-excavate orphan_post.c)
+  // 19b. Windows UTF-16LE Text / INI / REG / Log
   if (isEnabled('txt') && buf.length >= 8) {
     const hasUtf16Bom = buf[0] === 0xff && buf[1] === 0xfe;
     const samplePairs = Math.min(256, Math.floor(buf.length / 2));
@@ -2275,6 +2296,7 @@ export function identifyBuffer(
         matchedOffset: 0,
         matchedLength: hasUtf16Bom ? 2 : 0,
         calculatedSize: buf.length,
+        sizeEstimated: true,
         status: 'OK',
         metadata: { details: `${buf.length} bytes UTF-16LE text` },
       };
@@ -2407,15 +2429,18 @@ export function carveDiskBuffer(
             sector,
             size: clampedSize,
             calculatedSize: match.calculatedSize,
-            status: effectiveTruncated ? 'OK_TRUNCATED' : 'OK',
+            sizeEstimated: Boolean(match.sizeEstimated),
+            status: effectiveTruncated || match.sizeEstimated ? 'OK_TRUNCATED' : 'OK',
             metadata: match.metadata,
             data: carvedData,
             discoveryCrc32,
           });
 
           fileIndex++;
-          // Advance past the carved file aligned to blockSize (just like PhotoRec)
-          const alignedAdvance = Math.max(step, Math.ceil(clampedSize / step) * step);
+          // Only jump past files with verified structural bounds; for guessed HEADER_ONLY caps, step forward by 1 block (#9)
+          const alignedAdvance = match.sizeEstimated
+            ? step
+            : Math.max(step, Math.ceil(clampedSize / step) * step);
           cursor += alignedAdvance;
           continue;
         }
@@ -2598,7 +2623,8 @@ export async function carveDiskBufferAsync(
             sector,
             size: clampedSize,
             calculatedSize: match.calculatedSize,
-            status: effectiveTruncated ? 'OK_TRUNCATED' : 'OK',
+            sizeEstimated: Boolean(match.sizeEstimated),
+            status: effectiveTruncated || match.sizeEstimated ? 'OK_TRUNCATED' : 'OK',
             metadata: match.metadata,
             data: carvedData,
             discoveryCrc32,
@@ -2623,7 +2649,9 @@ export async function carveDiskBufferAsync(
             flushBatch();
           }
 
-          const alignedAdvance = Math.max(step, Math.ceil(clampedSize / step) * step);
+          const alignedAdvance = match.sizeEstimated
+            ? step
+            : Math.max(step, Math.ceil(clampedSize / step) * step);
           cursor += alignedAdvance;
           stepsSinceYield += 1;
           if (stepsSinceYield >= 400) {

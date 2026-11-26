@@ -4,7 +4,7 @@ export interface UsnJournalEntry {
   parentRecord: number;
   filename: string;
   reconstructedPath: string;
-  timestampMs: number;
+  timestampMs?: number;
   reasonFlags: number;
   isDirectory: boolean;
   isDelete: boolean;
@@ -16,14 +16,14 @@ export const USN_REASON_FILE_DELETE = 0x00000200;
 export const USN_REASON_RENAME_OLD_NAME = 0x00001000;
 export const USN_REASON_CLOSE = 0x80000000;
 
-function filetimeToUnixMs(dv: DataView, pos: number): number {
-  if (pos + 8 > dv.byteLength) return Date.now();
+function filetimeToUnixMs(dv: DataView, pos: number): number | undefined {
+  if (pos + 8 > dv.byteLength) return undefined;
   const lo = dv.getUint32(pos, true);
   const hi = dv.getUint32(pos + 4, true);
   const ticks = hi * 4294967296 + lo;
-  if (ticks <= 0) return Date.now();
+  if (ticks <= 0) return undefined;
   const ms = Math.floor(ticks / 10000 - WINDOWS_EPOCH_DIFF_MS);
-  return ms > 0 ? ms : Date.now();
+  return ms > 0 ? ms : undefined;
 }
 
 function decodeUtf16Le(buf: Uint8Array, pos: number, byteLen: number): string {
@@ -106,7 +106,7 @@ export function parseUsnJournalBuffer(
     let fileRef: number;
     let parentRef: number;
     let usn: number;
-    let tsMs: number;
+    let tsMs: number | undefined;
     let reason: number;
     let fileAttrs: number;
     let fnLen: number;

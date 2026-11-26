@@ -548,13 +548,27 @@ export function analyzeDiskImage(diskName: string, disk: Uint8Array): DiskAnalys
 }
 
 /**
- * Writes selected partitions (up to 4 primary) back into Sector 0 MBR (TestDisk "Write" equivalent)
+ * Writes selected partitions (up to 4 primary) back into Sector 0 MBR
  * and returns a patched Uint8Array copy ready for download or re-analysis.
+ * Refuses to overwrite EFI GPT disks to prevent corrupting GPT partition layouts.
  */
 export function writeMbrPartitionTable(
   originalDisk: Uint8Array,
   selectedPartitions: PartitionEntry[],
+  sectorSize = 512,
 ): Uint8Array {
+  const sec = sectorSize === 4096 ? 4096 : 512;
+  if (originalDisk.length >= sec + 8 && ascii(originalDisk, sec, 8) === 'EFI PART') {
+    throw new Error('Cannot write MBR partition table onto an EFI GPT disk.');
+  }
+  if (originalDisk.length >= 512 && originalDisk[510] === 0x55 && originalDisk[511] === 0xaa) {
+    for (let i = 0; i < 4; i++) {
+      if (originalDisk[0x1be + i * 16 + 4] === 0xee) {
+        throw new Error('Cannot write MBR partition table onto an EFI GPT protective MBR disk.');
+      }
+    }
+  }
+
   const patched = originalDisk.slice();
   // Clear 4 MBR partition slots (0x1BE .. 0x1FD)
   for (let i = 0x1be; i < 0x1fe; i++) {

@@ -4,6 +4,8 @@ import { PartitionEntry } from '../engine/partitions';
 
 interface LostPartitionsModalProps {
   lostPartitions: PartitionEntry[];
+  canRestoreMbr?: boolean;
+  restoreDisabledReason?: string;
   onInspectLostPartition: (partition: PartitionEntry) => void;
   onRestoreToMbr: (partition: PartitionEntry) => void;
   onClose: () => void;
@@ -11,6 +13,8 @@ interface LostPartitionsModalProps {
 
 export const LostPartitionsModal: React.FC<LostPartitionsModalProps> = ({
   lostPartitions,
+  canRestoreMbr = true,
+  restoreDisabledReason,
   onInspectLostPartition,
   onRestoreToMbr,
   onClose,
@@ -48,7 +52,6 @@ export const LostPartitionsModal: React.FC<LostPartitionsModalProps> = ({
             </p>
           </div>
 
-          {/* Crisp vector partition tree illustration matching EaseUS modal */}
           <div className="mx-auto w-60 rounded-lg bg-[#181B22] border border-[#2D3342] p-4 shadow-inner">
             <div className="space-y-2.5">
               <div className="flex items-center gap-2">
@@ -96,18 +99,26 @@ export const LostPartitionsModal: React.FC<LostPartitionsModalProps> = ({
               >
                 Inspect in Path View
               </button>
-              <span className="text-slate-600">·</span>
-              <button
-                type="button"
-                onClick={() => {
-                  onRestoreToMbr(primaryLost);
-                  onClose();
-                }}
-                className="inline-flex items-center gap-1 text-[#60A5FA] hover:underline"
-              >
-                <Wrench className="w-3 h-3" />
-                Restore Partition to MBR
-              </button>
+              {canRestoreMbr ? (
+                <>
+                  <span className="text-slate-600">·</span>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      onRestoreToMbr(primaryLost);
+                      onClose();
+                    }}
+                    className="inline-flex items-center gap-1 text-[#60A5FA] hover:underline"
+                  >
+                    <Wrench className="w-3 h-3" />
+                    Restore Partition to MBR
+                  </button>
+                </>
+              ) : restoreDisabledReason ? (
+                <span className="text-slate-500" title={restoreDisabledReason}>
+                  · {restoreDisabledReason}
+                </span>
+              ) : null}
             </div>
           </div>
         </div>

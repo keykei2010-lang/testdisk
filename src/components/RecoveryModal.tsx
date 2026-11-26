@@ -100,7 +100,10 @@ export const RecoveryModal: React.FC<RecoveryModalProps> = ({
   const [enableFileRepair, setEnableFileRepair] = useState<boolean>(true);
   const [referenceVideoName, setReferenceVideoName] = useState<string | null>(null);
   const [referenceVideoBytes, setReferenceVideoBytes] = useState<Uint8Array | null>(null);
-  const [includeRepairedImg, setIncludeRepairedImg] = useState<boolean>(!!repairedDiskBytes);
+  const [keepOriginalOnRepair, setKeepOriginalOnRepair] = useState<boolean>(true);
+  const [allowUnverifiedDestination, setAllowUnverifiedDestination] = useState<boolean>(false);
+  const [unverifiedPrompt, setUnverifiedPrompt] = useState<boolean>(false);
+  const [includeRepairedImg, setIncludeRepairedImg] = useState<boolean>(!!repairedDiskBytes && !scannedDevicePath);
   const [saving, setSaving] = useState<boolean>(false);
   const [resultMessage, setResultMessage] = useState<string | null>(null);
   const [reportPath, setReportPath] = useState<string | null>(null);
@@ -111,8 +114,13 @@ export const RecoveryModal: React.FC<RecoveryModalProps> = ({
     const letters = new Set<string>();
     const fromScanned = extractDriveLetter(scannedDevicePath);
     if (fromScanned) letters.add(fromScanned);
-    const firstItemDrive = extractDriveLetter(items[0]?.sourceRef?.devicePath);
-    if (firstItemDrive) letters.add(firstItemDrive);
+    for (let i = 0; i < items.length; i++) {
+      const dev = items[i]?.sourceRef?.devicePath;
+      const dl = extractDriveLetter(dev);
+      if (dl) letters.add(dl);
+      const origDl = extractDriveLetter(items[i]?.originalPath);
+      if (origDl) letters.add(origDl);
+    }
     // Physical drive labels look like "Samsung SSD 980 (C:, D:)"
     const parenMatch = diskName.match(/\(([^)]+)\)/);
     if (parenMatch) {
@@ -285,11 +293,17 @@ export const RecoveryModal: React.FC<RecoveryModalProps> = ({
           });
         }
 
+        setUnverifiedPrompt(false);
         const res = await desktop.recoverFilesToFolder({
           destinationDir: selectedRootDir,
           scannedDevicePath: scannedDevicePath ?? undefined,
+          keepOriginalOnRepair,
+          allowUnverifiedDestination,
           items: reqItems,
         });
+        if (res.unverifiedDestination) {
+          setUnverifiedPrompt(true);
+        }
         if (res.error) {
           setErrorMessage(res.error);
         } else if (!res.canceled) {
@@ -297,6 +311,7 @@ export const RecoveryModal: React.FC<RecoveryModalProps> = ({
           const extras: string[] = [];
           if ((res.verifiedCount ?? 0) > 0) extras.push(`${res.verifiedCount} CRC-verified`);
           if (res.repairedCount > 0) extras.push(`${res.repairedCount} repaired`);
+          if ((res.originalKeptCount ?? 0) > 0) extras.push(`${res.originalKeptCount} untouched originals preserved`);
           const extraNote = extras.length > 0 ? ` (${extras.join(', ')})` : '';
           setResultMessage(
             `Saved ${res.savedCount} file(s) to "${res.destinationDir}"${extraNote}.`,
@@ -428,6 +443,9 @@ export const RecoveryModal: React.FC<RecoveryModalProps> = ({
             if (want <= 0) continue;
             if (run.offset >= 0) {
               const part = await desktop.readDiskBytes(item.sourceRef.devicePath, run.offset, want);
+              if (part.length < want) {
+                throw new Error(`Short read assembling ${item.filename} (${part.length} < ${want} B).`);
+              }
               assembled.set(part.subarray(0, want), cursor);
             }
             cursor += want;
@@ -673,13 +691,25 @@ export const RecoveryModal: React.FC<RecoveryModalProps> = ({
               </div>
             </div>
 
-            {repairedDiskBytes && (
+            {repairedDiskBytes && !scannedDevicePath && (
               <label className="flex items-center justify-between px-2 pt-1 text-[11px] text-slate-300 cursor-pointer">
                 <span>Include repaired partition table (.img)</span>
                 <input
                   type="checkbox"
                   checked={includeRepairedImg}
                   onChange={(e) => setIncludeRepairedImg(e.target.checked)}
+                  className="accent-[#3A7AFE]"
+                />
+              </label>
+            )}
+
+            {enableFileRepair && (
+              <label className="flex items-center justify-between px-2 pt-1 text-[11px] text-slate-300 cursor-pointer">
+                <span>Also keep untouched original (.orig) alongside repaired copy</span>
+                <input
+                  type="checkbox"
+                  checked={keepOriginalOnRepair}
+                  onChange={(e) => setKeepOriginalOnRepair(e.target.checked)}
                   className="accent-[#3A7AFE]"
                 />
               </label>
@@ -724,6 +754,16 @@ export const RecoveryModal: React.FC<RecoveryModalProps> = ({
             </div>
           )}
 
+          {scannedDevicePath && (
+            <div className="flex items-start gap-2 text-[11px] text-slate-300 bg-[#181B22] border border-[#2D3342] rounded-md px-3 py-2">
+              <AlertTriangle className="w-3.5 h-3.5 text-amber-400 shrink-0 mt-0.5" />
+              <span>
+                SSD / NVMe TRIM notice: Operating systems zero trimmed blocks shortly after deletion;
+                files showing high zero-fill or CRC mismatch cannot be reconstructed after TRIM.
+              </span>
+            </div>
+          )}
+
           {resultMessage && (
             <div className="space-y-1.5 text-xs text-emerald-300 bg-emerald-500/10 border border-emerald-500/30 rounded-md px-3 py-2 animate-slide-down">
               <div className="flex items-center gap-2">
@@ -750,15 +790,26 @@ export const RecoveryModal: React.FC<RecoveryModalProps> = ({
               ))}
               {failures.length > 6 && (
                 <div className="text-[11px] text-amber-300">
-                  +{failures.length - 6} more (see TestDisk-Recovery-Report.txt)
+                  +{failures.length - 6} more (see Recovery-Audit-Report.txt)
                 </div>
               )}
             </div>
           )}
 
           {errorMessage && (
-            <div className="text-xs text-amber-300 bg-amber-500/10 border border-amber-500/30 rounded-md px-3 py-2">
-              {errorMessage}
+            <div className="text-xs text-amber-300 bg-amber-500/10 border border-amber-500/30 rounded-md px-3 py-2 space-y-2">
+              <div>{errorMessage}</div>
+              {unverifiedPrompt && (
+                <label className="flex items-center gap-2 text-[11px] text-amber-100 cursor-pointer pt-1 border-t border-amber-500/25">
+                  <input
+                    type="checkbox"
+                    checked={allowUnverifiedDestination}
+                    onChange={(e) => setAllowUnverifiedDestination(e.target.checked)}
+                    className="accent-[#3A7AFE]"
+                  />
+                  <span>I verified this destination is not on the scanned PhysicalDrive — allow write</span>
+                </label>
+              )}
             </div>
           )}
 

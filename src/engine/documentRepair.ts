@@ -252,7 +252,7 @@ export function repairZipContainerBuffer(raw: Uint8Array, ext = 'zip'): NonMedia
     const entryName = new TextDecoder().decode(nameBytes);
 
     let dataEnd = dataStart + compSize;
-    let usedDescriptor = false;
+    let descriptorNextPos = -1;
 
     if ((flags & 0x08) !== 0 && compSize === 0) {
       // Streaming data descriptor: scan until PK\x07\x08 or next PK\x03\x04 / PK\x01\x02
@@ -268,7 +268,7 @@ export function repairZipContainerBuffer(raw: Uint8Array, ext = 'zip'): NonMedia
         compSize = readU32LE(raw, descPos + 8);
         uncompSize = readU32LE(raw, descPos + 12);
         dataEnd = Math.min(bound, dataStart + compSize);
-        usedDescriptor = true;
+        descriptorNextPos = Math.max(descPos + 16, dataEnd);
       } else {
         dataEnd = bound;
         compSize = Math.max(0, dataEnd - dataStart);
@@ -291,7 +291,6 @@ export function repairZipContainerBuffer(raw: Uint8Array, ext = 'zip'): NonMedia
       const fixedXml = closeTruncatedXmlOrHtml(txt, false);
       if (fixedXml.closedCount > 0) {
         payload = new TextEncoder().encode(fixedXml.text);
-        compSize = payload.length;
         uncompSize = payload.length;
         crc = computeCrc32(payload, 0, payload.length);
       }
@@ -300,7 +299,6 @@ export function repairZipContainerBuffer(raw: Uint8Array, ext = 'zip'): NonMedia
     if (method === 0 && payload.length > 0 && crc === 0) {
       crc = computeCrc32(payload, 0, payload.length);
       uncompSize = payload.length;
-      compSize = payload.length;
     }
 
     // Rewrite clean local file header without broken data-descriptor flag so Central Directory offsets stay exact
@@ -330,7 +328,7 @@ export function repairZipContainerBuffer(raw: Uint8Array, ext = 'zip'): NonMedia
     });
 
     outOffset += localChunk.length;
-    cursor = usedDescriptor ? Math.max(dataEnd + 16, dataStart + compSize + 16) : dataEnd;
+    cursor = descriptorNextPos !== -1 ? descriptorNextPos : dataEnd;
   }
 
   if (entries.length === 0) {
@@ -381,7 +379,7 @@ export function repairZipContainerBuffer(raw: Uint8Array, ext = 'zip'): NonMedia
   return {
     repaired: true,
     data: rebuilt,
-    note: `Rebuilt ${ext.toUpperCase()} ZIP Central Directory + EOCD (${entries.length} entry${entries.length === 1 ? '' : 'ies'}${clampedEntries > 0 ? `, clamped ${clampedEntries} truncated` : ''}).`,
+    note: `Rebuilt ${ext.toUpperCase()} ZIP Central Directory + EOCD (${entries.length} ${entries.length === 1 ? 'entry' : 'entries'}${clampedEntries > 0 ? `, clamped ${clampedEntries} truncated` : ''}).`,
   };
 }
 
@@ -547,7 +545,7 @@ export function repairPsdBuffer(raw: Uint8Array): NonMediaRepairResult {
     return { repaired: false, data: raw, note: `Photoshop ${version === 2 ? 'PSB' : 'PSD'} header sections intact.` };
   }
   return {
-    repaired: fixedSections > 0 || Boolean(salvagedPreview),
+    repaired: fixedSections > 0,
     data: out,
     salvagedPreviewBytes: salvagedPreview ?? undefined,
     note:
@@ -708,7 +706,7 @@ export function repairOle2Buffer(raw: Uint8Array, ext = 'doc'): NonMediaRepairRe
     return { repaired: false, data: raw, note: `${ext.toUpperCase()} OLE2 compound sectors intact.` };
   }
   return {
-    repaired: padded > 0 || clampedFat || Boolean(salvagedPreview),
+    repaired: padded > 0 || clampedFat,
     data: out,
     salvagedPreviewBytes: salvagedPreview ?? undefined,
     note:
@@ -872,7 +870,10 @@ export function repairStructuredTextBuffer(raw: Uint8Array, ext: string): NonMed
         return {
           repaired: true,
           data: new TextEncoder().encode(repairedText),
-          note: `Repaired truncated JSON structure (closed ${stack.length} open container${stack.length === 1 ? '' : 's'}).`,
+          note:
+            stack.length > 0
+              ? `Repaired truncated JSON structure (closed ${stack.length} open container${stack.length === 1 ? '' : 's'}).`
+              : 'Repaired truncated JSON string or trailing syntax.',
         };
       } catch {
         // fallback if cleanup at least stripped slack

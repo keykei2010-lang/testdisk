@@ -220,7 +220,7 @@ function scanFat32Partition(
             c = next;
           }
           const covered = extents.reduce((s, e) => s + e.length, 0);
-          if (isDeletedEntry && covered < fileSize) overwritten = true;
+          if (isDeletedEntry || covered < fileSize) overwritten = true;
         } else {
           let rem = fileSize;
           for (let ci = 0; ci < neededClusters && rem > 0; ci++) {
@@ -294,8 +294,10 @@ function scanExfatPartition(
   const fatOffsetSec = dv.getUint32(80, true);
   const clusterHeapSec = dv.getUint32(88, true);
   const rootCluster = dv.getUint32(96, true) || 4;
-  const bps = 1 << Math.min(12, Math.max(9, disk[volStart + 108] || 9));
-  const spc = 1 << Math.min(25, disk[volStart + 109] || 3);
+  const bpsRaw = disk[volStart + 108];
+  const spcRaw = disk[volStart + 109];
+  const bps = 1 << (bpsRaw >= 9 && bpsRaw <= 12 ? bpsRaw : 9);
+  const spc = 1 << (spcRaw <= 25 ? spcRaw : 3);
   const clusterBytes = bps * spc;
 
   const fatStart = volStart + fatOffsetSec * bps;

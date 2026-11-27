@@ -161,7 +161,8 @@ export const MediaRepairLab: React.FC<MediaRepairLabProps> = ({ onOpenUnknownFil
           detectedExt === 'bin');
       const ext = (keepFilenameContainerExt ? fileExt : detectedExt || fileExt || 'mp4').toLowerCase();
       const diag = diagnoseMediaFile(ext, head);
-      const nativePath = (file as File & { path?: string }).path;
+      const nativePath =
+        desktop?.getPathForFile?.(file) ?? (file as File & { path?: string }).path;
 
       staged.push({
         id: `mrl-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
@@ -362,7 +363,7 @@ export const MediaRepairLab: React.FC<MediaRepairLabProps> = ({ onOpenUnknownFil
     }
 
     if (desktop && item.nativePath) {
-      await desktop.repairMediaFile({
+      const res = await desktop.repairMediaFile({
         filename: item.file.name,
         extension: item.extension,
         filePath: item.nativePath,
@@ -370,6 +371,30 @@ export const MediaRepairLab: React.FC<MediaRepairLabProps> = ({ onOpenUnknownFil
         allowTranscodeFallback: allowTranscode,
         saveWithDialog: true,
       });
+      if (res && !res.canceled) {
+        if (!res.ok) {
+          setItems((prev) =>
+            prev.map((x) =>
+              x.id === item.id
+                ? {
+                    ...x,
+                    status:
+                      res.tier === 'exif-preview' && x.salvagedPreviewBytes ? 'repaired' : 'failed',
+                    resultNote: res.error || res.note || 'Unable to save repaired file.',
+                  }
+                : x,
+            ),
+          );
+        } else if (res.outputPath) {
+          setItems((prev) =>
+            prev.map((x) =>
+              x.id === item.id
+                ? { ...x, resultNote: `${res.note} · Saved to ${res.outputPath}` }
+                : x,
+            ),
+          );
+        }
+      }
     }
   };
 
@@ -647,7 +672,9 @@ export const MediaRepairLab: React.FC<MediaRepairLabProps> = ({ onOpenUnknownFil
                       Save Preview JPEG
                     </button>
                   )}
-                  {item.status === 'repaired' && (item.repairedBytes || (desktop && item.nativePath)) ? (
+                  {item.status === 'repaired' &&
+                  (item.repairedBytes ||
+                    (desktop && item.nativePath && item.tierLabel !== 'exif-preview')) ? (
                     <button
                       type="button"
                       onClick={() => void handleSaveItem(item)}

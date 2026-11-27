@@ -65,20 +65,37 @@ function extractDriveLetter(pathStr?: string | null): string | null {
   return m ? m[1].toUpperCase() : null;
 }
 
+function sanitizeFsSegment(name: string, fallback = '_'): string {
+  const noCtrl = Array.from(name, (ch) => (ch.charCodeAt(0) < 32 ? '_' : ch)).join('');
+  const cleaned = noCtrl
+    .replace(/[<>:"/\\|?*]/g, '_')
+    .replace(/[. ]+$/g, '')
+    .trim();
+  if (!cleaned || cleaned === '.' || cleaned === '..') return fallback;
+  return cleaned;
+}
+
 function makeUniqueArchivePath(folder: string, filename: string, used: Set<string>): string {
-  const basePath = `${folder}/${filename}`;
+  const cleanFile = sanitizeFsSegment(filename, 'recovered_file');
+  const cleanFolder = folder
+    .split('/')
+    .map((s) => s.trim())
+    .filter((s) => Boolean(s) && s !== '.' && s !== '..')
+    .map((s) => sanitizeFsSegment(s))
+    .join('/') || 'Recovered';
+  const basePath = `${cleanFolder}/${cleanFile}`;
   if (!used.has(basePath)) {
     used.add(basePath);
     return basePath;
   }
-  const dot = filename.lastIndexOf('.');
-  const stem = dot > 0 ? filename.slice(0, dot) : filename;
-  const ext = dot > 0 ? filename.slice(dot) : '';
+  const dot = cleanFile.lastIndexOf('.');
+  const stem = dot > 0 ? cleanFile.slice(0, dot) : cleanFile;
+  const ext = dot > 0 ? cleanFile.slice(dot) : '';
   let idx = 2;
-  while (used.has(`${folder}/${stem}_${idx}${ext}`)) {
+  while (used.has(`${cleanFolder}/${stem}_${idx}${ext}`)) {
     idx++;
   }
-  const unique = `${folder}/${stem}_${idx}${ext}`;
+  const unique = `${cleanFolder}/${stem}_${idx}${ext}`;
   used.add(unique);
   return unique;
 }
@@ -196,19 +213,21 @@ export const RecoveryModal: React.FC<RecoveryModalProps> = ({
 
   const resolveOutputFolder = (item: RecoverableItem) => {
     if (folderLayout === 'type') {
-      return `${item.family}/${item.extension}`;
+      const fam = sanitizeFsSegment(item.family, 'Others');
+      const ext = sanitizeFsSegment(item.extension, 'bin');
+      return `${fam}/${ext}`;
     }
     if (item.originalPath && item.originalPath.includes('\\')) {
-      const stripped = item.originalPath
+      const segments = item.originalPath
         .replace(/^(FAT32|exFAT|NTFS)\s+/i, '')
         .replace(/^[A-Za-z]:\\/, '')
         .split(/[\\/]/)
         .slice(0, -1)
-        .filter(Boolean)
-        .join('/');
-      if (stripped) return stripped;
+        .filter((s) => Boolean(s) && s !== '.' && s !== '..')
+        .map((s) => sanitizeFsSegment(s));
+      if (segments.length > 0) return segments.join('/');
     }
-    return item.partitionName.replace(/[^a-zA-Z0-9._-]/g, '_');
+    return sanitizeFsSegment(item.partitionName, 'Partition');
   };
 
   const handleSave = async () => {
@@ -397,8 +416,10 @@ export const RecoveryModal: React.FC<RecoveryModalProps> = ({
           }
 
           const uniquePath = makeUniqueArchivePath(folder, outName, usedPaths);
-          const uniqueFilename = uniquePath.slice(folder.length + 1);
-          const parts = folder.split('/').filter(Boolean);
+          const lastSlash = uniquePath.lastIndexOf('/');
+          const uniqueFolder = lastSlash >= 0 ? uniquePath.slice(0, lastSlash) : folder;
+          const uniqueFilename = lastSlash >= 0 ? uniquePath.slice(lastSlash + 1) : uniquePath;
+          const parts = uniqueFolder.split('/').filter(Boolean);
           let curDir = rootHandle;
           for (const part of parts) {
             curDir = await curDir.getDirectoryHandle(part, { create: true });
@@ -408,8 +429,9 @@ export const RecoveryModal: React.FC<RecoveryModalProps> = ({
             const dot = uniqueFilename.lastIndexOf('.');
             const stem = dot > 0 ? uniqueFilename.slice(0, dot) : uniqueFilename;
             const ext = dot > 0 ? uniqueFilename.slice(dot) : '';
-            const origUniquePath = makeUniqueArchivePath(folder, `${stem}_original${ext}`, usedPaths);
-            const origUniqueName = origUniquePath.slice(folder.length + 1);
+            const origUniquePath = makeUniqueArchivePath(uniqueFolder, `${stem}_original${ext}`, usedPaths);
+            const origSlash = origUniquePath.lastIndexOf('/');
+            const origUniqueName = origSlash >= 0 ? origUniquePath.slice(origSlash + 1) : origUniquePath;
             const origHandle = await curDir.getFileHandle(origUniqueName, { create: true });
             const origWritable = await origHandle.createWritable();
             await origWritable.write(untouchedPayload.slice().buffer);

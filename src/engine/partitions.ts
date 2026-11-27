@@ -204,7 +204,7 @@ export function probeFilesystemAtOffset(disk: Uint8Array, offset: number): BootS
     const spc = disk[offset + 13];
     const totalSectors = u64le(disk, offset + 40);
     const mftCluster = u64le(disk, offset + 48);
-    if (bps >= 512 && bps <= 4096 && spc > 0) {
+    if ([512, 1024, 2048, 4096].includes(bps) && spc > 0) {
       return {
         filesystem: 'NTFS',
         label: 'NTFS Volume',
@@ -224,17 +224,21 @@ export function probeFilesystemAtOffset(disk: Uint8Array, offset: number): BootS
     ascii(disk, offset + 3, 8) === 'EXFAT   '
   ) {
     const volLen = u64le(disk, offset + 72);
-    const bps = 1 << disk[offset + 108];
-    const spc = 1 << disk[offset + 109];
-    return {
-      filesystem: 'exFAT',
-      label: 'exFAT Volume',
-      oemOrVersion: 'EXFAT   ',
-      bytesPerSector: bps,
-      sectorsPerCluster: spc,
-      totalSectors: volLen,
-      details: `Cluster ${bps * spc} B`,
-    };
+    const bpsShift = disk[offset + 108];
+    const spcShift = disk[offset + 109];
+    if (bpsShift >= 9 && bpsShift <= 12 && spcShift <= 25 && volLen > 0) {
+      const bps = 1 << bpsShift;
+      const spc = 1 << spcShift;
+      return {
+        filesystem: 'exFAT',
+        label: 'exFAT Volume',
+        oemOrVersion: 'EXFAT   ',
+        bytesPerSector: bps,
+        sectorsPerCluster: spc,
+        totalSectors: volLen,
+        details: `Cluster ${bps * spc} B`,
+      };
+    }
   }
 
   // 3. FAT32 / FAT16 / FAT12 BPB
@@ -466,6 +470,42 @@ export function analyzeDiskImage(diskName: string, disk: Uint8Array): DiskAnalys
   }
 
   const basePartitions = isGpt && gptPartitions.length > 0 ? gptPartitions : mbrEntries;
+
+  // Support partitionless superfloppy / logical volume images starting at LBA 0
+  if (basePartitions.length === 0 && totalSectors > 0) {
+    const lba0Probe = probeFilesystemAtOffset(disk, 0);
+    if (lba0Probe) {
+      const clampedSectors = Math.min(lba0Probe.totalSectors || totalSectors, totalSectors);
+      const typeMap: Record<string, { code: string; name: string }> = {
+        FAT32: { code: '0x0C', name: 'FAT32 LBA' },
+        FAT16: { code: '0x06', name: 'FAT16' },
+        FAT12: { code: '0x01', name: 'FAT12' },
+        NTFS: { code: '0x07', name: 'HPFS - NTFS' },
+        exFAT: { code: '0x07', name: 'exFAT' },
+        ext2: { code: '0x83', name: 'Linux' },
+        ext3: { code: '0x83', name: 'Linux' },
+        ext4: { code: '0x83', name: 'Linux' },
+        BitLocker: { code: '0x07', name: 'BitLocker FVE' },
+      };
+      const t = typeMap[lba0Probe.filesystem] ?? { code: '0x83', name: lba0Probe.filesystem };
+      basePartitions.push({
+        id: 'vol-0',
+        order: 1,
+        bootable: false,
+        status: 'Primary',
+        typeCode: t.code,
+        typeName: t.name,
+        startLba: 0,
+        endLba: Math.max(0, clampedSectors - 1),
+        sectors: clampedSectors,
+        sizeBytes: clampedSectors * sectorSize,
+        startOffset: 0,
+        name: lba0Probe.label,
+        detectedFs: lba0Probe,
+        selectedForRestore: false,
+      });
+    }
+  }
 
   // TestDisk "Analyse" deep sector scan for deleted / unmapped filesystems
   const discoveredLost: PartitionEntry[] = [];

@@ -1,5 +1,10 @@
 const fs = require('node:fs');
-const { detectSectorSizeSync, readAlignedSync, normalizeSectorSize } = require('./alignedIoCjs.cjs');
+const {
+  detectSectorSizeSync,
+  readAlignedSync,
+  normalizeSectorSize,
+  FATAL_IO_ERRNOS,
+} = require('./alignedIoCjs.cjs');
 
 // IEEE 802.3 CRC-32 for PNG chunk verification & recalculation
 const CRC_TABLE = new Uint32Array(256);
@@ -980,8 +985,8 @@ function repairMp4StreamingFileCjs(srcPath, dstPath, referenceBuf) {
             const lenHdr = Buffer.allocUnsafe(4);
             for (let idx = 0; idx < scOffsets.length; idx++) {
               const nStart = scOffsets[idx].p + scOffsets[idx].l;
-              const nEnd = idx + 1 < scOffsets.length ? scOffsets[idx + 1].p : span.end;
-              const nLen = nEnd - nStart;
+              const nEnd = idx + 1 < scOffsets.length ? scOffsets[idx + 1].p : scanLim;
+              const nLen = Math.min(nEnd - nStart, 64 * 1024 * 1024);
               if (nLen <= 0) continue;
               lenHdr.writeUInt32BE(nLen >>> 0, 0);
               fs.writeSync(dstFd, lenHdr);
@@ -1612,18 +1617,33 @@ function stitchFragmentedVideosFromFdCjs(devicePath, results, limitBytes, blockS
       let activeEnd = -1;
       let sawMoovAtEnd = false;
 
+      let badReadStreak = 0;
       for (let pos = searchStart; pos + step <= searchEnd; pos += step) {
         if (insideNonVid(pos)) {
           if (activeStart !== -1) { runs.push({ offset: activeStart, length: activeEnd - activeStart }); activeStart = -1; }
           continue;
         }
         let n = 0;
+        let sectorErr = null;
         try {
           n = readAlignedSync(fd, secBuf, 0, step, pos, sectorSize);
-        } catch {
+        } catch (err) {
+          sectorErr = err;
           n = 0;
         }
+        if (sectorErr) {
+          if (FATAL_IO_ERRNOS && FATAL_IO_ERRNOS.has(sectorErr.code)) break;
+          if (activeStart !== -1) {
+            runs.push({ offset: activeStart, length: activeEnd - activeStart });
+            activeStart = -1;
+            if (runs.length >= 16) break;
+          }
+          badReadStreak++;
+          if (badReadStreak >= 32) break;
+          continue;
+        }
         if (n < 64) break;
+        badReadStreak = 0;
         const probe = scoreVideoClusterCjs(secBuf.subarray(0, n));
         if (probe.isVideo) {
           if (activeStart === -1) activeStart = pos;

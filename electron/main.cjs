@@ -596,15 +596,23 @@ function detectVolumesFromDisk(fd, limitBytes, sectorSizeHint) {
     }
 
     if (oem === 'EXFAT   ') {
-      const bps = 1 << Math.min(12, Math.max(9, boot[108] || 9));
-      const spc = 1 << Math.min(25, boot[109] || 3);
+      const bpsShift = boot[108] >= 9 && boot[108] <= 12 ? boot[108] : 9;
+      const spcShift = boot[109] <= 25 ? boot[109] : 3;
+      const bps = 1 << bpsShift;
+      const spc = 1 << spcShift;
+      const clusterBytes = bps * spc;
+      const heapOffset = startByte + boot.readUInt32LE(88) * bps;
+      const rootCluster = boot.readUInt32LE(96) || 4;
+      const rootDirOffset = heapOffset + (rootCluster - 2) * clusterBytes;
       seenStarts.add(startByte);
       volumes.push({
         fsType: 'exfat',
         volStart: startByte,
         volEnd: Math.min(limitBytes, startByte + totalBytesFromTable),
-        clusterBytes: bps * spc,
+        clusterBytes,
         sectorSize: Math.max(detectedSecSize, bps),
+        heapOffset,
+        rootDirOffset,
         bootBuf: boot,
       });
       return;
@@ -1092,7 +1100,11 @@ function scanFat32VolumeFromFd(fd, devicePath, vol, limitBytes, includeExisting 
             if (next === 0 || next >= 0x0ffffff8) break;
             c = next;
           }
-          if (extents.reduce((s, e) => s + e.length, 0) < fileSize) overwritten = true;
+          // On deleted FAT32 files, directory deletion zeroes FAT entries; any remaining non-zero FAT entry
+          // at firstCluster means the cluster chain has already been reallocated to another file.
+          if (isDeleted || extents.reduce((s, e) => s + e.length, 0) < fileSize) {
+            overwritten = true;
+          }
         } else {
           let rem = fileSize;
           for (let ci = 0; ci < needed && rem > 0 && extents.length < 4096; ci++) {
@@ -1171,8 +1183,10 @@ function scanExfatVolumeFromFd(fd, devicePath, vol, limitBytes, includeExisting 
   if (!boot) return out;
 
   const sectorSize = vol.sectorSize || 512;
-  const bps = 1 << Math.min(12, Math.max(9, boot[108] || 9));
-  const spc = 1 << Math.min(25, boot[109] || 3);
+  const bpsShift = boot[108] >= 9 && boot[108] <= 12 ? boot[108] : 9;
+  const spcShift = boot[109] <= 25 ? boot[109] : 3;
+  const bps = 1 << bpsShift;
+  const spc = 1 << spcShift;
   const clusterBytes = bps * spc;
   const fatStart = vol.volStart + boot.readUInt32LE(80) * bps;
   const heapStart = vol.volStart + boot.readUInt32LE(88) * bps;
@@ -1246,6 +1260,13 @@ function scanExfatVolumeFromFd(fd, devicePath, vol, limitBytes, includeExisting 
     const idx = c - 2;
     const bIdx = idx >>> 3;
     if (bIdx >= bitmap.length) return null;
+    if (bitmap.sectorValidity) {
+      const secIdx = bIdx >>> 9;
+      const valByteIdx = secIdx >>> 3;
+      if (valByteIdx >= bitmap.sectorValidity.length || (bitmap.sectorValidity[valByteIdx] & (1 << (secIdx & 7))) === 0) {
+        return null;
+      }
+    }
     return (bitmap[bIdx] & (1 << (idx & 7))) !== 0;
   };
 
@@ -2720,8 +2741,8 @@ function readDiskBytesDetailedFromFdSync(fd, startByte = 0, maxBytes = 64 * 1024
     const alignedToRead = Math.ceil(toRead / sectorSize) * sectorSize;
     const res = readAlignedResilientSync(fd, scratch, 0, Math.min(scratch.length, alignedToRead), diskCursor, sectorSize);
     const bytesRead = res.bytesRead;
-    badSectors += res.badSectors || 0;
-    badBytes += res.badBytes || 0;
+    badSectors += res.skippedSectors || 0;
+    badBytes += res.skippedBytes || 0;
     if (bytesRead <= 0) break;
 
     const srcOffset = firstChunk ? headTrim : 0;
@@ -3088,10 +3109,22 @@ function readExfatBitmapOnly(fd, exfatParts, limitBytes, sectorSizeHint = 0) {
   const result = [];
   const warnings = [];
   for (const part of exfatParts) {
-    const secSize = part.sectorSize || normalizeSectorSize(sectorSizeHint);
-    const clusterBytes = Math.max(512, part.clusterBytes || 4096);
-    const heapOff = Number(part.heapOffset || 0);
-    const rootOff = Number(part.rootDirOffset || 0);
+    let secSize = part.sectorSize || normalizeSectorSize(sectorSizeHint);
+    let clusterBytes = Math.max(512, part.clusterBytes || 4096);
+    let heapOff = Number(part.heapOffset || 0);
+    let rootOff = Number(part.rootDirOffset || 0);
+    if ((!heapOff || !rootOff) && part.bootBuf && part.bootBuf.length >= 110) {
+      const boot = part.bootBuf;
+      const bpsShift = boot[108] >= 9 && boot[108] <= 12 ? boot[108] : 9;
+      const spcShift = boot[109] <= 25 ? boot[109] : 3;
+      const bps = 1 << bpsShift;
+      const spc = 1 << spcShift;
+      clusterBytes = Math.max(512, bps * spc);
+      secSize = part.sectorSize || bps;
+      heapOff = Number(part.volStart || 0) + boot.readUInt32LE(88) * bps;
+      const rootCluster = boot.readUInt32LE(96) || 4;
+      rootOff = heapOff + (rootCluster - 2) * clusterBytes;
+    }
     if (!heapOff || !rootOff || rootOff >= limitBytes) continue;
 
     try {
@@ -3444,12 +3477,32 @@ if (app && typeof app.whenReady === 'function') {
             }
           } else if ((ext === 'wav' || ext === 'webp') && rawBuf.length >= 12) {
             const copy = Buffer.from(rawBuf);
-            copy.writeUInt32LE(Math.max(4, copy.length - 8) >>> 0, 4);
-            if (ext === 'wav' && copy.length >= 44) copy.writeUInt32LE(Math.max(0, copy.length - 44) >>> 0, 40);
-            fs.writeFileSync(tmpStruct, copy);
-            stagePath = tmpStruct;
-            structuralTier = 'structural-riff';
-            structuralNote = `Recalculated ${ext.toUpperCase()} RIFF payload length.`;
+            const expectedRiffSize = Math.max(4, copy.length - 8) >>> 0;
+            let riffChanged = copy.readUInt32LE(4) !== expectedRiffSize;
+            copy.writeUInt32LE(expectedRiffSize, 4);
+            if (ext === 'wav') {
+              let pos = 12;
+              while (pos + 8 <= copy.length) {
+                const chunkId = copy.toString('ascii', pos, pos + 4);
+                const chunkLen = copy.readUInt32LE(pos + 4);
+                if (chunkId === 'data') {
+                  const expectedDataLen = Math.max(0, copy.length - (pos + 8)) >>> 0;
+                  if (chunkLen !== expectedDataLen) {
+                    copy.writeUInt32LE(expectedDataLen, pos + 4);
+                    riffChanged = true;
+                  }
+                  break;
+                }
+                if (chunkLen === 0 && !/^[a-zA-Z0-9 _-]+$/.test(chunkId)) break;
+                pos += 8 + chunkLen + (chunkLen & 1);
+              }
+            }
+            if (riffChanged) {
+              fs.writeFileSync(tmpStruct, copy);
+              stagePath = tmpStruct;
+              structuralTier = 'structural-riff';
+              structuralNote = `Recalculated ${ext.toUpperCase()} RIFF payload length.`;
+            }
           } else if (ext === 'gif' && rawBuf.length >= 14 && rawBuf[rawBuf.length - 1] !== 0x3b) {
             fs.writeFileSync(tmpStruct, Buffer.concat([rawBuf, Buffer.from([0x3b])]));
             stagePath = tmpStruct;
@@ -3489,16 +3542,22 @@ if (app && typeof app.whenReady === 'function') {
           }
         }
 
-        if (finalTier === 'none') {
+        if (finalTier === 'none' || finalTier === 'raw-preview') {
           const isDocOrArchive = NON_MEDIA_REPAIR_EXTS_CJS.has(ext) && ext !== 'mp3' && ext !== 'flac';
+          const previewDataUrl = salvagedPreviewBuf
+            ? `data:image/jpeg;base64,${salvagedPreviewBuf.toString('base64')}`
+            : undefined;
           return {
             ok: false,
-            tier: 'none',
-            repairedSize: srcSize,
+            tier: finalTier === 'raw-preview' ? 'exif-preview' : 'none',
+            repairedSize: salvagedPreviewBuf ? salvagedPreviewBuf.length : srcSize,
+            previewDataUrl,
             salvagedPreviewBytes: salvagedPreviewBuf ? new Uint8Array(salvagedPreviewBuf) : undefined,
-            note: isDocOrArchive
-              ? `No structural patches needed or .${ext.toUpperCase()} stream cannot be rebuilt automatically (${Math.round(srcSize / 1024)} KiB).`
-              : 'Container could not be repaired automatically. Enable salvage re-encode or supply a healthy reference clip/photo.',
+            note: finalNote || (
+              isDocOrArchive
+                ? `No structural patches needed or .${ext.toUpperCase()} stream cannot be rebuilt automatically (${Math.round(srcSize / 1024)} KiB).`
+                : 'Container could not be repaired automatically. Enable salvage re-encode or supply a healthy reference clip/photo.'
+            ),
           };
         }
 
@@ -3514,8 +3573,11 @@ if (app && typeof app.whenReady === 'function') {
         }
 
         const finalSize = fs.statSync(finalPath).size;
+        const shouldSaveDialog = Boolean(
+          params.saveWithDialog || (params.saveWithDialogIfLarge && finalSize > 128 * 1024 * 1024),
+        );
         let outputPath;
-        if (params.saveWithDialog) {
+        if (shouldSaveDialog) {
           const cleanName = sanitizeWinFilename(params.filename || `repaired.${ext}`).replace(/(\.[^.]+)?$/, `_repaired.${ext}`);
           const res = await dialog.showSaveDialog({
             title: 'Save Repaired Media File',
@@ -3545,7 +3607,7 @@ if (app && typeof app.whenReady === 'function') {
         }
 
         const repairedBytes =
-          !params.saveWithDialog && finalSize <= 128 * 1024 * 1024
+          !shouldSaveDialog && finalSize <= 128 * 1024 * 1024
             ? new Uint8Array(fs.readFileSync(finalPath))
             : undefined;
 
@@ -4886,7 +4948,10 @@ async function recoverFilesImpl({ targetRoot, items, keepOriginalOnRepair = true
     try {
       srcFd = fs.openSync(item.devicePath, 'r');
       dstFd = fs.openSync(partialPath, 'w');
-      const sectorSize = detectSectorSizeSync(srcFd);
+      const sectorSize =
+        Number(item.sectorSize) > 0
+          ? normalizeSectorSize(Number(item.sectorSize))
+          : detectSectorSizeSync(srcFd);
       const headChunks = [];
       let totalWritten = 0;
       let badSectors = 0;

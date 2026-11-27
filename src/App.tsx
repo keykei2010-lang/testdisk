@@ -73,6 +73,7 @@ import {
   computeRecoveryLikelihood,
   formatShortDate,
   isNonMediaRepairableExtension,
+  isRepairableExplorerFile,
   repairFileBuffer,
   resolvePreferredExtension,
 } from './engine/recoveryHealth';
@@ -916,6 +917,11 @@ export const App: React.FC = () => {
 
   const startFreshScanState = (bytes: Uint8Array, scopePartitionId?: string | null) => {
     if (bytes.length === 0) return;
+    if (activeNativeScanIdRef.current) {
+      const staleId = activeNativeScanIdRef.current;
+      activeNativeScanIdRef.current = null;
+      void getDesktopBridge()?.cancelDriveScan(staleId).catch(() => {});
+    }
     setActiveScreen('explorer');
     setUseNativeScan(false);
     setSessionReadOnly(false);
@@ -1155,6 +1161,7 @@ export const App: React.FC = () => {
     setSkippedBadBytes(0);
     setNativeDiskTotalBytes(totalBytes || headBytes.length);
     setExtraLostPartitions([]);
+    setScanPartitionScope(null);
     setDiskName(label);
     setDiskBytes(headBytes);
     setRepairedDiskBytes(null);
@@ -1177,7 +1184,7 @@ export const App: React.FC = () => {
     });
 
     const unsubProgress = bridge.onDriveScanProgress((ev) => {
-      if (ev.scanId !== scanId) return;
+      if (ev.scanId !== scanId || activeNativeScanIdRef.current !== scanId) return;
       if (ev.phase) setScanPhase(ev.phase);
       if (ev.incomplete) setScanIncomplete(true);
       if (typeof ev.skippedSectors === 'number' && ev.skippedSectors > 0) {
@@ -1200,7 +1207,7 @@ export const App: React.FC = () => {
     });
 
     const unsubBatch = bridge.onDriveScanBatch((batchEv) => {
-      if (batchEv.scanId !== scanId || batchEv.entries.length === 0) return;
+      if (batchEv.scanId !== scanId || activeNativeScanIdRef.current !== scanId || batchEv.entries.length === 0) return;
       const incoming = batchEv.entries.map((e) =>
         mapNativeEntryToExplorerItem(e, resolveLocalPart),
       );
@@ -1669,7 +1676,8 @@ export const App: React.FC = () => {
       const readCap = Math.min(file.size, 32 * 1024 * 1024);
       const buf = new Uint8Array(await file.slice(0, readCap).arrayBuffer());
       const res = identifyBuffer(buf);
-      const nativePath = (file as File & { path?: string }).path;
+      const nativePath =
+        bridge?.getPathForFile?.(file) ?? (file as File & { path?: string }).path;
       if (!res && bridge && nativePath) {
         unknownPaths.push(nativePath);
       }
@@ -1834,8 +1842,15 @@ export const App: React.FC = () => {
           buffer: isNative ? undefined : sourceBytes,
           referenceBuffer: referenceBytes,
           allowTranscodeFallback: true,
+          saveWithDialogIfLarge: isNative,
         })
         .catch(() => null);
+
+      if (ipcRes?.canceled) return;
+      if (ipcRes && !ipcRes.ok && ipcRes.error) {
+        setLoadError(ipcRes.error);
+        return;
+      }
 
       if (ipcRes?.ok && ipcRes.repairedBytes) {
         repairedData =
@@ -1846,27 +1861,37 @@ export const App: React.FC = () => {
       } else if (ipcRes?.ok && isNative) {
         largeNativeHandledOnDisk = true;
         repairNote = ipcRes.note;
-        await bridge
-          .repairMediaFile({
-            filename: target.filename,
-            extension: target.extension,
-            sourceKind: target.sourceRef?.kind as 'native-file',
-            filePath:
-              target.sourceRef?.kind === 'native-file'
-                ? target.sourceRef.devicePath
-                : undefined,
-            devicePath: target.sourceRef?.devicePath,
-            offset: target.sourceRef?.offset,
-            size: target.sourceRef?.size,
-            runs: target.sourceRef?.runs,
-            tskInode: target.sourceRef?.tskInode,
-            tskOffset: target.sourceRef?.tskOffset,
-            sectorSize: target.sourceRef?.sectorSize,
-            referenceBuffer: referenceBytes,
-            allowTranscodeFallback: true,
-            saveWithDialog: true,
-          })
-          .catch(() => null);
+        if (ipcRes.outputPath) {
+          setMbrActionNotice(
+            `Repaired ${target.filename} and saved to "${ipcRes.outputPath}" (${ipcRes.note}).`,
+          );
+          const repairedSize = ipcRes.repairedSize || target.size;
+          const markRepaired = (list: ExplorerFileItem[]) =>
+            list.map((item) =>
+              item.id === target.id
+                ? {
+                    ...item,
+                    repaired: true,
+                    status: 'OK' as const,
+                    size: repairedSize,
+                    calculatedSize: repairedSize,
+                    sizeEstimated: false,
+                    sourceRef: {
+                      kind: 'native-file' as const,
+                      devicePath: ipcRes.outputPath!,
+                      offset: 0,
+                      size: repairedSize,
+                    },
+                    recoveryChance: Math.max(item.recoveryChance, 95),
+                    recoveryTier: 'high' as const,
+                    recoveryReason: `${ipcRes.note} · Saved to ${ipcRes.outputPath}`,
+                  }
+                : item,
+            );
+          setCarvedItems(markRepaired);
+          setLocationItems(markRepaired);
+          setFidentifyItems(markRepaired);
+        }
       }
     }
 
@@ -1938,7 +1963,7 @@ export const App: React.FC = () => {
     const bridge = getDesktopBridge();
     const outName = resolvePreferredExtension(item.filename, item.extension);
     if (
-      !item.repaired &&
+      (!item.repaired || item.data.byteLength < item.size) &&
       bridge &&
       item.sourceRef &&
       (item.sourceRef.kind === 'native-device' ||
@@ -1966,8 +1991,9 @@ export const App: React.FC = () => {
             ntfsEncrypted: item.ntfsEncrypted,
             extension: item.extension,
             repairIfTruncated:
-              item.status === 'OK_TRUNCATED' ||
-              (item.status === 'HEADER_ONLY' && isNonMediaRepairableExtension(item.extension)),
+              !item.repaired &&
+              (item.status === 'OK_TRUNCATED' ||
+                (item.status === 'HEADER_ONLY' && isNonMediaRepairableExtension(item.extension))),
             modifiedAtMs: item.modifiedAt,
           },
         ],
@@ -2286,6 +2312,12 @@ export const App: React.FC = () => {
         contentFingerprint: s.contentFingerprint,
         discoveryCrc32: s.discoveryCrc32,
       }));
+
+      if (activeNativeScanIdRef.current) {
+        const staleId = activeNativeScanIdRef.current;
+        activeNativeScanIdRef.current = null;
+        void getDesktopBridge()?.cancelDriveScan(staleId).catch(() => {});
+      }
 
       setActiveScreen('explorer');
       setUseNativeScan(false);
@@ -3464,8 +3496,10 @@ export const App: React.FC = () => {
           focusedPartition={focusedPartition}
           analysis={analysis}
           diskBytes={diskBytes}
+          scannedDevicePath={scannedDevicePath}
           onRestorePartitionToMbr={(p) => handleRestorePartitionToMbr(p)}
           onRepairFile={handleRepairFile}
+          onNotifyError={setLoadError}
           onBitLockerUnlocked={() => {
             if (nativeDriveTargetRef.current) {
               const t = nativeDriveTargetRef.current;
@@ -3792,7 +3826,7 @@ export const App: React.FC = () => {
             <Download className="w-3.5 h-3.5 text-emerald-400" />
             Save File Directly
           </button>
-          {contextMenu.item.status === 'OK_TRUNCATED' && !contextMenu.item.repaired && (
+          {isRepairableExplorerFile(contextMenu.item) && (
             <button
               type="button"
               onClick={() => {

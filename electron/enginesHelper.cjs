@@ -836,7 +836,7 @@ async function ffmpegRepairVideoFile(srcPath, dstPath, options = {}) {
     .replace(/^\./, '');
   const isMp4Family = ['mp4', 'mov', 'm4v', '3gp'].includes(ext);
   const isImage = ['jpg', 'jpeg', 'png', 'webp', 'bmp', 'gif', 'tif', 'tiff'].includes(ext);
-  const isRawImage = ['cr2', 'cr3', 'nef', 'arw', 'dng', 'orf', 'rw2'].includes(ext);
+  const isRawImage = ['cr2', 'cr3', 'nef', 'arw', 'dng', 'orf', 'rw2', 'raf', 'pef', 'srw', 'rwl', '3fr', 'iiq'].includes(ext);
   const isAudio = ['mp3', 'wav', 'aac', 'm4a', 'flac', 'ogg'].includes(ext);
 
   const validOut = (p) => fs.existsSync(p) && fs.statSync(p).size > 0;
@@ -997,7 +997,7 @@ async function ffmpegRepairVideoFile(srcPath, dstPath, options = {}) {
           note: `FFmpeg Tier 3 salvage re-encoded damaged ${ext.toUpperCase()} audio stream.`,
         };
       }
-    } else {
+    } else if (!isRawImage) {
       const vidArgs = [
         '-y',
         '-hide_banner',
@@ -1027,6 +1027,11 @@ async function ffmpegRepairVideoFile(srcPath, dstPath, options = {}) {
     }
   }
 
+  try {
+    if (dstPath && fs.existsSync(dstPath)) fs.unlinkSync(dstPath);
+  } catch {
+    // ignore partial output cleanup failure
+  }
   return { ok: false, tier: 'none', note: 'FFmpeg could not reconstruct a valid stream.' };
 }
 

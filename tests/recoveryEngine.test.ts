@@ -17,6 +17,7 @@ import {
   extractEmbeddedJpegPreview,
   formatCompactCount,
   formatShortDate,
+  isRepairableExplorerFile,
   repairAviBuffer,
   repairFileBuffer,
   repairJpegBuffer,
@@ -2339,6 +2340,491 @@ test('third-audit regressions: lost partitions IPC + sparse probe + early EOF + 
     fs.rmSync(tmpDir, { recursive: true, force: true });
   }
 });
+
+test('full audit regressions: EIO/ENODEV telemetry, exFAT spcShift=0 & sectorValidity, FAT32 reallocation, NTFS lowestVcn, partition probes, WAV/ZIP repair, and cross-chunk carving', async () => {
+  const cjsRequire = createRequire(import.meta.url);
+  const mainMod = cjsRequire('../electron/main.cjs');
+  const alignedIoMod = cjsRequire('../electron/alignedIoCjs.cjs');
+  const { scanRange } = cjsRequire('../electron/scannerWorker.cjs');
+
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'td-full-audit-'));
+  try {
+    // 1. readDiskBytesDetailedFromFdSync must report skippedSectors/skippedBytes -> badSectors/badBytes,
+    // and readAlignedResilientSync must rethrow device disconnect ENODEV/ENXIO instead of zero-filling.
+    const testBinPath = path.join(tmpDir, 'io_test.bin');
+    fs.writeFileSync(testBinPath, Buffer.alloc(4096, 0x41));
+    const fdIo = fs.openSync(testBinPath, 'r');
+    const origReadSync = fs.readSync;
+    try {
+      let phase = 'eio';
+      (fs as unknown as { readSync: typeof fs.readSync }).readSync = ((
+        fd: number,
+        buf: NodeJS.ArrayBufferView,
+        off: number,
+        len: number,
+        pos: number | null,
+      ) => {
+        if (fd === fdIo && phase === 'eio') {
+          if (len > 512 || pos === 1024) {
+            const err = Object.assign(new Error('I/O error'), { code: 'EIO' });
+            throw err;
+          }
+        }
+        if (fd === fdIo && phase === 'enodev') {
+          const err = Object.assign(new Error('No such device'), { code: 'ENODEV' });
+          throw err;
+        }
+        return origReadSync(fd, buf, off, len, pos);
+      }) as typeof fs.readSync;
+
+      const detailed = mainMod.readDiskBytesDetailedFromFdSync(fdIo, 0, 2048, 512);
+      assert.equal(detailed.badSectors, 1);
+      assert.equal(detailed.badBytes, 512);
+      assert.equal(detailed.buffer.length, 2048);
+
+      phase = 'enodev';
+      assert.throws(
+        () => alignedIoMod.readAlignedResilientSync(fdIo, Buffer.alloc(512), 0, 512, 0, 512),
+        (err: unknown) => Boolean(err && (err as { code?: string }).code === 'ENODEV'),
+      );
+    } finally {
+      fs.readSync = origReadSync;
+      fs.closeSync(fdIo);
+    }
+
+    // 2. exFAT spcShift === 0 (1 sector/cluster), detectVolumesFromDisk heapOffset/rootDirOffset,
+    // readExfatBitmapOnly fallback without precomputed offsets, and EIO sectorValidity masking.
+    const exfatBuf = Buffer.alloc(64 * 512, 0);
+    exfatBuf.write('EXFAT   ', 3, 'ascii');
+    exfatBuf.writeBigUInt64LE(64n, 72);
+    exfatBuf.writeUInt32LE(4, 80); // FAT @ sector 4
+    exfatBuf.writeUInt32LE(2, 84); // FAT len 2 sectors
+    exfatBuf.writeUInt32LE(8, 88); // heap @ sector 8
+    exfatBuf.writeUInt32LE(40, 92); // cluster count
+    exfatBuf.writeUInt32LE(2, 96); // root @ cluster 2 -> sector 8
+    exfatBuf[108] = 9; // 512 B/sec
+    exfatBuf[109] = 0; // spcShift === 0 -> 1 sec/cluster (512 B)
+    exfatBuf[510] = 0x55;
+    exfatBuf[511] = 0xaa;
+
+    // Root cluster 2 @ byte 4096 (sector 8): Allocation Bitmap (0x81) at cluster 3 (sector 9), len 512 B
+    const rootOff = 8 * 512;
+    exfatBuf[rootOff] = 0x81;
+    exfatBuf.writeUInt32LE(3, rootOff + 20);
+    exfatBuf.writeUInt32LE(512, rootOff + 24);
+    // Deleted file entry set (0x05 + 0x40 + 0x41) pointing to cluster 4 (byte 5120)
+    const delOff = rootOff + 32;
+    exfatBuf[delOff] = 0x05;
+    exfatBuf[delOff + 1] = 2; // 2 secondary entries
+    exfatBuf[delOff + 32] = 0x40;
+    exfatBuf[delOff + 33] = 0x02; // NoFatChain
+    exfatBuf[delOff + 35] = 5; // nameLen = 5 ("a.txt")
+    exfatBuf.writeUInt32LE(4, delOff + 52); // firstCluster = 4
+    exfatBuf.writeUInt32LE(12, delOff + 56); // size = 12
+    exfatBuf[delOff + 64] = 0x41;
+    Buffer.from('a.txt', 'utf16le').copy(exfatBuf, delOff + 66);
+    Buffer.from('EXFAT_SPCSHIFT0').subarray(0, 12).copy(exfatBuf, 10 * 512);
+
+    const exfatPath = path.join(tmpDir, 'exfat_spc0.img');
+    fs.writeFileSync(exfatPath, exfatBuf);
+    const exFd = fs.openSync(exfatPath, 'r');
+    try {
+      const vols = mainMod.detectVolumesFromDisk(exFd, exfatBuf.length, 512);
+      const exVol = vols.find((v: { fsType: string }) => v.fsType === 'exfat');
+      assert.ok(exVol);
+      assert.equal(exVol.clusterBytes, 512);
+      assert.equal(exVol.heapOffset, 4096);
+      assert.equal(exVol.rootDirOffset, 4096);
+
+      // Stripping heapOffset/rootDirOffset still works via bootBuf fallback in readExfatBitmapOnly
+      const bmOnly = mainMod.readExfatBitmapOnly(
+        exFd,
+        [{ volStart: 0, volEnd: exfatBuf.length, clusterBytes: exVol.clusterBytes, bootBuf: exVol.bootBuf }],
+        exfatBuf.length,
+        512,
+      );
+      assert.equal(bmOnly.bitmaps.length, 1);
+
+      // TS engine scanExfatPartition preserves spcShift === 0
+      const tsParts = analyzeDiskImage('exfat.img', new Uint8Array(exfatBuf)).partitions;
+      const tsExfat = scanFatAndExfatDeletedInBuffer(new Uint8Array(exfatBuf), tsParts);
+      assert.ok(tsExfat.some((r) => r.filename === 'a.txt' && r.fileSize === 12));
+
+      // When bitmap sector throws EIO, sectorValidity clears -> mftBitmapIntact becomes undefined
+      const origRead2 = fs.readSync;
+      (fs as unknown as { readSync: typeof fs.readSync }).readSync = ((
+        fd: number,
+        buf: NodeJS.ArrayBufferView,
+        off: number,
+        len: number,
+        pos: number | null,
+      ) => {
+        if (fd === exFd && pos === 9 * 512) {
+          throw Object.assign(new Error('Bitmap sector EIO'), { code: 'EIO' });
+        }
+        return origRead2(fd, buf, off, len, pos);
+      }) as typeof fs.readSync;
+      try {
+        const scannedEx = mainMod.scanExfatVolumeFromFd(exFd, exfatPath, exVol, exfatBuf.length, false, 100);
+        const recA = scannedEx.find((x: { filename: string }) => x.filename === 'a.txt');
+        assert.ok(recA);
+        assert.equal(recA.mftBitmapIntact, undefined);
+      } finally {
+        fs.readSync = origRead2;
+      }
+    } finally {
+      fs.closeSync(exFd);
+    }
+
+    // 3. FAT32 deleted single-cluster file whose FAT[firstCluster] is non-zero (reallocated) -> overwritten === true
+    const fatBuf = Buffer.alloc(64 * 512, 0);
+    fatBuf[0] = 0xeb;
+    fatBuf[1] = 0x58;
+    fatBuf[2] = 0x90;
+    fatBuf.write('MSDOS5.0', 3, 'ascii');
+    fatBuf.writeUInt16LE(512, 11); // bps
+    fatBuf[13] = 1; // spc = 1
+    fatBuf.writeUInt16LE(2, 14); // reserved = 2 sectors
+    fatBuf[16] = 1; // numFats = 1
+    fatBuf.writeUInt32LE(64, 32); // total sectors
+    fatBuf.writeUInt32LE(2, 36); // fatSz32 = 2 sectors (sectors 2..3)
+    fatBuf.writeUInt32LE(2, 44); // rootCluster = 2 (sector 4)
+    fatBuf.write('FAT32   ', 82, 'ascii');
+    fatBuf[510] = 0x55;
+    fatBuf[511] = 0xaa;
+    // FAT entries at byte 1024: cluster 2 EOC, cluster 3 EOC (reallocated to new active file!)
+    fatBuf.writeUInt32LE(0x0ffffff8, 1024 + 8);
+    fatBuf.writeUInt32LE(0x0fffffff, 1024 + 12);
+    // Root directory @ sector 4 (byte 2048): deleted 8.3 entry pointing to cluster 3, size 100
+    const fDirOff = 4 * 512;
+    fatBuf.write('OLD     TXT', fDirOff, 'ascii');
+    fatBuf[fDirOff] = 0xe5;
+    fatBuf.writeUInt16LE(3, fDirOff + 26); // low cluster = 3
+    fatBuf.writeUInt32LE(100, fDirOff + 28);
+    Buffer.from('reallocated cluster payload').copy(fatBuf, 5 * 512);
+
+    const fatParts = analyzeDiskImage('fat32.img', new Uint8Array(fatBuf)).partitions;
+    const tsFatRes = scanFatAndExfatDeletedInBuffer(new Uint8Array(fatBuf), fatParts);
+    const oldTxtTs = tsFatRes.find((r) => r.filename.endsWith('LD.TXT'));
+    assert.ok(oldTxtTs);
+    assert.equal(oldTxtTs.overwritten, true);
+
+    const fatImgPath = path.join(tmpDir, 'fat32_realloc.img');
+    fs.writeFileSync(fatImgPath, fatBuf);
+    const fatFd = fs.openSync(fatImgPath, 'r');
+    try {
+      const fatVols = mainMod.detectVolumesFromDisk(fatFd, fatBuf.length, 512);
+      const fatRes = mainMod.scanFat32VolumeFromFd(fatFd, fatImgPath, fatVols[0], fatBuf.length, false, 100);
+      const oldTxtNative = fatRes.find((r: { filename: string }) => r.filename.endsWith('LD.TXT'));
+      assert.ok(oldTxtNative);
+      assert.equal(oldTxtNative.mftOverwritten, true);
+    } finally {
+      fs.closeSync(fatFd);
+    }
+
+    // 4. partitions.ts rejects non-power-of-two NTFS bps and invalid exFAT shifts / volLen=0
+    const badNtfs = new Uint8Array(4096);
+    badNtfs.set([0xeb, 0x52, 0x90], 0);
+    badNtfs.set(Buffer.from('NTFS    ', 'ascii'), 3);
+    new DataView(badNtfs.buffer).setUint16(11, 1500, true); // invalid bps
+    badNtfs[13] = 8;
+    badNtfs[510] = 0x55;
+    badNtfs[511] = 0xaa;
+    assert.equal(analyzeDiskImage('bad_ntfs.img', badNtfs).partitions.some((p) => p.detectedFs?.filesystem === 'NTFS'), false);
+
+    const badExfat = new Uint8Array(4096);
+    badExfat.set(Buffer.from('EXFAT   ', 'ascii'), 3);
+    badExfat[108] = 9;
+    badExfat[109] = 3;
+    badExfat[510] = 0x55;
+    badExfat[511] = 0xaa; // volLen === 0!
+    assert.equal(analyzeDiskImage('bad_exfat.img', badExfat).partitions.some((p) => p.detectedFs?.filesystem === 'exFAT'), false);
+
+    // 5. ntfsMft.ts preserves fileSize when a secondary non-resident $DATA attribute has lowestVcn > 0
+    const mftImg = new Uint8Array(16384);
+    const recOff = 1024;
+    const mftBuf = mftImg.subarray(recOff, recOff + 1024);
+    mftBuf.set(Buffer.from('FILE', 'ascii'), 0);
+    const mftDv = new DataView(mftImg.buffer, recOff, 1024);
+    mftDv.setUint16(4, 48, true); // USA offset
+    mftDv.setUint16(6, 3, true); // USA count
+    mftDv.setUint16(20, 56, true); // first attr offset
+    mftDv.setUint16(22, 0, true); // deleted
+    mftDv.setUint32(24, 512, true); // bytesInUse
+    mftDv.setUint32(44, 42, true); // record #42
+    // USA fixups
+    mftDv.setUint16(48, 0xabcd, true);
+    mftDv.setUint16(510, 0xabcd, true);
+    mftDv.setUint16(1022, 0xabcd, true);
+    // $FILE_NAME attr (0x30)
+    const fnAttr = 56;
+    const fnBytes = Buffer.from('split.bin', 'utf16le');
+    const fnAttrLen = 112;
+    mftDv.setUint32(fnAttr, 0x30, true);
+    mftDv.setUint32(fnAttr + 4, fnAttrLen, true);
+    mftDv.setUint32(fnAttr + 16, 66 + fnBytes.length, true); // valLen
+    mftDv.setUint16(fnAttr + 20, 24, true); // value offset
+    mftDv.setUint32(fnAttr + 24 + 0, 5, true); // parent = 5
+    mftBuf[fnAttr + 24 + 64] = 9; // len
+    mftBuf[fnAttr + 24 + 65] = 1; // Win32
+    mftBuf.set(fnBytes, fnAttr + 24 + 66);
+    // $DATA #1 (lowestVcn = 0, realSize = 8192)
+    const d1 = fnAttr + fnAttrLen;
+    mftDv.setUint32(d1, 0x80, true);
+    mftDv.setUint32(d1 + 4, 72, true);
+    mftBuf[d1 + 8] = 1; // non-resident
+    mftDv.setUint16(d1 + 32, 64, true); // runlist off
+    mftDv.setUint32(d1 + 48, 8192, true); // realSize = 8192
+    mftBuf[d1 + 64] = 0x11;
+    mftBuf[d1 + 65] = 1; // 1 cluster
+    mftBuf[d1 + 66] = 1; // LCN 1
+    // $DATA #2 (lowestVcn = 1, realSize = 0 -> must NOT overwrite 8192!)
+    const d2 = d1 + 72;
+    mftDv.setUint32(d2, 0x80, true);
+    mftDv.setUint32(d2 + 4, 72, true);
+    mftBuf[d2 + 8] = 1;
+    mftDv.setUint32(d2 + 16, 1, true); // lowestVcn = 1
+    mftDv.setUint16(d2 + 32, 64, true);
+    mftDv.setUint32(d2 + 48, 0, true); // realSize = 0 on extension extent
+    mftBuf[d2 + 64] = 0x11;
+    mftBuf[d2 + 65] = 1;
+    mftBuf[d2 + 66] = 2;
+    mftDv.setUint32(d2 + 72, 0xffffffff, true);
+    const mftRes = scanNtfsMftRecordsInBuffer(mftImg, []);
+    const splitRec = mftRes.find((r) => r.filename === 'split.bin');
+    assert.ok(splitRec);
+    assert.equal(splitRec.fileSize, 8192);
+
+    // 6. recoveryHealth WAV non-36 data chunk patching + BMP/WAV idempotency + isRepairableExplorerFile
+    const wavWithJunk = new Uint8Array(64);
+    wavWithJunk.set(Buffer.from('RIFF', 'ascii'), 0);
+    const wDv = new DataView(wavWithJunk.buffer);
+    wDv.setUint32(4, 9999, true); // bogus RIFF size
+    wavWithJunk.set(Buffer.from('WAVEfmt ', 'ascii'), 8);
+    wDv.setUint32(16, 16, true);
+    wavWithJunk.set(Buffer.from('JUNK', 'ascii'), 36);
+    wDv.setUint32(40, 4, true); // 4B JUNK payload at 44..47
+    wavWithJunk.set(Buffer.from('data', 'ascii'), 48);
+    wDv.setUint32(52, 0, true); // broken data chunk size at offset 52
+    const wavFixed = repairFileBuffer('wav', wavWithJunk);
+    assert.equal(wavFixed.repaired, true);
+    const fixedDv = new DataView(wavFixed.data.buffer);
+    assert.equal(fixedDv.getUint32(4, true), 56);
+    assert.equal(fixedDv.getUint32(40, true), 4); // JUNK size preserved untouched!
+    assert.equal(fixedDv.getUint32(52, true), 8); // data chunk @ 48 got size 64 - 56 = 8
+    assert.equal(repairFileBuffer('wav', wavFixed.data).repaired, false);
+
+    const healthyBmp = new Uint8Array(32);
+    healthyBmp[0] = 0x42;
+    healthyBmp[1] = 0x4d;
+    new DataView(healthyBmp.buffer).setUint32(2, 32, true);
+    assert.equal(repairFileBuffer('bmp', healthyBmp).repaired, false);
+    assert.equal(isRepairableExplorerFile({ status: 'HEADER_ONLY', extension: 'pdf' }), true);
+    assert.equal(isRepairableExplorerFile({ status: 'HEADER_ONLY', extension: 'unknown' }), false);
+
+    // 7. repairFileBuffer('zip') with flags & 0x08 missing PK\x07\x08 descriptor must NOT skip 16 bytes into entry 2
+    const mkLocal = (name: string, payload: string, flags = 0): Uint8Array => {
+      const nb = Buffer.from(name, 'utf8');
+      const pb = Buffer.from(payload, 'utf8');
+      const out = new Uint8Array(30 + nb.length + pb.length);
+      const dv = new DataView(out.buffer);
+      out.set([0x50, 0x4b, 0x03, 0x04], 0);
+      dv.setUint16(4, 20, true);
+      dv.setUint16(6, flags, true);
+      dv.setUint32(14, flags ? 0 : computeCrc32(pb), true);
+      dv.setUint32(18, flags ? 0 : pb.length, true);
+      dv.setUint32(22, flags ? 0 : pb.length, true);
+      dv.setUint16(26, nb.length, true);
+      out.set(nb, 30);
+      out.set(pb, 30 + nb.length);
+      return out;
+    };
+    const brokenZip = Buffer.concat([
+      mkLocal('one.txt', 'hello', 0x08),
+      mkLocal('two.txt', 'world', 0x00),
+    ]);
+    const zipRepaired = repairFileBuffer('zip', new Uint8Array(brokenZip));
+    assert.equal(zipRepaired.repaired, true);
+    assert.ok(zipRepaired.note.includes('2 entries'), `Expected 2 salvaged ZIP entries, got: ${zipRepaired.note}`);
+
+    // 8. signatures enabled filtering respects specific format toggles
+    const webmBuf = new Uint8Array(64);
+    webmBuf.set([0x1a, 0x45, 0xdf, 0xa3, 0x9f, 0x42, 0x82, 0x84], 0);
+    webmBuf.set(Buffer.from('webm', 'ascii'), 8);
+    assert.equal(identifyBuffer(webmBuf, new Set(['mkv'])), null);
+    assert.equal(identifyBuffer(webmBuf, new Set(['webm']))?.extension, 'webm');
+
+    // 9. scannerWorker cross-chunk verified alignedSkip does NOT re-carve tail of a multi-chunk PNG
+    const chunkDiskPath = path.join(tmpDir, 'cross_chunk.img');
+    const chunkDisk = Buffer.alloc(4 * 1024 * 1024 + 4096, 0);
+    const png1Start = 4 * 1024 * 1024 - 1024;
+    // Valid PNG header + IDAT spanning past 4 MiB + inner embedded PNG header at 4 MiB + 512 + real IEND at 4 MiB + 1536
+    chunkDisk.set([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a], png1Start);
+    chunkDisk.writeUInt32BE(13, png1Start + 8);
+    chunkDisk.write('IHDR', png1Start + 12, 'ascii');
+    chunkDisk.writeUInt32BE(2500, png1Start + 33); // IDAT length 2500
+    chunkDisk.write('IDAT', png1Start + 37, 'ascii');
+    // Embedded bogus PNG signature at sector boundary inside chunk 2 (offset 4 MiB + 512)
+    chunkDisk.set([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a], 4 * 1024 * 1024 + 512);
+    const iendPos = png1Start + 33 + 12 + 2500;
+    chunkDisk.writeUInt32BE(0, iendPos);
+    chunkDisk.write('IEND', iendPos + 4, 'ascii');
+    chunkDisk.writeUInt32BE(0xae426082, iendPos + 8);
+    fs.writeFileSync(chunkDiskPath, chunkDisk);
+
+    const scanRes = await scanRange({
+      devicePath: chunkDiskPath,
+      rangeStart: 0,
+      rangeEnd: chunkDisk.length,
+      totalLimitBytes: chunkDisk.length,
+      step: 512,
+      sectorSize: 512,
+      workerIndex: 0,
+    });
+    assert.equal(scanRes.entries.length, 1, `Expected 1 PNG without inner chunk-2 re-carve, got ${scanRes.entries.length}`);
+    assert.equal(scanRes.entries[0].offset, png1Start);
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test('latest audit fixes: preview-only PSD/OLE2 stays unrepaired, clean JSON/ZIP notes, RAW FFmpeg guard, and bad-sector stitching', async () => {
+  const req = createRequire(import.meta.url);
+  const { repairNonMediaBufferCjs } = req('../electron/documentRepairCjs.cjs');
+  const { ffmpegRepairVideoFile } = req('../electron/enginesHelper.cjs');
+  const { stitchFragmentedVideosFromFdCjs } = req('../electron/mediaRepairCjs.cjs');
+
+  // Construct a tiny valid JPEG > 256 bytes so extractEmbeddedJpeg accepts it as a salvaged preview
+  const tinyJpg = Buffer.concat([
+    Buffer.from([0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10, 0x4a, 0x46, 0x49, 0x46, 0x00, 0x01, 0x01, 0x00, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00]),
+    Buffer.from([0xff, 0xdb, 0x00, 0x04, 0x00, 0x00]),
+    Buffer.from([0xff, 0xc0, 0x00, 0x0b, 0x08, 0x00, 0x01, 0x00, 0x01, 0x01, 0x01, 0x11, 0x00]),
+    Buffer.from([0xff, 0xda, 0x00, 0x08, 0x01, 0x01, 0x00, 0x00, 0x3f, 0x00]),
+    Buffer.alloc(240, 0x55),
+    Buffer.from([0xff, 0xd9]),
+  ]);
+
+  // 1. Intact PSD with embedded thumbnail in ImageResources must NOT mark repaired: true or return modified container bytes
+  const imgRes = Buffer.concat([Buffer.from('8BIM'), Buffer.from([0x04, 0x0c, 0x00, 0x00]), Buffer.alloc(4), tinyJpg]);
+  imgRes.writeUInt32BE(tinyJpg.length, 8);
+  const psdIntact = Buffer.alloc(26 + 4 + 4 + imgRes.length + 4 + 4);
+  psdIntact.write('8BPS', 0, 'ascii');
+  psdIntact.writeUInt16BE(1, 4);
+  psdIntact.writeUInt32BE(0, 26); // ColorModeData = 0
+  psdIntact.writeUInt32BE(imgRes.length, 30); // ImageResources
+  imgRes.copy(psdIntact, 34);
+  psdIntact.writeUInt32BE(0, 34 + imgRes.length); // LayerMask = 0
+
+  const tsPsdPreviewOnly = repairFileBuffer('psd', new Uint8Array(psdIntact));
+  assert.equal(tsPsdPreviewOnly.repaired, false);
+  assert.ok(tsPsdPreviewOnly.salvagedPreviewBytes && tsPsdPreviewOnly.salvagedPreviewBytes.length >= 256);
+
+  const cjsPsdPreviewOnly = repairNonMediaBufferCjs('psd', psdIntact);
+  assert.ok(cjsPsdPreviewOnly);
+  assert.equal(cjsPsdPreviewOnly.data, null);
+  assert.ok(cjsPsdPreviewOnly.salvagedPreview && cjsPsdPreviewOnly.salvagedPreview.length >= 256);
+
+  // 2. Intact OLE2 (.doc) with aligned sector size and embedded JPEG thumbnail -> repaired: false / data: null
+  const ole = Buffer.alloc(1024, 0);
+  Buffer.from([0xd0, 0xcf, 0x11, 0xe0, 0xa1, 0xb1, 0x1a, 0xe1]).copy(ole, 0);
+  ole.writeUInt16LE(9, 0x1e); // sector shift = 512
+  ole.writeUInt32LE(1, 0x2c); // numFatSectors = 1
+  ole.writeUInt32LE(0, 0x4c); // fatSector0 = 0
+  tinyJpg.copy(ole, 512);
+
+  const tsOlePreviewOnly = repairFileBuffer('doc', new Uint8Array(ole));
+  assert.equal(tsOlePreviewOnly.repaired, false);
+  assert.ok(tsOlePreviewOnly.salvagedPreviewBytes && tsOlePreviewOnly.salvagedPreviewBytes.length >= 256);
+
+  const cjsOlePreviewOnly = repairNonMediaBufferCjs('doc', ole);
+  assert.ok(cjsOlePreviewOnly);
+  assert.equal(cjsOlePreviewOnly.data, null);
+  assert.ok(cjsOlePreviewOnly.salvagedPreview && cjsOlePreviewOnly.salvagedPreview.length >= 256);
+
+  // 3. Balanced JSON null-slack note & singular ZIP entry pluralization
+  const jsonSlackRes = repairFileBuffer('json', new Uint8Array(Buffer.from('{"ok":true}\0\0', 'utf8')));
+  assert.equal(jsonSlackRes.repaired, true);
+  assert.equal(jsonSlackRes.note, 'Trimmed trailing binary slack from JSON file.');
+
+  const singleZipName = Buffer.from('only.txt', 'utf8');
+  const singleZipBuf = Buffer.alloc(30 + singleZipName.length + 3);
+  singleZipBuf.writeUInt32LE(0x04034b50, 0);
+  singleZipBuf.writeUInt16LE(20, 4);
+  singleZipBuf.writeUInt32LE(3, 18);
+  singleZipBuf.writeUInt32LE(3, 22);
+  singleZipBuf.writeUInt16LE(singleZipName.length, 26);
+  singleZipName.copy(singleZipBuf, 30);
+  Buffer.from('abc', 'utf8').copy(singleZipBuf, 30 + singleZipName.length);
+  const singleZipCjs = repairNonMediaBufferCjs('zip', singleZipBuf);
+  assert.ok(singleZipCjs && singleZipCjs.note.includes('1 entry') && !singleZipCjs.note.includes('1 entries'));
+
+  // 4. ffmpegRepairVideoFile treats .raf as RAW image and never leaves partial dstPath
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'td_audit_fix_'));
+  try {
+    const rafSrc = path.join(tmpDir, 'sample.raf');
+    const rafDst = path.join(tmpDir, 'sample_out.raf');
+    fs.writeFileSync(rafSrc, Buffer.from('FUJIFILMCCD-RAW 0201'));
+    const ffRes = await ffmpegRepairVideoFile(rafSrc, rafDst, { extension: 'raf', allowTranscode: true });
+    assert.equal(ffRes.ok, false);
+    assert.equal(fs.existsSync(rafDst), false);
+
+    // 5. stitchFragmentedVideosFromFdCjs survives an isolated EIO sector during search and stitches fragment 2
+    const disk = Buffer.alloc(8192);
+    const ftyp = Buffer.from([0x00, 0x00, 0x00, 0x10, 0x66, 0x74, 0x79, 0x70, 0x69, 0x73, 0x6f, 0x6d, 0x00, 0x00, 0x02, 0x00]);
+    const mdatHdr = Buffer.alloc(8);
+    mdatHdr.writeUInt32BE(2048, 0);
+    mdatHdr.write('mdat', 4, 'ascii');
+    const frag1 = Buffer.from([
+      0x00, 0x00, 0x00, 0x04, 0x67, 0x42, 0xc0, 0x1e,
+      0x00, 0x00, 0x00, 0x04, 0x68, 0xce, 0x38, 0x80,
+      0x00, 0x00, 0x00, 0x06, 0x65, 0x88, 0x84, 0x21, 0xa0, 0x00,
+    ]);
+    const frag2 = Buffer.from([
+      0x00, 0x00, 0x00, 0x06, 0x65, 0x88, 0x84, 0x21, 0xb0, 0x01,
+      0xff, 0xf1, 0x50, 0x80, 0x01, 0x5f, 0xfc, 0x21, 0x00, 0x1a,
+      0xff, 0xf1, 0x50, 0x80, 0x01, 0x5f, 0xfc, 0x21, 0x00, 0x1b,
+    ]);
+    ftyp.copy(disk, 512);
+    mdatHdr.copy(disk, 512 + ftyp.length);
+    frag1.copy(disk, 512 + ftyp.length + 8);
+    frag2.copy(disk, 2048);
+
+    const diskPath = path.join(tmpDir, 'bad_sector_frag.img');
+    fs.writeFileSync(diskPath, disk);
+
+    const origReadSync = fs.readSync;
+    (fs as unknown as { readSync: typeof fs.readSync }).readSync = ((
+      fd: number,
+      buf: NodeJS.ArrayBufferView,
+      offset: number,
+      length: number,
+      position: number | null,
+    ) => {
+      if (Number(position ?? 0) === 1536) {
+        throw Object.assign(new Error('Simulated isolated EIO sector'), { code: 'EIO' });
+      }
+      return origReadSync(fd, buf, offset, length, position);
+    }) as typeof fs.readSync;
+
+    try {
+      const stitched = stitchFragmentedVideosFromFdCjs(
+        diskPath,
+        [{ id: 'v1', extensionHint: 'mp4', sourceKind: 'carved', offset: 512, size: 512, truncated: true }],
+        disk.length,
+        512,
+      );
+      assert.equal(stitched.length, 1);
+      assert.ok(Array.isArray(stitched[0].runs) && stitched[0].runs.length >= 2);
+      assert.ok(stitched[0].runs.some((r: { offset: number }) => r.offset === 2048));
+    } finally {
+      (fs as unknown as { readSync: typeof fs.readSync }).readSync = origReadSync;
+    }
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+
 
 
 

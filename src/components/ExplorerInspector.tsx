@@ -22,6 +22,7 @@ import { getDesktopBridge, VideoPreviewResult } from '../engine/desktopBridge';
 import {
   formatShortDate,
   isNonMediaRepairableExtension,
+  isRepairableExplorerFile,
   resolvePreferredExtension,
 } from '../engine/recoveryHealth';
 import { useMediaUrl } from '../utils/useMediaUrl';
@@ -32,8 +33,10 @@ interface ExplorerInspectorProps {
   focusedPartition: PartitionEntry | null;
   analysis: DiskAnalysisResult;
   diskBytes: Uint8Array;
+  scannedDevicePath?: string | null;
   onRestorePartitionToMbr: (partition: PartitionEntry) => void;
   onRepairFile: (item: ExplorerFileItem, referenceBytes?: Uint8Array) => Promise<void> | void;
+  onNotifyError?: (message: string) => void;
   onBitLockerUnlocked?: () => void;
   lightboxOpen: boolean;
   onSetLightboxOpen: (open: boolean) => void;
@@ -54,8 +57,10 @@ export const ExplorerInspector: React.FC<ExplorerInspectorProps> = ({
   focusedPartition,
   analysis,
   diskBytes,
+  scannedDevicePath,
   onRestorePartitionToMbr,
   onRepairFile,
+  onNotifyError,
   onBitLockerUnlocked,
   lightboxOpen,
   onSetLightboxOpen,
@@ -147,6 +152,29 @@ export const ExplorerInspector: React.FC<ExplorerInspectorProps> = ({
     fileId: string;
     bytes: Uint8Array;
   } | null>(null);
+  const [remoteSectorState, setRemoteSectorState] = useState<{
+    key: string;
+    bytes: Uint8Array;
+  } | null>(null);
+
+  useEffect(() => {
+    if (!showHex || focusedFile || !desktop || !scannedDevicePath) return;
+    const secSize = analysis.sectorSize || 512;
+    const offset = inspectLba * secSize;
+    if (offset + secSize <= diskBytes.length) return;
+    const reqKey = `${scannedDevicePath}:${offset}:${secSize}`;
+    let active = true;
+    desktop
+      .readDiskBytes(scannedDevicePath, offset, secSize, undefined, undefined, secSize)
+      .then((bytes) => {
+        if (!active || !bytes || bytes.length === 0) return;
+        setRemoteSectorState({ key: reqKey, bytes });
+      })
+      .catch(() => {});
+    return () => {
+      active = false;
+    };
+  }, [showHex, focusedFile, desktop, scannedDevicePath, inspectLba, analysis.sectorSize, diskBytes.length]);
 
   useEffect(() => {
     if (!desktop || !focusedFile || focusedFile.family !== 'Videos') return;
@@ -218,7 +246,7 @@ export const ExplorerInspector: React.FC<ExplorerInspectorProps> = ({
     const outName = resolvePreferredExtension(item.filename, item.extension);
 
     if (
-      !item.repaired &&
+      (!item.repaired || item.data.byteLength < item.size) &&
       bridge &&
       item.sourceRef &&
       (item.sourceRef.kind === 'native-device' ||
@@ -226,7 +254,7 @@ export const ExplorerInspector: React.FC<ExplorerInspectorProps> = ({
         item.sourceRef.kind === 'native-file' ||
         item.sourceRef.kind === 'native-tsk')
     ) {
-      await bridge.recoverFilesToFolder({
+      const res = await bridge.recoverFilesToFolder({
         destinationDir: null,
         scannedDevicePath: item.sourceRef.devicePath,
         items: [
@@ -245,13 +273,16 @@ export const ExplorerInspector: React.FC<ExplorerInspectorProps> = ({
             ntfsCompressed: item.ntfsCompressed,
             ntfsEncrypted: item.ntfsEncrypted,
             extension: item.extension,
-            repairIfTruncated:
-              item.status === 'OK_TRUNCATED' ||
-              (item.status === 'HEADER_ONLY' && isNonMediaRepairableExtension(item.extension)),
+            repairIfTruncated: !item.repaired && isRepairableExplorerFile(item),
             modifiedAtMs: item.modifiedAt,
           },
         ],
       });
+      if (res?.error) {
+        onNotifyError?.(res.error);
+      } else if (res?.failures && res.failures.length > 0 && !res.canceled) {
+        onNotifyError?.(res.failures.map((f) => `${f.filename}: ${f.reason}`).join(' | '));
+      }
       return;
     }
 
@@ -587,7 +618,7 @@ export const ExplorerInspector: React.FC<ExplorerInspectorProps> = ({
                 </div>
               </div>
 
-              {((focusedFile.status === 'OK_TRUNCATED' && !focusedFile.repaired) ||
+              {(isRepairableExplorerFile(focusedFile) ||
                 canRepairNonMedia ||
                 (!focusedFile.repaired &&
                   ((isImage && previewUrl !== null && failedPreviewUrl === previewUrl) ||
@@ -981,7 +1012,7 @@ export const ExplorerInspector: React.FC<ExplorerInspectorProps> = ({
                   <span>{focusedFile.recoveryReason}</span>
                 </div>
                 <div className="flex items-center gap-2 shrink-0">
-                  {focusedFile.status === 'OK_TRUNCATED' && !focusedFile.repaired && (
+                  {isRepairableExplorerFile(focusedFile) && (
                     <button
                       type="button"
                       onClick={() => onRepairFile(focusedFile)}
@@ -1010,7 +1041,16 @@ export const ExplorerInspector: React.FC<ExplorerInspectorProps> = ({
 
   // --- Mode B: Partition / Disk Inspector (Matches Screenshot 2 right pane) ---
   const sectorOffset = inspectLba * analysis.sectorSize;
-  const sectorSlice = diskBytes.subarray(sectorOffset, sectorOffset + analysis.sectorSize);
+  const localSectorSlice = diskBytes.subarray(sectorOffset, sectorOffset + analysis.sectorSize);
+  const remoteSectorKey = scannedDevicePath
+    ? `${scannedDevicePath}:${sectorOffset}:${analysis.sectorSize || 512}`
+    : '';
+  const sectorSlice =
+    localSectorSlice.length > 0
+      ? localSectorSlice
+      : remoteSectorState && remoteSectorState.key === remoteSectorKey
+        ? remoteSectorState.bytes
+        : localSectorSlice;
   const isLost = focusedPartition?.status === 'Deleted / Lost';
 
   const canRestoreMbr =

@@ -116,6 +116,16 @@ function readAlignedSync(fd, dstBuf, dstOff, len, filePos, sectorSize = 512) {
  * retries one sector at a time, zero-filling unreadable sectors and recording skipped ranges
  * so deep carving / metadata recovery never aborts the entire drive or worker range.
  */
+const FATAL_IO_ERRNOS = new Set([
+  'EBADF',
+  'EACCES',
+  'EPERM',
+  'ENXIO',
+  'ENODEV',
+  'ENOENT',
+  'ESHUTDOWN',
+]);
+
 function readAlignedResilientSync(fd, dstBuf, dstOff, len, filePos, sectorSize = 512) {
   const sec = normalizeSectorSize(sectorSize);
   const targetLen = Math.min(len, Math.max(0, dstBuf.length - dstOff));
@@ -127,7 +137,7 @@ function readAlignedResilientSync(fd, dstBuf, dstOff, len, filePos, sectorSize =
     const bytesRead = readAlignedSync(fd, dstBuf, dstOff, targetLen, filePos, sec);
     return { bytesRead, skippedSectors: 0, skippedBytes: 0, skippedRanges: [] };
   } catch (bulkErr) {
-    if (bulkErr && (bulkErr.code === 'EBADF' || bulkErr.code === 'EACCES' || bulkErr.code === 'EPERM')) {
+    if (bulkErr && FATAL_IO_ERRNOS.has(bulkErr.code)) {
       throw bulkErr;
     }
   }
@@ -149,7 +159,10 @@ function readAlignedResilientSync(fd, dstBuf, dstOff, len, filePos, sectorSize =
       if (n < sec && n > 0) {
         secScratch.fill(0, n, sec);
       }
-    } catch {
+    } catch (secErr) {
+      if (secErr && FATAL_IO_ERRNOS.has(secErr.code)) {
+        throw secErr;
+      }
       sectorFailed = true;
       n = sec;
       secScratch.fill(0);
@@ -195,6 +208,7 @@ function readAlignedResilientSync(fd, dstBuf, dstOff, len, filePos, sectorSize =
 }
 
 module.exports = {
+  FATAL_IO_ERRNOS,
   normalizeSectorSize,
   detectSectorSizeSync,
   readAlignedSync,

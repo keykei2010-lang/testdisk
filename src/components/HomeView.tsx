@@ -130,6 +130,8 @@ export const HomeView: React.FC<HomeViewProps> = ({
     if (nextSection === 'sdcard') {
       if (selectedDevicePath && !externalDrives.some((d) => d.devicePath === selectedDevicePath)) {
         setSelectedDevicePath(externalDrives[0]?.devicePath ?? null);
+      } else if (!selectedDevicePath && !selectedQuickTarget && externalDrives.length > 0) {
+        setSelectedDevicePath(externalDrives[0].devicePath);
       }
     } else if (nextSection === 'hardware') {
       if (!selectedDevicePath && !selectedQuickTarget && drives.length > 0) {
@@ -177,6 +179,10 @@ export const HomeView: React.FC<HomeViewProps> = ({
       } finally {
         setScanningDrivePath(null);
       }
+      return;
+    }
+    if (section === 'partition') {
+      onOpenDiskPicker();
       return;
     }
     switch (selectedQuickTarget) {
@@ -729,7 +735,10 @@ export const HomeView: React.FC<HomeViewProps> = ({
               onClick={() => void triggerSearch()}
               disabled={
                 scanningDrivePath !== null ||
-                (section !== 'repair' && !selectedDrive && !selectedQuickTarget)
+                (section !== 'repair' &&
+                  section !== 'partition' &&
+                  !selectedDrive &&
+                  !selectedQuickTarget)
               }
               className="px-7 py-2 rounded-md text-xs font-medium bg-[#3A7AFE] hover:bg-[#2F6EEB] active:scale-[0.98] disabled:opacity-40 text-white transition-all whitespace-nowrap shrink-0"
             >
@@ -737,7 +746,9 @@ export const HomeView: React.FC<HomeViewProps> = ({
                 ? 'Starting Scan...'
                 : section === 'repair'
                   ? 'Inspect Unknown File'
-                  : 'Search for Lost Data'}
+                  : section === 'partition' && !selectedDrive
+                    ? 'Open Disk Image'
+                    : 'Search for Lost Data'}
             </button>
           </div>
         </footer>

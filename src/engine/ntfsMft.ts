@@ -241,9 +241,12 @@ export function parseSingleMftRecord(
         const mpOffset = dv.getUint16(pos + 32, true);
         const realSizeLo = dv.getUint32(pos + 48, true);
         const realSizeHi = dv.getUint32(pos + 52, true);
-        fileSize = realSizeHi * 4294967296 + realSizeLo;
+        if (lowestVcn === 0) {
+          fileSize = realSizeHi * 4294967296 + realSizeLo;
+        }
         if (pos + mpOffset < pos + attrLen) {
-          runs = decodeNtfsRunlist(work, pos + mpOffset, pos + attrLen, lowestVcn, highestVcn);
+          const decoded = decodeNtfsRunlist(work, pos + mpOffset, pos + attrLen, lowestVcn, highestVcn);
+          runs = runs.length > 0 ? [...runs, ...decoded] : decoded;
         }
       }
     }
@@ -344,8 +347,9 @@ export function scanNtfsMftRecordsInBuffer(
   options?: { includeExisting?: boolean },
 ): MftDeletedRecord[] {
   const includeExisting = options?.includeExisting ?? false;
-  const dirMap = new Map<string, { parentRecord: number; name: string }>();
+  const dirMap = new Map<string, { parentRecord: number; name: string; inUse?: boolean }>();
   const bitmapByPartition = new Map<string, Uint8Array>();
+  const bitmapActiveByPartition = new Map<string, boolean>();
 
   type ParsedCandidate = {
     off: number;
@@ -382,17 +386,25 @@ export function scanNtfsMftRecordsInBuffer(
       : 'Reconstructed NTFS MFT';
 
     if (parsed.isDirectory && parsed.recordNumber >= 5 && parsed.filename) {
-      dirMap.set(`${partId}:${parsed.recordNumber}`, {
-        parentRecord: parsed.parentRecord,
-        name: parsed.filename,
-      });
+      const dirKey = `${partId}:${parsed.recordNumber}`;
+      const existingDir = dirMap.get(dirKey);
+      if (!existingDir || parsed.inUse || !existingDir.inUse) {
+        dirMap.set(dirKey, {
+          parentRecord: parsed.parentRecord,
+          name: parsed.filename,
+          inUse: parsed.inUse,
+        });
+      }
       continue;
     }
 
-    // Extract $Bitmap (record #6) allocation map
+    // Extract $Bitmap (record #6) allocation map (prefer active in-use record over stale copies)
     if (parsed.recordNumber === 6 && parsed.filename === '$Bitmap') {
+      const hasActiveBm = bitmapActiveByPartition.get(partId) === true;
+      if (hasActiveBm && !parsed.inUse) continue;
       if (parsed.residentData && parsed.residentData.length > 0) {
         bitmapByPartition.set(partId, parsed.residentData);
+        bitmapActiveByPartition.set(partId, parsed.inUse);
       } else if (parsed.runs.length > 0 && parsed.fileSize > 0) {
         const bmSize = Math.min(parsed.fileSize, 4 * 1024 * 1024);
         const bm = new Uint8Array(bmSize);
@@ -409,6 +421,7 @@ export function scanNtfsMftRecordsInBuffer(
           cursor += take;
         }
         bitmapByPartition.set(partId, bm);
+        bitmapActiveByPartition.set(partId, parsed.inUse);
       }
       continue;
     }

@@ -555,6 +555,7 @@ async function scanRange({
   let totalSkippedBytes = 0;
   const allSkippedRanges = [];
   const collectedEntries = [];
+  let skipPastAbsOffset = 0;
 
   try {
     while (cursor < rangeEnd) {
@@ -608,6 +609,11 @@ async function scanRange({
           break;
         }
         const absOffset = cursor + local;
+        if (absOffset < skipPastAbsOffset) {
+          const skipBytes = Math.ceil((skipPastAbsOffset - absOffset) / scanStep) * scanStep;
+          local += Math.max(scanStep, skipBytes);
+          continue;
+        }
 
         const allocCheck = checkOffsetAllocation(absOffset, unallocatedOnly, allocatedBitmaps);
         if (unallocatedOnly) {
@@ -934,6 +940,9 @@ async function scanRange({
           const alignedSkip = isEstimated
             ? scanStep
             : Math.max(scanStep, Math.ceil(measured.size / scanStep) * scanStep);
+          if (!isEstimated) {
+            skipPastAbsOffset = Math.max(skipPastAbsOffset, absOffset + alignedSkip);
+          }
           local += alignedSkip;
           continue;
         }

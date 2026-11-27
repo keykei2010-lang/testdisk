@@ -162,6 +162,7 @@ export interface RepairMediaFileParams {
   referenceBuffer?: Uint8Array;
   allowTranscodeFallback?: boolean;
   saveWithDialog?: boolean;
+  saveWithDialogIfLarge?: boolean;
 }
 
 export interface RepairMediaFileResult {
@@ -181,6 +182,7 @@ export interface RepairMediaFileResult {
 export interface DesktopBridge {
   isDesktop: boolean;
   platform: string;
+  getPathForFile?: (file: File) => string | undefined;
   getEngineCapabilities: () => Promise<EngineCapabilities>;
   relaunchAsAdmin: () => Promise<{ ok: boolean; error?: string }>;
   listWindowsDrives: () => Promise<WindowsDriveInfo[]>;

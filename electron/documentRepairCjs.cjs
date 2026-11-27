@@ -103,7 +103,7 @@ function repairZipContainerCjs(raw, ext = 'zip') {
     const entryName = nameBuf.toString('utf8');
 
     let dataEnd = dataStart + compSize;
-    let usedDesc = false;
+    let descriptorNextPos = -1;
     if ((flags & 0x08) !== 0 && compSize === 0) {
       const nLoc = raw.indexOf(sigLocal, dataStart);
       const nCd = raw.indexOf(sigCd, dataStart);
@@ -114,7 +114,7 @@ function repairZipContainerCjs(raw, ext = 'zip') {
         compSize = raw.readUInt32LE(dPos + 8);
         uncompSize = raw.readUInt32LE(dPos + 12);
         dataEnd = Math.min(bound, dataStart + compSize);
-        usedDesc = true;
+        descriptorNextPos = Math.max(dPos + 16, dataEnd);
       } else {
         dataEnd = bound;
         compSize = Math.max(0, dataEnd - dataStart);
@@ -168,7 +168,7 @@ function repairZipContainerCjs(raw, ext = 'zip') {
       extraBuf,
     });
     outOffset += localHdr.length + payload.length;
-    cursor = usedDesc ? Math.max(dataEnd + 16, dataStart + compSize + 16) : dataEnd;
+    cursor = descriptorNextPos !== -1 ? descriptorNextPos : dataEnd;
   }
 
   if (entries.length === 0) return null;
@@ -203,7 +203,7 @@ function repairZipContainerCjs(raw, ext = 'zip') {
 
   return {
     data: Buffer.concat([...outChunks, cdBuf, eocd]),
-    note: `Rebuilt ${ext.toUpperCase()} ZIP Central Directory + EOCD (${entries.length} entries${clamped > 0 ? `, clamped ${clamped}` : ''}).`,
+    note: `Rebuilt ${ext.toUpperCase()} ZIP Central Directory + EOCD (${entries.length} ${entries.length === 1 ? 'entry' : 'entries'}${clamped > 0 ? `, clamped ${clamped}` : ''}).`,
   };
 }
 
@@ -295,7 +295,7 @@ function repairPsdCjs(raw) {
   }
   if (fixed === 0 && !salvagedPreview) return null;
   return {
-    data: out,
+    data: fixed > 0 ? out : null,
     salvagedPreview,
     note: [fixed > 0 ? `clamped ${fixed} truncated PSD section(s)` : '', salvagedPreview ? `extracted ${salvagedPreview.length} B thumbnail` : ''].filter(Boolean).join('; '),
   };
@@ -372,7 +372,7 @@ function repairOle2Cjs(raw, ext = 'doc') {
   }
   if (pad === 0 && !clampedFat && !salvagedPreview) return null;
   return {
-    data: out,
+    data: (pad > 0 || clampedFat) ? out : null,
     salvagedPreview,
     note: [pad > 0 ? `padded OLE2 sector (+${pad} B)` : '', clampedFat ? 'clamped FAT count' : '', salvagedPreview ? `extracted ${salvagedPreview.length} B thumbnail` : ''].filter(Boolean).join('; '),
   };
@@ -452,7 +452,10 @@ function repairStructuredTextCjs(raw, ext) {
       if (stack.length > 0) rep = rep.replace(/,?\s*"[^"]*"\s*:\s*$/, '') + stack.reverse().join('');
       try {
         JSON.parse(rep);
-        return { data: Buffer.from(rep, 'utf8'), note: `Closed ${stack.length} unclosed JSON container(s).` };
+        return {
+          data: Buffer.from(rep, 'utf8'),
+          note: stack.length > 0 ? `Closed ${stack.length} unclosed JSON container(s).` : 'Repaired truncated JSON string or trailing comma.',
+        };
       } catch {
         // continue
       }

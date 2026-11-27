@@ -1,8 +1,17 @@
-const { contextBridge, ipcRenderer } = require('electron');
+const { contextBridge, ipcRenderer, webUtils } = require('electron');
 
 contextBridge.exposeInMainWorld('desktopBridge', {
   isDesktop: true,
   platform: process.platform,
+  getPathForFile: (file) => {
+    try {
+      return webUtils && typeof webUtils.getPathForFile === 'function'
+        ? webUtils.getPathForFile(file)
+        : file?.path;
+    } catch {
+      return file?.path;
+    }
+  },
   getEngineCapabilities: () => ipcRenderer.invoke('win:get-engine-capabilities'),
   relaunchAsAdmin: () => ipcRenderer.invoke('win:relaunch-admin'),
   listWindowsDrives: () => ipcRenderer.invoke('win:list-drives'),

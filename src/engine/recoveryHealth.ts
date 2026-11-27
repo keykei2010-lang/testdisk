@@ -21,6 +21,46 @@ import { analyzeDiskImage } from './partitions';
 import { buildSampleDiskImage } from './sampleDisk';
 import { carveDiskBuffer, FILE_FORMATS, identifyBuffer, IdentifyMetadata } from './signatures';
 
+const REPAIRABLE_MEDIA_EXTS = new Set([
+  'jpg',
+  'jpeg',
+  'png',
+  'mp4',
+  'mov',
+  'm4v',
+  '3gp',
+  'avi',
+  'wav',
+  'bmp',
+  'gif',
+  'webp',
+  'mkv',
+  'webm',
+  'cr2',
+  'cr3',
+  'nef',
+  'arw',
+  'dng',
+  'orf',
+  'rw2',
+  'tif',
+  'tiff',
+]);
+
+export function isRepairableExplorerFile(item: {
+  status: string;
+  extension: string;
+  repaired?: boolean;
+}): boolean {
+  if (item.repaired) return false;
+  if (item.status === 'OK_TRUNCATED') return true;
+  if (item.status === 'HEADER_ONLY') {
+    const ext = item.extension.toLowerCase().replace(/^\./, '');
+    return isNonMediaRepairableExtension(ext) || REPAIRABLE_MEDIA_EXTS.has(ext);
+  }
+  return false;
+}
+
 export { extractEmbeddedJpegPreview, repairJpegBuffer, repairPngBuffer, repairAviBuffer, isNonMediaRepairableExtension };
 
 export interface RecoveryLikelihoodAssessment {
@@ -348,9 +388,35 @@ export function repairFileBuffer(
   if (ext === 'wav' && data.length >= 12) {
     const patched = data.slice();
     const dv = new DataView(patched.buffer);
-    dv.setUint32(4, Math.max(4, patched.length - 8), true);
-    if (patched.length >= 44) {
-      dv.setUint32(40, Math.max(0, patched.length - 44), true);
+    const expectedRiffSize = Math.max(4, patched.length - 8) >>> 0;
+    let changed = dv.getUint32(4, true) !== expectedRiffSize;
+    dv.setUint32(4, expectedRiffSize, true);
+    let pos = 12;
+    while (pos + 8 <= patched.length) {
+      const chunkId = String.fromCharCode(
+        patched[pos],
+        patched[pos + 1],
+        patched[pos + 2],
+        patched[pos + 3],
+      );
+      const chunkLen = dv.getUint32(pos + 4, true);
+      if (chunkId === 'data') {
+        const expectedDataLen = Math.max(0, patched.length - (pos + 8)) >>> 0;
+        if (chunkLen !== expectedDataLen) {
+          dv.setUint32(pos + 4, expectedDataLen, true);
+          changed = true;
+        }
+        break;
+      }
+      if (chunkLen === 0 && !/^[a-zA-Z0-9 _-]+$/.test(chunkId)) break;
+      pos += 8 + chunkLen + (chunkLen & 1);
+    }
+    if (!changed) {
+      return {
+        repaired: false,
+        data,
+        note: 'WAV RIFF & data chunk lengths already match recovered size.',
+      };
     }
     return {
       repaired: true,
@@ -364,6 +430,14 @@ export function repairFileBuffer(
   }
 
   if (ext === 'bmp' && data.length >= 18) {
+    const dvIn = new DataView(data.buffer, data.byteOffset, data.byteLength);
+    if (dvIn.getUint32(2, true) === data.length) {
+      return {
+        repaired: false,
+        data,
+        note: 'BMP bfSize header already matches recovered size.',
+      };
+    }
     const patched = data.slice();
     const dv = new DataView(patched.buffer);
     dv.setUint32(2, patched.length, true);

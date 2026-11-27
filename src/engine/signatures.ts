@@ -1031,7 +1031,7 @@ function validateAndMeasureZip(
   detectFromSliceStr(readAscii(buf, start, Math.min(searchLimit - start, 16384)));
   if (eocdPos !== -1 && eocdPos + 22 <= maxEnd) {
     const commentLen = readUint16LE(buf, eocdPos + 20);
-    const totalSize = eocdPos + 22 + commentLen - start;
+    const totalSize = Math.min(maxEnd - start, eocdPos + 22 + commentLen - start);
     if (subExtension === 'zip') {
       detectFromSliceStr(readAscii(buf, Math.max(start, eocdPos - 8192), Math.min(totalSize, 8192)));
     }
@@ -1593,7 +1593,9 @@ export function identifyBuffer(
     isEnabled('jar') ||
     isEnabled('kra') ||
     isEnabled('ora') ||
-    isEnabled('kmz')
+    isEnabled('kmz') ||
+    isEnabled('sketch') ||
+    isEnabled('xps')
   ) {
     const zip = validateAndMeasureZip(buf, 0, buf.length);
     if (zip) {
@@ -1813,7 +1815,9 @@ export function identifyBuffer(
     isEnabled('m4a') ||
     isEnabled('m4v') ||
     isEnabled('3gp') ||
-    isEnabled('3g2')
+    isEnabled('3g2') ||
+    isEnabled('braw') ||
+    isEnabled('cr3')
   ) {
     const mp4 = validateAndMeasureMp4(buf, 0, buf.length);
     if (mp4) {
@@ -1938,22 +1942,24 @@ export function identifyBuffer(
       const ver = readUint16BE(buf, 4);
       if (ver === 1 || ver === 2) {
         const id = ver === 2 ? 'psb' : 'psd';
-        const def = FORMAT_MAP.get(id)!;
-        const h = readUint32BE(buf, 14);
-        const w = readUint32BE(buf, 18);
-        return {
-          formatId: id,
-          extension: id,
-          description: def.description,
-          family: def.family,
-          mimeType: def.mimeType,
-          matchedOffset: 0,
-          matchedLength: 6,
-          calculatedSize: buf.length,
-          sizeEstimated: true,
-          status: 'HEADER_ONLY',
-          metadata: { width: w, height: h, details: `Photoshop ${w}x${h} px (${id.toUpperCase()})` },
-        };
+        if (isEnabled(id)) {
+          const def = FORMAT_MAP.get(id)!;
+          const h = readUint32BE(buf, 14);
+          const w = readUint32BE(buf, 18);
+          return {
+            formatId: id,
+            extension: id,
+            description: def.description,
+            family: def.family,
+            mimeType: def.mimeType,
+            matchedOffset: 0,
+            matchedLength: 6,
+            calculatedSize: buf.length,
+            sizeEstimated: true,
+            status: 'HEADER_ONLY',
+            metadata: { width: w, height: h, details: `Photoshop ${w}x${h} px (${id.toUpperCase()})` },
+          };
+        }
       }
     }
   }
@@ -1962,43 +1968,47 @@ export function identifyBuffer(
     if (buf.length >= 512 && buf[0] === 0x21 && buf[1] === 0x42 && buf[2] === 0x44 && buf[3] === 0x4e) {
       const subMagic = readAscii(buf, 8, 2);
       const id = subMagic === 'SO' ? 'ost' : 'pst';
-      const wVer = readUint16LE(buf, 10);
-      const calc = wVer >= 23 && buf.length >= 0xc0
-        ? readUint32LE(buf, 0xbc) * 4294967296 + readUint32LE(buf, 0xb8)
-        : buf.length >= 0xac ? readUint32LE(buf, 0xa8) : buf.length;
-      const def = FORMAT_MAP.get(id)!;
-      return {
-        formatId: id,
-        extension: id,
-        description: def.description,
-        family: def.family,
-        mimeType: def.mimeType,
-        matchedOffset: 0,
-        matchedLength: 4,
-        calculatedSize: calc > 512 ? Math.min(calc, 500 * MB) : buf.length,
-        sizeEstimated: calc <= 512,
-        status: calc > 512 && calc <= buf.length ? 'OK' : calc > buf.length ? 'OK_TRUNCATED' : 'HEADER_ONLY',
-        metadata: { details: `Outlook ${id.toUpperCase()} (NDB v${wVer})` },
-      };
+      if (isEnabled(id)) {
+        const wVer = readUint16LE(buf, 10);
+        const calc = wVer >= 23 && buf.length >= 0xc0
+          ? readUint32LE(buf, 0xbc) * 4294967296 + readUint32LE(buf, 0xb8)
+          : buf.length >= 0xac ? readUint32LE(buf, 0xa8) : buf.length;
+        const def = FORMAT_MAP.get(id)!;
+        return {
+          formatId: id,
+          extension: id,
+          description: def.description,
+          family: def.family,
+          mimeType: def.mimeType,
+          matchedOffset: 0,
+          matchedLength: 4,
+          calculatedSize: calc > 512 ? Math.min(calc, 500 * MB) : buf.length,
+          sizeEstimated: calc <= 512,
+          status: calc > 512 && calc <= buf.length ? 'OK' : calc > buf.length ? 'OK_TRUNCATED' : 'HEADER_ONLY',
+          metadata: { details: `Outlook ${id.toUpperCase()} (NDB v${wVer})` },
+        };
+      }
     }
   }
 
   if ((isEnabled('mkv') || isEnabled('webm')) && buf.length >= 16 && buf[0] === 0x1a && buf[1] === 0x45 && buf[2] === 0xdf && buf[3] === 0xa3) {
     const docType = readAscii(buf, 0, Math.min(buf.length, 64)).includes('webm') ? 'webm' : 'mkv';
-    const def = FORMAT_MAP.get(docType)!;
-    return {
-      formatId: docType,
-      extension: docType,
-      description: def.description,
-      family: def.family,
-      mimeType: def.mimeType,
-      matchedOffset: 0,
-      matchedLength: 4,
-      calculatedSize: buf.length,
-      sizeEstimated: true,
-      status: 'HEADER_ONLY',
-      metadata: { subExtension: docType, details: `EBML Matroska (${docType.toUpperCase()})` },
-    };
+    if (isEnabled(docType)) {
+      const def = FORMAT_MAP.get(docType)!;
+      return {
+        formatId: docType,
+        extension: docType,
+        description: def.description,
+        family: def.family,
+        mimeType: def.mimeType,
+        matchedOffset: 0,
+        matchedLength: 4,
+        calculatedSize: buf.length,
+        sizeEstimated: true,
+        status: 'HEADER_ONLY',
+        metadata: { subExtension: docType, details: `EBML Matroska (${docType.toUpperCase()})` },
+      };
+    }
   }
 
   if (isEnabled('dwg') && buf.length >= 16 && /^AC10(1[2-9]|2[0-9]|3[0-9])/.test(readAscii(buf, 0, 6))) {
@@ -2136,8 +2146,9 @@ export function identifyBuffer(
   }
 
   if ((isEnabled('wmv') || isEnabled('wma')) && buf.length >= 30 && buf[0] === 0x30 && buf[1] === 0x26 && buf[2] === 0xb2 && buf[3] === 0x75 && buf[4] === 0x8e && buf[5] === 0x66 && buf[6] === 0xcf && buf[7] === 0x11) {
-    const def = FORMAT_MAP.get('wmv')!;
-    return { formatId: 'wmv', extension: 'wmv', description: def.description, family: def.family, mimeType: def.mimeType, matchedOffset: 0, matchedLength: 8, calculatedSize: buf.length, sizeEstimated: true, status: 'HEADER_ONLY', metadata: { details: 'Microsoft ASF / WMV Stream' } };
+    const wId = isEnabled('wmv') ? 'wmv' : 'wma';
+    const def = FORMAT_MAP.get(wId)!;
+    return { formatId: wId, extension: wId, description: def.description, family: def.family, mimeType: def.mimeType, matchedOffset: 0, matchedLength: 8, calculatedSize: buf.length, sizeEstimated: true, status: 'HEADER_ONLY', metadata: { details: 'Microsoft ASF / WMV Stream' } };
   }
 
   if (isEnabled('cab') && buf.length >= 36 && readAscii(buf, 0, 4) === 'MSCF' && readUint32LE(buf, 8) > 36) {

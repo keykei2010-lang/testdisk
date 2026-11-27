@@ -248,11 +248,13 @@ async function runMmlsPartitions(devicePath, sectorSize = 512) {
     const sectors = Number(m[3]);
     const desc = m[4].trim();
     if (/unallocated|meta|primary table|safety/i.test(desc)) continue;
+    const sec = Math.max(512, Number(sectorSize) || 512);
     parts.push({
       startLba,
       endLba,
       sectors,
-      startByte: startLba * sectorSize,
+      startByte: startLba * sec,
+      lengthBytes: sectors * sec,
       description: desc,
     });
   }
@@ -408,8 +410,9 @@ function extractTskInodeToFile(devicePath, partOffsetBytes, inode, destPath, exp
       settled = true;
       const expected = Number.isFinite(Number(expectedSize)) ? Math.max(0, Number(expectedSize)) : 0;
       const shortWrite = expected > 0 && bytesWritten < expected;
+      const oversizedWrite = expected > 0 && bytesWritten > expected;
       const emptyWrite = bytesWritten <= 0;
-      const ok = childCode === 0 && !emptyWrite && !shortWrite;
+      const ok = childCode === 0 && !emptyWrite && !shortWrite && !oversizedWrite;
       let error;
       if (childCode !== 0) {
         error = errText.trim() || `icat exited with code ${childCode}`;
@@ -417,6 +420,8 @@ function extractTskInodeToFile(devicePath, partOffsetBytes, inode, destPath, exp
         error = 'Sleuth Kit icat extracted 0 bytes.';
       } else if (shortWrite) {
         error = `Short TSK extraction: wrote ${bytesWritten} of ${expected} expected bytes.`;
+      } else if (oversizedWrite) {
+        error = `Unexpected oversized TSK extraction: wrote ${bytesWritten} of ${expected} expected bytes.`;
       }
       resolve({
         ok,

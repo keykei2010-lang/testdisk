@@ -9,8 +9,10 @@ contextBridge.exposeInMainWorld('desktopBridge', {
   listWindowsVolumes: () => ipcRenderer.invoke('win:list-volumes'),
   listBitLockerVolumes: () => ipcRenderer.invoke('win:list-bitlocker'),
   unlockBitLocker: (params) => ipcRenderer.invoke('win:unlock-bitlocker', params),
-  readDiskBytes: (devicePath, startByte, maxBytes, tskInode, tskOffset) =>
-    ipcRenderer.invoke('win:read-disk-bytes', { devicePath, startByte, maxBytes, tskInode, tskOffset }),
+  readDiskBytes: (devicePath, startByte, maxBytes, tskInode, tskOffset, sectorSize) =>
+    ipcRenderer.invoke('win:read-disk-bytes', { devicePath, startByte, maxBytes, tskInode, tskOffset, sectorSize }),
+  readDiskBytesDetailed: (devicePath, startByte, maxBytes, tskInode, tskOffset, sectorSize) =>
+    ipcRenderer.invoke('win:read-disk-bytes-detailed', { devicePath, startByte, maxBytes, tskInode, tskOffset, sectorSize }),
   probeVideoPreview: (params) => ipcRenderer.invoke('win:probe-video-preview', params),
   repairMediaFile: (params) => ipcRenderer.invoke('win:repair-media-file', params),
   identifyFilesNative: (filePaths) => ipcRenderer.invoke('win:identify-files', filePaths),

@@ -42,6 +42,7 @@ export interface NativeScannedEntry {
   runs?: { offset: number; length: number }[];
   tskInode?: string;
   tskOffset?: number;
+  sectorSize?: number;
   discoveryCrc32?: number;
   mftResident?: boolean;
   mftOverwritten?: boolean;
@@ -135,7 +136,10 @@ export interface NativeRecoverRequestItem {
   runs?: { offset: number; length: number }[];
   tskInode?: string;
   tskOffset?: number;
+  sectorSize?: number;
   discoveryCrc32?: number;
+  ntfsCompressed?: boolean;
+  ntfsEncrypted?: boolean;
   memoryBytes?: Uint8Array;
   extension: string;
   repairIfTruncated: boolean;
@@ -154,6 +158,7 @@ export interface RepairMediaFileParams {
   runs?: { offset: number; length: number }[];
   tskInode?: string;
   tskOffset?: number;
+  sectorSize?: number;
   referenceBuffer?: Uint8Array;
   allowTranscodeFallback?: boolean;
   saveWithDialog?: boolean;
@@ -169,6 +174,7 @@ export interface RepairMediaFileResult {
   outputPath?: string;
   repairedBytes?: Uint8Array;
   salvagedPreviewBytes?: Uint8Array;
+  unverifiedDestination?: boolean;
   error?: string;
 }
 
@@ -191,12 +197,22 @@ export interface DesktopBridge {
     maxBytes?: number,
     tskInode?: string,
     tskOffset?: number,
+    sectorSize?: number,
   ) => Promise<Uint8Array>;
+  readDiskBytesDetailed?: (
+    devicePath: string,
+    startByte?: number,
+    maxBytes?: number,
+    tskInode?: string,
+    tskOffset?: number,
+    sectorSize?: number,
+  ) => Promise<{ bytes: Uint8Array; badSectors: number; badBytes: number; shortRead: boolean }>;
   probeVideoPreview: (params: {
     filePath?: string;
     buffer?: Uint8Array;
     tskInode?: string;
     tskOffset?: number;
+    sectorSize?: number;
     devicePath?: string;
   }) => Promise<VideoPreviewResult | null>;
   repairMediaFile: (params: RepairMediaFileParams) => Promise<RepairMediaFileResult>;
@@ -237,6 +253,7 @@ export interface DesktopBridge {
     canceled?: boolean;
     savedCount: number;
     verifiedCount?: number;
+    partialCount?: number;
     originalKeptCount?: number;
     destinationDir: string;
     repairedCount: number;

@@ -160,6 +160,7 @@ export const ExplorerInspector: React.FC<ExplorerInspectorProps> = ({
               devicePath: ref.devicePath,
               tskInode: ref.tskInode,
               tskOffset: ref.tskOffset,
+              sectorSize: ref.sectorSize,
             }
           : focusedFile.data.byteLength > 0
             ? { buffer: focusedFile.data }
@@ -191,6 +192,7 @@ export const ExplorerInspector: React.FC<ExplorerInspectorProps> = ({
         4096,
         ref.tskInode,
         ref.tskOffset,
+        ref.sectorSize,
       )
       .then((bytes) => {
         if (!active || bytes.length === 0) return;
@@ -226,6 +228,7 @@ export const ExplorerInspector: React.FC<ExplorerInspectorProps> = ({
     ) {
       await bridge.recoverFilesToFolder({
         destinationDir: null,
+        scannedDevicePath: item.sourceRef.devicePath,
         items: [
           {
             filename: outName,
@@ -237,7 +240,10 @@ export const ExplorerInspector: React.FC<ExplorerInspectorProps> = ({
             runs: item.sourceRef.runs,
             tskInode: item.sourceRef.tskInode,
             tskOffset: item.sourceRef.tskOffset,
+            sectorSize: item.sourceRef.sectorSize,
             discoveryCrc32: item.discoveryCrc32,
+            ntfsCompressed: item.ntfsCompressed,
+            ntfsEncrypted: item.ntfsEncrypted,
             extension: item.extension,
             repairIfTruncated:
               item.status === 'OK_TRUNCATED' ||

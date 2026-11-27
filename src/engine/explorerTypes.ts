@@ -15,6 +15,7 @@ export interface FileSourceRef {
   runs?: ExtentRun[];
   tskInode?: string;
   tskOffset?: number;
+  sectorSize?: number;
   browserFile?: File;
 }
 
@@ -211,6 +212,11 @@ export interface SavedScanSession {
   diskSizeBytes: number;
   devicePath?: string;
   resumeOffset?: number;
+  incomplete?: boolean;
+  skippedBadSectors?: number;
+  skippedBadBytes?: number;
+  progressPercent?: number;
+  truncatedMemoryCount?: number;
   readOnly?: boolean;
   warnings?: string[];
   items: SerializedScanSessionItem[];

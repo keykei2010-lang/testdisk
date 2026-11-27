@@ -569,15 +569,48 @@ export function writeMbrPartitionTable(
     }
   }
 
+  if (selectedPartitions.length > 4) {
+    throw new Error('MBR supports at most 4 primary partition entries.');
+  }
+
+  const totalDiskSectors = Math.floor(originalDisk.length / sec);
+  const sorted = [...selectedPartitions].sort((a, b) => a.startLba - b.startLba);
+  for (let i = 0; i < sorted.length; i++) {
+    const p = sorted[i];
+    if (
+      !Number.isInteger(p.startLba) ||
+      !Number.isInteger(p.sectors) ||
+      p.startLba < 1 ||
+      p.sectors <= 0 ||
+      p.startLba > 0xffffffff ||
+      p.sectors > 0xffffffff
+    ) {
+      throw new Error(`Invalid MBR LBA range for partition "${p.name || p.id}" (start=${p.startLba}, sectors=${p.sectors}).`);
+    }
+    if (p.startLba + p.sectors > totalDiskSectors) {
+      throw new Error(
+        `Partition "${p.name || p.id}" (ends at LBA ${p.startLba + p.sectors - 1}) exceeds disk image bounds (${totalDiskSectors} sectors).`,
+      );
+    }
+    if (i > 0) {
+      const prev = sorted[i - 1];
+      const prevEnd = prev.startLba + prev.sectors - 1;
+      if (p.startLba <= prevEnd) {
+        throw new Error(
+          `Partition "${p.name || p.id}" (LBA ${p.startLba}) overlaps preceding partition "${prev.name || prev.id}" (ends LBA ${prevEnd}).`,
+        );
+      }
+    }
+  }
+
   const patched = originalDisk.slice();
   // Clear 4 MBR partition slots (0x1BE .. 0x1FD)
   for (let i = 0x1be; i < 0x1fe; i++) {
     patched[i] = 0;
   }
 
-  const toWrite = selectedPartitions.slice(0, 4);
   const view = new DataView(patched.buffer);
-  toWrite.forEach((part, idx) => {
+  sorted.forEach((part, idx) => {
     const off = 0x1be + idx * 16;
     const sysInd = parseInt(part.typeCode, 16) || 0x83;
     patched[off] = part.bootable ? 0x80 : 0x00;

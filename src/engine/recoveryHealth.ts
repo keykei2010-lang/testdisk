@@ -479,7 +479,7 @@ export function buildCsvReport(items: ExplorerFileItem[], diskName: string): str
         item.recoveryChance,
         item.recoveryReason,
         item.sourceKind,
-        item.isDeleted === false ? 'No' : 'Yes',
+        item.isDeleted === true ? 'Yes' : item.isDeleted === false ? 'No' : 'Unknown',
         item.partitionName,
         item.originalPath || '',
         `0x${item.offset.toString(16)}`,

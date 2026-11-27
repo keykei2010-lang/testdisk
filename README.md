@@ -23,7 +23,7 @@ A Windows desktop and offline data recovery application built with React, TypeSc
 
 ## Important Recovery Safety & Limitations
 
-- **SSD / NVMe TRIM Advisory**: Internal and USB-UASP SSDs with hardware TRIM / Discard enabled typically zero out unallocated blocks almost immediately after file deletion or Recycle Bin emptying. If a file disappeared after TRIM ran, deleted sectors may contain zeros (`0x00`), leaving raw sector carving unable to recover deleted payloads unless Volume Shadow Copies (`vssadmin`) or intact `$MFT` copies remain.
+- **SSD / NVMe TRIM Advisory**: Depending on the SSD controller, firmware, and OS settings, trimmed unallocated blocks may return zeros (`0x00`), stale blocks, or read errors after deletion or Recycle Bin emptying. When carved or native exports show zero-filled sectors or header CRC mismatches, TRIM, hardware read errors, or overwritten clusters may prevent reconstruction unless Volume Shadow Copies (`vssadmin`) or intact `$MFT` copies remain.
 - **Save to a Different Drive**: Always write recovered files, forensic reports (`.csv`, `.dfxml`, `.tdscan.json`), and `Recovery-Audit-Report.txt` to a **different physical drive or volume** than the one being scanned so recovered writes never overwrite unallocated sectors.
 - **Administrator & BitLocker**: Accessing physical drives (`\\.\PhysicalDriveN`), raw `$MFT` records, `$UsnJrnl`, and Volume Shadow Copies requires running as Administrator (`requireAdministrator` manifest). BitLocker-encrypted partitions (`-FVE-FS-`) must be unlocked using your 48-digit recovery key or password first.
 
@@ -91,7 +91,7 @@ npm run dist:win
 
 ## License & Third-Party Notices
 
-- Application source code: GNU General Public License v3 (GPLv3).
+- Application source code: GNU General Public License v2 (GPLv2) — see `COPYING`.
 - When packaged with optional helper binaries via `scripts/setup-win-engines.ps1` / CI:
   - **The Sleuth Kit** (`fls`, `icat`, `istat`, `mmls`): Common Public License (CPL 1.0) / IBM Public License (IPL 1.0).
   - **FFmpeg / FFprobe** (`ffmpeg`, `ffprobe`): GNU General Public License (GPL) / Lesser General Public License (LGPL).

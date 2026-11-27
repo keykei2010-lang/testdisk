@@ -1743,9 +1743,9 @@ test('main.cjs NTFS 4K MFT record + $ATTRIBUTE_LIST + compression/EFS + missing 
   payload.copy(dataAttr, 24);
 
   const mftStartOffset = 8192;
-  // Place rec 0 at slot 0, rec 1 at slot 1 inside mftRuns
+  // Place rec 0 at slot 0, rec 1 (pointing back to base record 0) at slot 1 inside mftRuns
   const baseRecBuf = buildMftRec(0, 0, [fnAttr, alAttr]);
-  const extRecBuf = buildMftRec(1, 1, [dataAttr]);
+  const extRecBuf = buildMftRec(1, 0, [dataAttr]);
   baseRecBuf.copy(imgBuf, mftStartOffset);
   extRecBuf.copy(imgBuf, mftStartOffset + recSize);
 
@@ -1772,6 +1772,31 @@ test('main.cjs NTFS 4K MFT record + $ATTRIBUTE_LIST + compression/EFS + missing 
     assert.equal(parsed.entry.ntfsCompressed, true);
     assert.equal(parsed.entry.ntfsEncrypted, true);
     assert.equal(parsed.entry.modifiedAt, undefined);
+
+    // Extension record with mismatched baseRec (99 != 0) MUST be rejected by ownership check (#10)
+    const rogueExt = buildMftRec(1, 99, [dataAttr]);
+    const rogueFdBuf = Buffer.from(imgBuf);
+    rogueExt.copy(rogueFdBuf, mftStartOffset + recSize);
+    const roguePath = `${tmpImg}.rogue`;
+    fs.writeFileSync(roguePath, rogueFdBuf);
+    const rfd = fs.openSync(roguePath, 'r');
+    try {
+      const rogueParsed = parseMftRecordBuffer(
+        baseRecBuf,
+        mftStartOffset,
+        [part],
+        rfd,
+        rogueFdBuf.length,
+        new Map(),
+        new Map(),
+        true,
+        { mftRuns, mftRecSize: recSize, sectorSize: 512 },
+      );
+      assert.equal(rogueParsed?.entry, undefined);
+    } finally {
+      fs.closeSync(rfd);
+      if (fs.existsSync(roguePath)) fs.unlinkSync(roguePath);
+    }
   } finally {
     fs.closeSync(fd);
     if (fs.existsSync(tmpImg)) fs.unlinkSync(tmpImg);
@@ -1827,6 +1852,494 @@ test('main.cjs NTFS 4K MFT record + $ATTRIBUTE_LIST + compression/EFS + missing 
   gptDisk[511] = 0xaa;
   assert.throws(() => writeMbrPartitionTable(gptDisk, []), /GPT/);
 });
+
+test('third-audit regressions: lost partitions IPC + sparse probe + early EOF + unreadable bitmap + range bitmap + incomplete export + zero-fill audit + same-drive + MBR bounds + CSV Unknown', async () => {
+  const req = createRequire(import.meta.url);
+  const {
+    scanLostPartitionsHandlerImpl,
+    startDriveScanHandlerImpl,
+    loadNtfsBitmapsOnly,
+    readFat32BitmapOnly,
+    readExfatBitmapOnly,
+    checkSameSourcePaths,
+    recoverFilesImpl,
+    readDiskBytesDetailedFromFdSync,
+    scanVssSnapshotsForPrefix,
+  } = req('../electron/main.cjs');
+  const { checkRangeAllocation, scanRange } = req('../electron/scannerWorker.cjs');
+
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'td_audit3_test_'));
+  try {
+    // 1 + 13: 8 MiB image with NTFS at LBA 2048 and ext4 superblock at LBA 5000 (superblock +1024 inside LBA 5000)
+    const img8mPath = path.join(tmpDir, 'lost8m.img');
+    const img8m = Buffer.alloc(8 * 1024 * 1024);
+    const lba2048 = 2048 * 512;
+    img8m[lba2048] = 0xeb; img8m[lba2048 + 1] = 0x52; img8m[lba2048 + 2] = 0x90;
+    img8m.write('NTFS    ', lba2048 + 3, 'ascii');
+    img8m.writeUInt16LE(512, lba2048 + 11);
+    img8m[lba2048 + 13] = 8;
+    img8m.writeBigUInt64LE(4096n, lba2048 + 40);
+    img8m[lba2048 + 510] = 0x55; img8m[lba2048 + 511] = 0xaa;
+
+    const lba5000 = 5000 * 512;
+    const sbOff = lba5000 + 1024;
+    img8m.writeUInt16LE(0xef53, sbOff + 0x38); // ext magic
+    img8m.writeUInt32LE(2, sbOff + 0x18); // s_log_block_size -> 4096
+    img8m.writeUInt32LE(512, sbOff + 0x04); // s_blocks_count_lo -> 512 * 4096 = 2 MiB
+    img8m.writeUInt32LE(0x40, sbOff + 0x60); // ext4 feature extents
+
+    // Also place an out-of-bounds FAT16 boot sector at LBA 7000 claiming 999999 sectors -> must be clamped or rejected
+    const lba7000 = 7000 * 512;
+    img8m[lba7000] = 0xeb; img8m[lba7000 + 1] = 0x3c; img8m[lba7000 + 2] = 0x90;
+    img8m.write('MSDOS5.0', lba7000 + 3, 'ascii');
+    img8m.writeUInt16LE(512, lba7000 + 11);
+    img8m[lba7000 + 13] = 4;
+    img8m.writeUInt16LE(1, lba7000 + 14);
+    img8m[lba7000 + 16] = 2;
+    img8m.writeUInt16LE(512, lba7000 + 17);
+    img8m.writeUInt32LE(999999, lba7000 + 32); // way past 8 MiB EOF
+    img8m.write('FAT16   ', lba7000 + 54, 'ascii');
+    img8m[lba7000 + 510] = 0x55; img8m[lba7000 + 511] = 0xaa;
+    fs.writeFileSync(img8mPath, img8m);
+
+    const lostIpcRes = await scanLostPartitionsHandlerImpl({
+      devicePath: img8mPath,
+      totalBytes: img8m.length,
+    });
+    assert.ok(Array.isArray(lostIpcRes.partitions));
+    assert.ok(lostIpcRes.partitions.some((p: { startLba: number; status: string }) => p.startLba === 2048 && p.status === 'Deleted / Lost'));
+    assert.ok(lostIpcRes.partitions.some((p: { startLba: number; typeName: string }) => p.startLba === 5000 && /ext/i.test(p.typeName)));
+    for (const p of lostIpcRes.partitions) {
+      assert.ok(p.endLba * 512 <= img8m.length, `LBA ${p.startLba} endLba ${p.endLba} exceeded image bounds`);
+    }
+
+    // 2: Early EOF on Deep Scan (1024-byte file, declared totalBytes = 1 MiB) -> incomplete=true + warning
+    const tinyPath = path.join(tmpDir, 'tiny_eof.img');
+    fs.writeFileSync(tinyPath, Buffer.alloc(1024));
+    const eofRes = await startDriveScanHandlerImpl(null, {
+      scanId: 'test-eof-1',
+      devicePath: tinyPath,
+      totalBytes: 1024 * 1024,
+      blockSize: 512,
+      scanMode: 'full',
+      startPhase: 'deep',
+    });
+    assert.equal(eofRes.incomplete, true);
+    assert.ok(eofRes.warnings.some((w: string) => /EOF|bytes of/i.test(w)));
+
+    // Direct worker scanRange early EOF reporting
+    const workerMsgs: unknown[] = [];
+    const resWorker = await scanRange({
+      devicePath: tinyPath,
+      rangeStart: 0,
+      rangeEnd: 64 * 1024,
+      totalLimitBytes: 64 * 1024,
+      blockSize: 512,
+      workerIndex: 0,
+      emit: (m: unknown) => workerMsgs.push(m),
+    });
+    assert.equal(resWorker.earlyEof, true);
+    assert.ok(workerMsgs.some((m: { type?: string }) => m.type === 'error'));
+
+    // 3: Simulated EIO on $Bitmap middle sector keeps sectorValidity false and prevents marking unverified clusters as free
+    const ntfsMapImg = Buffer.alloc(64 * 1024);
+    ntfsMapImg[0] = 0xeb; ntfsMapImg[1] = 0x52; ntfsMapImg[2] = 0x90;
+    ntfsMapImg.write('NTFS    ', 3, 'ascii');
+    ntfsMapImg.writeUInt16LE(512, 11);
+    ntfsMapImg[13] = 2; // 1024 B cluster
+    ntfsMapImg.writeBigUInt64LE(128n, 40); // 128 sectors
+    ntfsMapImg.writeBigUInt64LE(4n, 48); // MFT at cluster 4 (offset 4096)
+    ntfsMapImg[64] = 0xfc; // -4 => 1024-byte MFT record
+    ntfsMapImg[510] = 0x55; ntfsMapImg[511] = 0xaa;
+    // MFT record 0 ($MFT) at offset 4096 with valid USA fixup so readNtfsBootAndMftLayout succeeds
+    const writeSmallMftRec = (targetOff: number, recNum: number, attrs: Buffer[]) => {
+      ntfsMapImg.write('FILE', targetOff, 'ascii');
+      ntfsMapImg.writeUInt16LE(48, targetOff + 4); // USA offset
+      ntfsMapImg.writeUInt16LE(3, targetOff + 6); // 1 + 1024/512 = 3 words
+      ntfsMapImg.writeUInt16LE(1, targetOff + 16); // seq
+      ntfsMapImg.writeUInt16LE(56, targetOff + 20); // first attr offset
+      ntfsMapImg.writeUInt16LE(1, targetOff + 22); // in-use
+      ntfsMapImg.writeUInt32LE(recNum, targetOff + 44);
+      const usn = 1;
+      ntfsMapImg.writeUInt16LE(usn, targetOff + 48);
+      let pos = 56;
+      for (const a of attrs) {
+        a.copy(ntfsMapImg, targetOff + pos);
+        pos += a.length;
+      }
+      ntfsMapImg.writeUInt32LE(0xffffffff, targetOff + pos);
+      ntfsMapImg.writeUInt32LE(pos + 8, targetOff + 24); // usedBytes
+      for (let s = 1; s <= 2; s++) {
+        const se = targetOff + s * 512 - 2;
+        ntfsMapImg.writeUInt16LE(ntfsMapImg.readUInt16LE(se), targetOff + 48 + s * 2);
+        ntfsMapImg.writeUInt16LE(usn, se);
+      }
+    };
+    writeSmallMftRec(4096, 0, []);
+
+    // MFT record 6 ($Bitmap) at offset 4096 + 6*1024 = 10240 with $FILE_NAME('$Bitmap') + non-resident $DATA
+    const bmNameBytes = Buffer.from('$Bitmap', 'utf16le');
+    const bmFnAttr = Buffer.alloc(Math.ceil((24 + 66 + bmNameBytes.length) / 8) * 8);
+    bmFnAttr.writeUInt32LE(0x30, 0);
+    bmFnAttr.writeUInt32LE(bmFnAttr.length, 4);
+    bmFnAttr.writeUInt32LE(66 + bmNameBytes.length, 16);
+    bmFnAttr.writeUInt16LE(24, 20);
+    bmFnAttr.writeUInt32LE(5, 24);
+    bmFnAttr[24 + 64] = '$Bitmap'.length;
+    bmFnAttr[24 + 65] = 3;
+    bmNameBytes.copy(bmFnAttr, 24 + 66);
+
+    const bmDataAttr = Buffer.alloc(80);
+    bmDataAttr.writeUInt32LE(0x80, 0);
+    bmDataAttr.writeUInt32LE(80, 4);
+    bmDataAttr[8] = 1; // non-resident
+    bmDataAttr.writeUInt16LE(64, 32); // mapping pairs offset
+    bmDataAttr.writeBigUInt64LE(1536n, 48); // real size = 1536 B (3 sectors)
+    bmDataAttr[64] = 0x11; // len=1, off=1
+    bmDataAttr[65] = 2; // 2 clusters = 2048 B
+    bmDataAttr[66] = 20; // LCN 20
+    bmDataAttr[67] = 0x00;
+
+    writeSmallMftRec(4096 + 6 * 1024, 6, [bmFnAttr, bmDataAttr]);
+
+    const ntfsMapPath = path.join(tmpDir, 'ntfs_eio.img');
+    fs.writeFileSync(ntfsMapPath, ntfsMapImg);
+    const eioFd = fs.openSync(ntfsMapPath, 'r');
+    const origReadSync = fs.readSync;
+    const targetBadSectorOffset = 20 * 1024 + 512; // middle sector of $Bitmap!
+    fs.readSync = ((fdArg: number, buf: Buffer, off: number, len: number, pos: number) => {
+      if (fdArg === eioFd && pos !== null && pos <= targetBadSectorOffset && pos + len > targetBadSectorOffset) {
+        const err = new Error('Simulated EIO on $Bitmap') as NodeJS.ErrnoException;
+        err.code = 'EIO';
+        throw err;
+      }
+      return origReadSync.call(fs, fdArg, buf, off, len, pos);
+    }) as typeof fs.readSync;
+    try {
+      const bmRes = loadNtfsBitmapsOnly(
+        eioFd,
+        [{ fsType: 'NTFS', volStart: 0, volEnd: ntfsMapImg.length, clusterBytes: 1024, sectorSize: 512, mftLcn: 4, mftRecSize: 1024 }],
+        ntfsMapImg.length,
+      );
+      const bmBuf = bmRes.bitmapByVol.get(0);
+      assert.ok(bmBuf);
+      assert.equal(bmBuf.hadReadError, true);
+      assert.equal((bmBuf.sectorValidity[0] & (1 << 1)) === 0, true);
+      assert.ok(bmRes.warnings.length > 0);
+      // Sector 1 of $Bitmap covers bytes 512..1023 -> clusters 4096..8191; cluster 4096 must NOT be marked verified free!
+      const ntfsBmList = [{
+        volStart: 0,
+        volEnd: ntfsMapImg.length,
+        clusterBytes: 1024,
+        bitmap: bmBuf,
+        sectorValidity: bmBuf.sectorValidity,
+      }];
+      const rangeCheck = checkRangeAllocation(4096 * 1024, 512, true, ntfsBmList);
+      assert.equal(rangeCheck.allVerified, false);
+    } finally {
+      fs.readSync = origReadSync;
+      fs.closeSync(eioFd);
+    }
+
+    // 4: checkRangeAllocation rejects multi-cluster file whose starting cluster is free (0) but second cluster is allocated (1)
+    const synthBitmap = Buffer.from([0b00000010]); // cluster 0 free, cluster 1 allocated!
+    const synthMap = [{
+      fsType: 'FAT32',
+      volStart: 0,
+      volEnd: 16 * 4096,
+      dataStart: 0,
+      clusterBytes: 4096,
+      bitmap: synthBitmap,
+      sectorValidity: Buffer.from([1]),
+    }];
+    assert.deepEqual(checkRangeAllocation(0, 2048, true, synthMap), { anyAllocated: false, allVerified: true });
+    assert.deepEqual(checkRangeAllocation(0, 6000, true, synthMap), { anyAllocated: true, allVerified: false });
+
+    // Verify FAT32 & exFAT bitmap readers extract real bitmaps
+    const fatPath = path.join(tmpDir, 'fat32_bm.img');
+    const fatImg = Buffer.alloc(64 * 1024);
+    fatImg[0] = 0xeb; fatImg[1] = 0x58; fatImg[2] = 0x90;
+    fatImg.writeUInt16LE(512, 11);
+    fatImg[13] = 2; // 1024 B cluster
+    fatImg.writeUInt16LE(8, 14); // reserved sectors = 8
+    fatImg[16] = 1; // 1 FAT
+    fatImg.writeUInt32LE(128, 32); // total sectors
+    fatImg.writeUInt32LE(4, 36); // FAT size = 4 sectors -> data starts at sector 12 (6144 B)
+    fatImg.write('FAT32   ', 82, 'ascii');
+    fatImg[510] = 0x55; fatImg[511] = 0xaa;
+    // FAT[2] at sector 8 * 512 + 8 = allocated, FAT[3] = free (0)
+    fatImg.writeUInt32LE(0x0ffffff8, 8 * 512);
+    fatImg.writeUInt32LE(0x0fffffff, 8 * 512 + 4);
+    fatImg.writeUInt32LE(0x0fffffff, 8 * 512 + 8); // cluster 2 allocated!
+    fs.writeFileSync(fatPath, fatImg);
+    const fatFd = fs.openSync(fatPath, 'r');
+    try {
+      const fatBmRes = readFat32BitmapOnly(
+        fatFd,
+        [{ volStart: 0, volEnd: fatImg.length, sectorSize: 512, clusterBytes: 1024, bootBuf: fatImg.subarray(0, 512) }],
+        fatImg.length,
+        512,
+      );
+      assert.equal(fatBmRes.bitmaps.length, 1);
+      assert.equal(checkRangeAllocation(12 * 512, 512, true, fatBmRes.bitmaps).anyAllocated, true); // cluster 2 allocated
+      assert.equal(checkRangeAllocation(12 * 512 + 1024, 512, true, fatBmRes.bitmaps).anyAllocated, false); // cluster 3 free
+    } finally {
+      fs.closeSync(fatFd);
+    }
+
+    const exfatPath = path.join(tmpDir, 'exfat_bm.img');
+    const exfatImg = Buffer.alloc(64 * 1024);
+    exfatImg[0] = 0xeb; exfatImg[1] = 0x76; exfatImg[2] = 0x90;
+    exfatImg.write('EXFAT   ', 3, 'ascii');
+    exfatImg.writeBigUInt64LE(128n, 72);
+    exfatImg.writeUInt32LE(16, 88); // clusterHeapOffset = sector 16 (8192 B)
+    exfatImg.writeUInt32LE(2, 96); // rootDirFirstCluster = 2
+    exfatImg[108] = 9; // 512 B sector
+    exfatImg[109] = 1; // 2 sectors/cluster = 1024 B cluster
+    exfatImg[510] = 0x55; exfatImg[511] = 0xaa;
+    // Root directory entry type 0x81 (Allocation Bitmap) at cluster 2 (offset 8192)
+    exfatImg[8192] = 0x81;
+    exfatImg.writeUInt32LE(3, 8192 + 20); // bitmap at cluster 3 (offset 9216)
+    exfatImg.writeBigUInt64LE(8n, 8192 + 24);
+    exfatImg[9216] = 0b00000011; // clusters 2 & 3 allocated, cluster 4 free
+    fs.writeFileSync(exfatPath, exfatImg);
+    const exfatFd = fs.openSync(exfatPath, 'r');
+    try {
+      const exBmRes = readExfatBitmapOnly(
+        exfatFd,
+        [{ volStart: 0, volEnd: exfatImg.length, sectorSize: 512, clusterBytes: 1024, heapOffset: 8192, rootDirOffset: 8192 }],
+        exfatImg.length,
+        512,
+      );
+      assert.equal(exBmRes.bitmaps.length, 1);
+      assert.equal(checkRangeAllocation(8192 + 1024, 512, true, exBmRes.bitmaps).anyAllocated, true); // cluster 3 allocated
+      assert.equal(checkRangeAllocation(8192 + 2048, 512, true, exBmRes.bitmaps).anyAllocated, false); // cluster 4 free
+    } finally {
+      fs.closeSync(exfatFd);
+    }
+
+    // 5 + 6 + 8 + 15: incomplete run list, short memory payload, bad-sector partial reporting & zero-fill NOT verified
+    const srcPath = path.join(tmpDir, 'export_src.bin');
+    const srcBuf = Buffer.alloc(70 * 1024, 0x41);
+    fs.writeFileSync(srcPath, srcBuf);
+    const outDir = path.join(tmpDir, 'export_out');
+    fs.mkdirSync(outDir);
+
+    const incompleteRunsRes = await recoverFilesImpl({
+      targetRoot: outDir,
+      items: [
+        {
+          filename: 'incomplete.bin',
+          folder: 'Docs',
+          sourceKind: 'native-runs',
+          devicePath: srcPath,
+          offset: 0,
+          size: 2048,
+          runs: [{ offset: 0, length: 512 }],
+          extension: 'bin',
+          repairIfTruncated: false,
+        },
+      ],
+    });
+    assert.equal(incompleteRunsRes.savedCount, 0);
+    assert.ok(/Incomplete.*run list/i.test(incompleteRunsRes.failures[0].reason));
+
+    const shortMemRes = await recoverFilesImpl({
+      targetRoot: outDir,
+      items: [
+        {
+          filename: 'shortmem.bin',
+          folder: 'Docs',
+          sourceKind: 'memory',
+          offset: 0,
+          size: 2048,
+          memoryBytes: new Uint8Array(512).fill(0x42),
+          extension: 'bin',
+          repairIfTruncated: false,
+        },
+      ],
+    });
+    assert.equal(shortMemRes.savedCount, 0);
+    assert.ok(shortMemRes.failures[0].reason.includes('Short memory payload'));
+
+    // Memory repair with keepOriginalOnRepair preserves _original (#15)
+    const truncPngMem = Buffer.from([
+      0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, // PNG signature (8)
+      0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52, // IHDR header (len=13)
+      0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x02, 0x00, 0x00, 0x00, // 1x1 RGB (13)
+      0x90, 0x77, 0x53, 0xde, // IHDR CRC (4)
+      0x00, 0x00, 0x00, 0x10, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9c, 0x63, 0x00, // truncated IDAT without IEND
+    ]);
+    const memRepRes = await recoverFilesImpl({
+      targetRoot: outDir,
+      keepOriginalOnRepair: true,
+      items: [
+        {
+          filename: 'pic.png',
+          folder: 'Pictures',
+          sourceKind: 'memory',
+          offset: 0,
+          size: truncPngMem.length,
+          memoryBytes: new Uint8Array(truncPngMem),
+          extension: 'png',
+          repairIfTruncated: true,
+        },
+      ],
+    });
+    assert.equal(memRepRes.savedCount, 1);
+    assert.equal(memRepRes.repairedCount, 1);
+    assert.equal(memRepRes.originalKeptCount, 1);
+    assert.ok(fs.existsSync(path.join(outDir, 'Pictures', 'pic_original.png')));
+
+    // Bad sector past 64 KiB -> savedCount=1, partialCount=1, verifiedCount=0, audit log says PARTIAL_BAD_SECTORS (#8)
+    const head64Crc = computeCrc32(new Uint8Array(srcBuf.subarray(0, 65536)));
+    const fdSrc = fs.openSync(srcPath, 'r');
+    const origOpen = fs.openSync;
+    const origRead2 = fs.readSync;
+    let patchedBadFd = -1;
+    fs.openSync = ((p: fs.PathLike, flags: fs.OpenMode) => {
+      const f = origOpen.call(fs, p, flags);
+      if (String(p) === srcPath && flags === 'r') patchedBadFd = f;
+      return f;
+    }) as typeof fs.openSync;
+    fs.readSync = ((fdArg: number, buf: Buffer, off: number, len: number, pos: number) => {
+      if (fdArg === patchedBadFd && pos !== null && pos <= 66048 && pos + len > 66048) {
+        const err = new Error('Simulated EIO after 64K') as NodeJS.ErrnoException;
+        err.code = 'EIO';
+        throw err;
+      }
+      return origRead2.call(fs, fdArg, buf, off, len, pos);
+    }) as typeof fs.readSync;
+    try {
+      const detailed = readDiskBytesDetailedFromFdSync(fdSrc, 0, srcBuf.length, 512);
+      assert.equal(detailed.shortRead, false);
+
+      const partialExportRes = await recoverFilesImpl({
+        targetRoot: outDir,
+        items: [
+          {
+            filename: 'bad65k.bin',
+            folder: 'Docs',
+            sourceKind: 'native-device',
+            devicePath: srcPath,
+            offset: 0,
+            size: srcBuf.length,
+            discoveryCrc32: head64Crc,
+            extension: 'bin',
+            repairIfTruncated: false,
+          },
+        ],
+      });
+      assert.equal(partialExportRes.savedCount, 1);
+      assert.equal(partialExportRes.partialCount, 1);
+      assert.equal(partialExportRes.verifiedCount, 0);
+      assert.ok(partialExportRes.failures.some((f: { reason: string }) => f.reason.includes('zero-filled')));
+      const reportTxt = fs.readFileSync(partialExportRes.reportPath, 'utf8');
+      assert.ok(reportTxt.includes('PARTIAL_BAD_SECTORS'));
+      assert.ok(reportTxt.includes('HEAD64K_CRC_MATCH_PARTIAL'));
+    } finally {
+      fs.openSync = origOpen;
+      fs.readSync = origRead2;
+      fs.closeSync(fdSrc);
+    }
+
+    // 7: Cross-letter same PhysicalDrive block (\\\\.\\C: source vs D:\\RecoveryOut sharing PhysicalDrive0)
+    const crossLetter = await checkSameSourcePaths({
+      targetPath: 'D:\\RecoveryOut',
+      sourcePaths: ['\\\\.\\C:'],
+      platform: 'win32',
+      resolveBackingDriveFn: async (dl: string) => {
+        if (dl === 'C' || dl === 'D') return { devicePath: '\\\\.\\PhysicalDrive0' };
+        return null;
+      },
+    });
+    assert.equal(crossLetter.blocked, true);
+
+    // 9: VSS snapshot sorting + multi-version retention (#9)
+    const vssEntries: Array<Record<string, unknown>> = [];
+    await scanVssSnapshotsForPrefix('Users\\Alice', new Set<string>(), vssEntries, 50, {
+      platform: 'win32',
+      driveLetter: 'C',
+      volLetterByGuid: new Map([['\\\\?\\volume{vol-guid-1}', 'C:']]),
+      runPowerShellJsonFn: async () => [
+        { DeviceObject: '\\\\?\\GLOBALROOT\\Device\\HarddiskVolumeShadowCopy1', VolumeName: '\\\\?\\Volume{vol-guid-1}\\', InstallDate: '20261101120000' },
+        { DeviceObject: '\\\\?\\GLOBALROOT\\Device\\HarddiskVolumeShadowCopy2', VolumeName: '\\\\?\\Volume{vol-guid-1}\\', InstallDate: '20261102120000' },
+      ],
+      walkFolderEntriesFn: (snapDir: string, tempOut: Array<Record<string, unknown>>) => {
+        if (snapDir.includes('ShadowCopy1')) {
+          tempOut.push({ filename: 'notes.txt', relPath: 'notes.txt', devicePath: path.join(snapDir, 'notes.txt'), size: 100, modifiedAt: 1000 });
+        } else {
+          tempOut.push({ filename: 'notes.txt', relPath: 'notes.txt', devicePath: path.join(snapDir, 'notes.txt'), size: 220, modifiedAt: 2000 });
+        }
+      },
+    });
+    assert.equal(vssEntries.length, 2);
+
+    // 14: writeMbrPartitionTable rejects > 4 partitions, out-of-bounds LBA, and overlapping partitions
+    const mbrImg = new Uint8Array(64 * 512);
+    assert.throws(
+      () =>
+        writeMbrPartitionTable(mbrImg, [
+          { id: '1', index: 1, name: 'p1', typeHex: '0x07', typeName: 'NTFS', bootable: false, status: 'Primary', startLba: 2, endLba: 5, sectors: 4, startOffset: 1024, sizeBytes: 2048 },
+          { id: '2', index: 2, name: 'p2', typeHex: '0x07', typeName: 'NTFS', bootable: false, status: 'Primary', startLba: 6, endLba: 9, sectors: 4, startOffset: 3072, sizeBytes: 2048 },
+          { id: '3', index: 3, name: 'p3', typeHex: '0x07', typeName: 'NTFS', bootable: false, status: 'Primary', startLba: 10, endLba: 13, sectors: 4, startOffset: 5120, sizeBytes: 2048 },
+          { id: '4', index: 4, name: 'p4', typeHex: '0x07', typeName: 'NTFS', bootable: false, status: 'Primary', startLba: 14, endLba: 17, sectors: 4, startOffset: 7168, sizeBytes: 2048 },
+          { id: '5', index: 5, name: 'p5', typeHex: '0x07', typeName: 'NTFS', bootable: false, status: 'Primary', startLba: 18, endLba: 21, sectors: 4, startOffset: 9216, sizeBytes: 2048 },
+        ]),
+      /at most 4/i,
+    );
+    assert.throws(
+      () =>
+        writeMbrPartitionTable(mbrImg, [
+          { id: '1', index: 1, name: 'p1', typeHex: '0x07', typeName: 'NTFS', bootable: false, status: 'Primary', startLba: 10, endLba: 25, sectors: 16, startOffset: 5120, sizeBytes: 8192 },
+          { id: '2', index: 2, name: 'p2', typeHex: '0x07', typeName: 'NTFS', bootable: false, status: 'Primary', startLba: 20, endLba: 35, sectors: 16, startOffset: 10240, sizeBytes: 8192 },
+        ]),
+      /overlap/i,
+    );
+    assert.throws(
+      () =>
+        writeMbrPartitionTable(mbrImg, [
+          { id: '1', index: 1, name: 'p1', typeHex: '0x07', typeName: 'NTFS', bootable: false, status: 'Primary', startLba: 50, endLba: 89, sectors: 40, startOffset: 25600, sizeBytes: 20480 },
+        ]),
+      /exceeds/i,
+    );
+
+    // 17: CSV exports Unknown when isDeleted === undefined
+    const csvOut = buildCsvReport(
+      [
+        {
+          id: 'u1',
+          filename: 'carved.jpg',
+          extension: 'jpg',
+          family: 'Pictures',
+          mimeType: 'image/jpeg',
+          size: 512,
+          calculatedSize: 512,
+          status: 'OK',
+          sourceKind: 'carved',
+          isDeleted: undefined,
+          partitionId: 'p1',
+          partitionName: 'Reconstructed',
+          offset: 0,
+          sector: 0,
+          matchedOffset: 0,
+          matchedLength: 4,
+          metadata: {},
+          description: 'JPEG',
+          data: new Uint8Array(0),
+          recoveryChance: 80,
+          recoveryTier: 'medium',
+          recoveryReason: 'Test',
+        },
+      ],
+      'TestDisk',
+    );
+    assert.ok(csvOut.includes(',Unknown,'), `Expected Unknown in CSV, got: ${csvOut}`);
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
 
 
 

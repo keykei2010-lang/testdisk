@@ -43,6 +43,9 @@
         }
       ]
     },
+    "portable": {
+      "requestExecutionLevel": "requireAdministrator"
+    },
     "directories": {
       "output": "release"
     }

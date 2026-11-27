@@ -358,6 +358,7 @@ export const App: React.FC = () => {
   const [scanIncomplete, setScanIncomplete] = useState<boolean>(false);
   const [skippedBadSectors, setSkippedBadSectors] = useState<number>(0);
   const [skippedBadBytes, setSkippedBadBytes] = useState<number>(0);
+  const [nativeDiskTotalBytes, setNativeDiskTotalBytes] = useState<number>(0);
   const [extraLostPartitions, setExtraLostPartitions] = useState<PartitionEntry[]>([]);
   const [sessionReadOnly, setSessionReadOnly] = useState<boolean>(false);
   const isPausedRef = useRef<boolean>(false);
@@ -423,7 +424,17 @@ export const App: React.FC = () => {
 
   const analysis = useMemo(() => {
     const base = analyzeDiskImage(diskName, diskBytes);
-    if (extraLostPartitions.length === 0) return base;
+    const effectiveDiskSize =
+      (useNativeScan || (sessionReadOnly && nativeDiskTotalBytes > 0)) &&
+      nativeDiskTotalBytes > base.diskSizeBytes
+        ? nativeDiskTotalBytes
+        : base.diskSizeBytes;
+    const effectiveTotalSectors = Math.max(1, Math.floor(effectiveDiskSize / base.sectorSize));
+    if (extraLostPartitions.length === 0) {
+      return effectiveDiskSize !== base.diskSizeBytes
+        ? { ...base, diskSizeBytes: effectiveDiskSize, totalSectors: effectiveTotalSectors }
+        : base;
+    }
     const seenLba = new Set(base.partitions.map((p) => p.startLba));
     const merged = [...base.partitions];
     for (const extra of extraLostPartitions) {
@@ -435,9 +446,11 @@ export const App: React.FC = () => {
     merged.sort((a, b) => a.startLba - b.startLba);
     return {
       ...base,
+      diskSizeBytes: effectiveDiskSize,
+      totalSectors: effectiveTotalSectors,
       partitions: merged,
     };
-  }, [diskName, diskBytes, extraLostPartitions]);
+  }, [diskName, diskBytes, extraLostPartitions, useNativeScan, sessionReadOnly, nativeDiskTotalBytes]);
 
   const canRestoreMbr =
     analysis.arch !== 'EFI GPT' &&
@@ -910,6 +923,7 @@ export const App: React.FC = () => {
     setScanIncomplete(false);
     setSkippedBadSectors(0);
     setSkippedBadBytes(0);
+    setNativeDiskTotalBytes(0);
     setExtraLostPartitions([]);
     setScannedDevicePath(null);
     nativeDriveTargetRef.current = null;
@@ -1073,6 +1087,7 @@ export const App: React.FC = () => {
           runs: entry.runs,
           tskInode: entry.tskInode,
           tskOffset: entry.tskOffset,
+          sectorSize: entry.sectorSize,
         },
         modifiedAt:
           res?.metadata.takenAtMs ??
@@ -1138,6 +1153,7 @@ export const App: React.FC = () => {
     setScanIncomplete(false);
     setSkippedBadSectors(0);
     setSkippedBadBytes(0);
+    setNativeDiskTotalBytes(totalBytes || headBytes.length);
     setExtraLostPartitions([]);
     setDiskName(label);
     setDiskBytes(headBytes);
@@ -1752,8 +1768,14 @@ export const App: React.FC = () => {
     const toRestore = targetPart ? [targetPart] : lostPartitions;
     const merged = [...activeEntries, ...toRestore]
       .filter((p, idx, arr) => arr.findIndex((x) => x.startLba === p.startLba) === idx)
-      .sort((a, b) => a.startLba - b.startLba)
-      .slice(0, 4);
+      .sort((a, b) => a.startLba - b.startLba);
+
+    if (merged.length > 4) {
+      setLoadError(
+        `Cannot write ${merged.length} entries into a 4-slot primary MBR table. Restore a single partition or remove redundant active slots first.`,
+      );
+      return;
+    }
 
     try {
       const patched = writeMbrPartitionTable(diskBytes, merged, analysis.sectorSize);
@@ -1808,6 +1830,7 @@ export const App: React.FC = () => {
           runs: target.sourceRef?.runs,
           tskInode: target.sourceRef?.tskInode,
           tskOffset: target.sourceRef?.tskOffset,
+          sectorSize: target.sourceRef?.sectorSize,
           buffer: isNative ? undefined : sourceBytes,
           referenceBuffer: referenceBytes,
           allowTranscodeFallback: true,
@@ -1838,6 +1861,7 @@ export const App: React.FC = () => {
             runs: target.sourceRef?.runs,
             tskInode: target.sourceRef?.tskInode,
             tskOffset: target.sourceRef?.tskOffset,
+            sectorSize: target.sourceRef?.sectorSize,
             referenceBuffer: referenceBytes,
             allowTranscodeFallback: true,
             saveWithDialog: true,
@@ -1922,9 +1946,9 @@ export const App: React.FC = () => {
         item.sourceRef.kind === 'native-file' ||
         item.sourceRef.kind === 'native-tsk')
     ) {
-      await bridge.recoverFilesToFolder({
+      const res = await bridge.recoverFilesToFolder({
         destinationDir: null,
-        scannedDevicePath: scannedDevicePath ?? undefined,
+        scannedDevicePath: scannedDevicePath ?? item.sourceRef.devicePath ?? undefined,
         items: [
           {
             filename: outName,
@@ -1936,7 +1960,10 @@ export const App: React.FC = () => {
             runs: item.sourceRef.runs,
             tskInode: item.sourceRef.tskInode,
             tskOffset: item.sourceRef.tskOffset,
+            sectorSize: item.sourceRef.sectorSize,
             discoveryCrc32: item.discoveryCrc32,
+            ntfsCompressed: item.ntfsCompressed,
+            ntfsEncrypted: item.ntfsEncrypted,
             extension: item.extension,
             repairIfTruncated:
               item.status === 'OK_TRUNCATED' ||
@@ -1945,6 +1972,11 @@ export const App: React.FC = () => {
           },
         ],
       });
+      if (res?.error) {
+        setLoadError(res.error);
+      } else if (res?.failures && res.failures.length > 0 && !res.canceled) {
+        setLoadError(res.failures.map((f) => `${f.filename}: ${f.reason}`).join(' | '));
+      }
       return;
     }
 
@@ -1965,7 +1997,7 @@ export const App: React.FC = () => {
     const q = searchQuery.trim().toLowerCase();
     const filtered = allItems.filter((item) => {
       if (!itemMatchesNode(item, selectedNode)) return false;
-      if (deletedFilter === 'deleted' && item.isDeleted === false) return false;
+      if (deletedFilter === 'deleted' && item.isDeleted !== true) return false;
       if (deletedFilter === 'existing' && item.isDeleted !== false) return false;
       if (statusFilter === 'ok' && item.status !== 'OK') return false;
       if (statusFilter === 'truncated' && item.status === 'OK') return false;
@@ -2129,6 +2161,7 @@ export const App: React.FC = () => {
             runs: item.sourceRef.runs,
             tskInode: item.sourceRef.tskInode,
             tskOffset: item.sourceRef.tskOffset,
+            sectorSize: item.sourceRef.sectorSize,
           }
         : undefined,
       modifiedAt: item.modifiedAt,
@@ -2146,6 +2179,22 @@ export const App: React.FC = () => {
           : bytesToHexSample(item.data, 4096),
     }));
 
+    const truncatedMemoryCount = allItems.filter(
+      (item) =>
+        (!item.sourceRef ||
+          item.sourceRef.kind === 'memory' ||
+          item.sourceRef.kind === 'browser-file') &&
+        !item.sourceRef?.devicePath &&
+        item.size > 262144,
+    ).length;
+
+    const sessionWarnings = [...scanWarnings];
+    if (truncatedMemoryCount > 0) {
+      sessionWarnings.push(
+        `${truncatedMemoryCount} large in-memory/browser file(s) (> 256 KiB) saved only 4 KiB header samples in this session file.`,
+      );
+    }
+
     const session: SavedScanSession = {
       version: 1,
       savedAt: new Date().toISOString(),
@@ -2153,8 +2202,13 @@ export const App: React.FC = () => {
       diskSizeBytes: analysis.diskSizeBytes,
       devicePath: nativeDriveTargetRef.current?.devicePath ?? scannedDevicePath ?? undefined,
       resumeOffset: scanProgress.currentSector * 512,
+      incomplete: scanIncomplete || undefined,
+      skippedBadSectors: skippedBadSectors > 0 ? skippedBadSectors : undefined,
+      skippedBadBytes: skippedBadBytes > 0 ? skippedBadBytes : undefined,
+      progressPercent: scanProgress.percent,
+      truncatedMemoryCount: truncatedMemoryCount > 0 ? truncatedMemoryCount : undefined,
       readOnly: true,
-      warnings: scanWarnings.length > 0 ? scanWarnings : undefined,
+      warnings: sessionWarnings.length > 0 ? Array.from(new Set(sessionWarnings)) : undefined,
       items: serialized,
     };
 
@@ -2238,13 +2292,24 @@ export const App: React.FC = () => {
       setSessionReadOnly(true);
       nativeDriveTargetRef.current = null;
       setScannedDevicePath(parsed.devicePath ?? null);
+      setNativeDiskTotalBytes(parsed.diskSizeBytes || 0);
       setDiskBytes(EMPTY_DISK_BYTES);
       setRepairedDiskBytes(null);
       setExtraLostPartitions([]);
-      setScanWarnings(Array.isArray(parsed.warnings) ? parsed.warnings : []);
-      setScanIncomplete(false);
-      setSkippedBadSectors(0);
-      setSkippedBadBytes(0);
+      const restoredWarnings = Array.isArray(parsed.warnings) ? [...parsed.warnings] : [];
+      if (
+        typeof parsed.truncatedMemoryCount === 'number' &&
+        parsed.truncatedMemoryCount > 0 &&
+        !restoredWarnings.some((w) => w.includes('4 KiB header samples'))
+      ) {
+        restoredWarnings.push(
+          `${parsed.truncatedMemoryCount} in-memory file(s) in this session contain only 4 KiB header samples and require re-opening the original image/folder to recover full bytes.`,
+        );
+      }
+      setScanWarnings(restoredWarnings);
+      setScanIncomplete(Boolean(parsed.incomplete));
+      setSkippedBadSectors(parsed.skippedBadSectors ?? 0);
+      setSkippedBadBytes(parsed.skippedBadBytes ?? 0);
       setIsScanning(false);
       setIsPaused(false);
       setDiskName(parsed.diskName);
@@ -2253,15 +2318,21 @@ export const App: React.FC = () => {
       setFidentifyItems(restored.filter((i) => i.sourceKind === 'fidentify'));
       setCheckedIds(new Set());
       setFocusedFileId(restored[0]?.id ?? null);
+      const totalSecs = Math.max(1, Math.floor((parsed.diskSizeBytes || 512) / 512));
+      const curSecs = Math.floor((parsed.resumeOffset ?? parsed.diskSizeBytes ?? 0) / 512);
+      const restoredPct =
+        typeof parsed.progressPercent === 'number' && Number.isFinite(parsed.progressPercent)
+          ? Math.max(0, Math.min(100, Math.round(parsed.progressPercent)))
+          : Math.max(0, Math.min(100, Math.round((curSecs / totalSecs) * 100)));
       setScanProgress({
-        currentSector: Math.floor((parsed.resumeOffset ?? parsed.diskSizeBytes) / 512),
-        totalSectors: Math.max(1, Math.floor(parsed.diskSizeBytes / 512)),
-        percent: 100,
+        currentSector: curSecs,
+        totalSectors: totalSecs,
+        percent: restoredPct,
         foundCount: restored.length,
         foundBytes: restored.reduce((sum, x) => sum + x.size, 0),
       });
       setMbrActionNotice(
-        `Loaded read-only saved scan session (${restored.length} files from ${parsed.diskName}). Re-open the drive/image to re-scan or recover uncached sectors.`,
+        `Loaded read-only saved scan session (${restored.length} files from ${parsed.diskName}${parsed.incomplete ? ', incomplete scan' : ''}). Re-open the drive/image to re-scan or recover uncached sectors.`,
       );
     } catch {
       setLoadError('Could not parse scan session JSON file.');

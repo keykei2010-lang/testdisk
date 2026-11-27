@@ -1,9 +1,10 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { AlertTriangle, Archive, CheckCircle2, Folder, HardDrive, X } from 'lucide-react';
-import { createZipArchive, formatBytes } from '../engine/crc32';
+import { computeCrc32, createZipArchive, formatBytes } from '../engine/crc32';
 import {
   getDesktopBridge,
   NativeRecoverFailure,
+  NativeRecoverRequestItem,
   WindowsVolumeInfo,
 } from '../engine/desktopBridge';
 import { FileSourceRef } from '../engine/explorerTypes';
@@ -26,6 +27,8 @@ export interface RecoverableItem {
   data: Uint8Array;
   sourceRef?: FileSourceRef;
   discoveryCrc32?: number;
+  ntfsCompressed?: boolean;
+  ntfsEncrypted?: boolean;
 }
 
 interface RecoveryModalProps {
@@ -136,6 +139,9 @@ export const RecoveryModal: React.FC<RecoveryModalProps> = ({
     destinationMode === 'folder' &&
     selectedDriveLetter !== null &&
     sourceDriveLetters.has(selectedDriveLetter);
+  const zipSameDriveRisk =
+    destinationMode === 'zip' && sourceDriveLetters.size > 0;
+  const hasNtfsRawStreams = items.some((i) => i.ntfsCompressed || i.ntfsEncrypted);
 
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
@@ -226,10 +232,14 @@ export const RecoveryModal: React.FC<RecoveryModalProps> = ({
 
       // 1. Native Windows Desktop streaming copy
       if (desktop && destinationMode === 'folder') {
-        const reqItems = filteredItems.map((item) => {
+        const reqItems: NativeRecoverRequestItem[] = filteredItems.map((item) => {
           const folder = resolveOutputFolder(item);
           const refKind = item.sourceRef?.kind;
           const outName = resolvePreferredExtension(item.filename, item.extension);
+          const shouldRepair =
+            enableFileRepair &&
+            (item.status === 'OK_TRUNCATED' ||
+              (item.status === 'HEADER_ONLY' && isNonMediaRepairableExtension(item.extension)));
           if (
             refKind === 'native-device' ||
             refKind === 'native-runs' ||
@@ -246,34 +256,28 @@ export const RecoveryModal: React.FC<RecoveryModalProps> = ({
               runs: item.sourceRef?.runs,
               tskInode: item.sourceRef?.tskInode,
               tskOffset: item.sourceRef?.tskOffset,
+              sectorSize: item.sourceRef?.sectorSize,
               discoveryCrc32: item.discoveryCrc32,
+              ntfsCompressed: item.ntfsCompressed,
+              ntfsEncrypted: item.ntfsEncrypted,
               extension: item.extension,
-              repairIfTruncated:
-                enableFileRepair &&
-                (item.status === 'OK_TRUNCATED' ||
-                  (item.status === 'HEADER_ONLY' && isNonMediaRepairableExtension(item.extension))),
+              repairIfTruncated: shouldRepair,
               modifiedAtMs: item.modifiedAt,
             };
           }
-          let payload = item.data;
-          if (
-            enableFileRepair &&
-            (item.status === 'OK_TRUNCATED' ||
-              (item.status === 'HEADER_ONLY' && isNonMediaRepairableExtension(item.extension)))
-          ) {
-            const rep = repairFileBuffer(item.extension, payload, referenceVideoBytes ?? undefined);
-            if (rep.repaired) payload = rep.data;
-          }
+          // Pass untouched bytes + repairIfTruncated so native export can validate declared size & keep _original backup
           return {
             filename: outName,
             folder,
             sourceKind: 'memory' as const,
             offset: 0,
-            size: payload.length,
+            size: item.size,
             discoveryCrc32: item.discoveryCrc32,
-            memoryBytes: payload,
+            ntfsCompressed: item.ntfsCompressed,
+            ntfsEncrypted: item.ntfsEncrypted,
+            memoryBytes: item.data,
             extension: item.extension,
-            repairIfTruncated: false,
+            repairIfTruncated: shouldRepair,
             modifiedAtMs: item.modifiedAt,
           };
         });
@@ -309,7 +313,8 @@ export const RecoveryModal: React.FC<RecoveryModalProps> = ({
         } else if (!res.canceled) {
           if (res.destinationDir) saveLastDestDir(res.destinationDir);
           const extras: string[] = [];
-          if ((res.verifiedCount ?? 0) > 0) extras.push(`${res.verifiedCount} CRC-verified`);
+          if ((res.verifiedCount ?? 0) > 0) extras.push(`${res.verifiedCount} header CRC-verified`);
+          if ((res.partialCount ?? 0) > 0) extras.push(`${res.partialCount} with zero-filled bad sectors`);
           if (res.repairedCount > 0) extras.push(`${res.repairedCount} repaired`);
           if ((res.originalKeptCount ?? 0) > 0) extras.push(`${res.originalKeptCount} untouched originals preserved`);
           const extraNote = extras.length > 0 ? ` (${extras.join(', ')})` : '';
@@ -336,11 +341,61 @@ export const RecoveryModal: React.FC<RecoveryModalProps> = ({
         ).showDirectoryPicker;
         const rootHandle = await dirPicker({ mode: 'readwrite' });
 
+        let savedCount = 0;
         let repairedCount = 0;
+        let originalKeptCount = 0;
+        const localFailures: NativeRecoverFailure[] = [];
         const usedPaths = new Set<string>();
         for (const item of filteredItems) {
           const folder = resolveOutputFolder(item);
           const outName = resolvePreferredExtension(item.filename, item.extension);
+          const shouldRepair =
+            enableFileRepair &&
+            (item.status === 'OK_TRUNCATED' ||
+              (item.status === 'HEADER_ONLY' && isNonMediaRepairableExtension(item.extension)));
+
+          let untouchedPayload: Uint8Array;
+          if (item.sourceRef?.browserFile) {
+            untouchedPayload = new Uint8Array(await item.sourceRef.browserFile.arrayBuffer());
+          } else {
+            untouchedPayload = item.data;
+          }
+
+          if (item.size > 0 && untouchedPayload.length < item.size) {
+            localFailures.push({
+              filename: outName,
+              reason: `Truncated/incomplete source payload (${untouchedPayload.length} of ${item.size} B) — skipped.`,
+            });
+            continue;
+          }
+
+          if (item.discoveryCrc32 !== undefined && untouchedPayload.length > 0) {
+            const actualHeadCrc =
+              computeCrc32(untouchedPayload, 0, Math.min(65536, untouchedPayload.length)) >>> 0;
+            if (actualHeadCrc !== (item.discoveryCrc32 >>> 0)) {
+              localFailures.push({
+                filename: outName,
+                reason: `64 KiB header CRC mismatch (expected 0x${(item.discoveryCrc32 >>> 0).toString(16)}, got 0x${actualHeadCrc.toString(16)}) — skipped.`,
+              });
+              continue;
+            }
+          }
+
+          let finalPayload = untouchedPayload;
+          let didRepair = false;
+          if (shouldRepair) {
+            const rep = repairFileBuffer(
+              item.extension,
+              untouchedPayload,
+              referenceVideoBytes ?? undefined,
+            );
+            if (rep.repaired) {
+              finalPayload = rep.data;
+              didRepair = true;
+              repairedCount++;
+            }
+          }
+
           const uniquePath = makeUniqueArchivePath(folder, outName, usedPaths);
           const uniqueFilename = uniquePath.slice(folder.length + 1);
           const parts = folder.split('/').filter(Boolean);
@@ -348,50 +403,32 @@ export const RecoveryModal: React.FC<RecoveryModalProps> = ({
           for (const part of parts) {
             curDir = await curDir.getDirectoryHandle(part, { create: true });
           }
+
+          if (didRepair && keepOriginalOnRepair) {
+            const dot = uniqueFilename.lastIndexOf('.');
+            const stem = dot > 0 ? uniqueFilename.slice(0, dot) : uniqueFilename;
+            const ext = dot > 0 ? uniqueFilename.slice(dot) : '';
+            const origUniquePath = makeUniqueArchivePath(folder, `${stem}_original${ext}`, usedPaths);
+            const origUniqueName = origUniquePath.slice(folder.length + 1);
+            const origHandle = await curDir.getFileHandle(origUniqueName, { create: true });
+            const origWritable = await origHandle.createWritable();
+            await origWritable.write(untouchedPayload.slice().buffer);
+            await origWritable.close();
+            originalKeptCount++;
+          }
+
           const fileHandle = await curDir.getFileHandle(uniqueFilename, { create: true });
           const writable = await fileHandle.createWritable();
-
-          const shouldRepair =
-            enableFileRepair &&
-            (item.status === 'OK_TRUNCATED' ||
-              (item.status === 'HEADER_ONLY' && isNonMediaRepairableExtension(item.extension)));
-          if (item.sourceRef?.browserFile) {
-            if (shouldRepair) {
-              let payload: Uint8Array = new Uint8Array(
-                await item.sourceRef.browserFile.arrayBuffer(),
-              );
-              const rep = repairFileBuffer(
-                item.extension,
-                payload,
-                referenceVideoBytes ?? undefined,
-              );
-              if (rep.repaired) {
-                payload = rep.data;
-                repairedCount++;
-              }
-              await writable.write(payload.slice().buffer);
-            } else {
-              await writable.write(item.sourceRef.browserFile);
-            }
-          } else {
-            let payload = item.data;
-            if (shouldRepair) {
-              const rep = repairFileBuffer(
-                item.extension,
-                payload,
-                referenceVideoBytes ?? undefined,
-              );
-              if (rep.repaired) {
-                payload = rep.data;
-                repairedCount++;
-              }
-            }
-            await writable.write(payload.slice().buffer);
-          }
+          await writable.write(finalPayload.slice().buffer);
           await writable.close();
+          savedCount++;
         }
+        if (localFailures.length > 0) setFailures(localFailures);
+        const extras: string[] = [];
+        if (repairedCount > 0) extras.push(`${repairedCount} repaired`);
+        if (originalKeptCount > 0) extras.push(`${originalKeptCount} untouched originals preserved`);
         setResultMessage(
-          `Saved ${filteredItems.length} file(s) directly to "${rootHandle.name}"${repairedCount > 0 ? ` (${repairedCount} repaired)` : ''}.`,
+          `Saved ${savedCount} file(s) directly to "${rootHandle.name}"${extras.length > 0 ? ` (${extras.join(', ')})` : ''}.`,
         );
         setSaving(false);
         return;
@@ -407,78 +444,230 @@ export const RecoveryModal: React.FC<RecoveryModalProps> = ({
       }
 
       let repairedCount = 0;
+      let originalKeptCount = 0;
+      let partialCount = 0;
+      let verifiedCount = 0;
+      const zipFailures: NativeRecoverFailure[] = [];
       const usedArchivePaths = new Set<string>();
       const archiveFiles: { name: string; data: Uint8Array }[] = [];
-      for (const item of filteredItems) {
-        let payload = item.data;
-        if (item.sourceRef?.browserFile) {
-          payload = new Uint8Array(await item.sourceRef.browserFile.arrayBuffer());
-        } else if (desktop && item.sourceRef?.kind === 'native-file' && item.sourceRef.devicePath) {
-          payload = await desktop.readDiskBytes(item.sourceRef.devicePath, 0, item.size);
-        } else if (
-          desktop &&
-          item.sourceRef?.kind === 'native-tsk' &&
-          item.sourceRef.devicePath
-        ) {
-          payload = await desktop.readDiskBytes(
-            item.sourceRef.devicePath,
-            0,
-            item.size,
-            item.sourceRef.tskInode,
-            item.sourceRef.tskOffset,
+
+      const readDetailed = async (
+        devicePath: string,
+        startByte: number,
+        wantBytes: number,
+        tskInode?: string,
+        tskOffset?: number,
+        sectorSize?: number,
+      ): Promise<{ bytes: Uint8Array; badSectors: number }> => {
+        if (desktop?.readDiskBytesDetailed) {
+          const res = await desktop.readDiskBytesDetailed(
+            devicePath,
+            startByte,
+            wantBytes,
+            tskInode,
+            tskOffset,
+            sectorSize,
           );
-        } else if (
-          desktop &&
-          item.sourceRef?.kind === 'native-runs' &&
-          item.sourceRef.devicePath &&
-          item.sourceRef.runs &&
-          item.sourceRef.runs.length > 0
-        ) {
-          const targetLen = Math.min(item.size, MAX_IN_MEMORY_ZIP_BYTES);
-          const assembled = new Uint8Array(targetLen);
-          let cursor = 0;
-          for (const run of item.sourceRef.runs) {
-            if (cursor >= targetLen) break;
-            const want = Math.min(run.length, targetLen - cursor);
-            if (want <= 0) continue;
-            if (run.offset >= 0) {
-              const part = await desktop.readDiskBytes(item.sourceRef.devicePath, run.offset, want);
-              if (part.length < want) {
-                throw new Error(`Short read assembling ${item.filename} (${part.length} < ${want} B).`);
-              }
-              assembled.set(part.subarray(0, want), cursor);
-            }
-            cursor += want;
-          }
-          payload = assembled.subarray(0, cursor);
-        } else if (
-          desktop &&
-          item.sourceRef?.kind === 'native-device' &&
-          item.sourceRef.devicePath
-        ) {
-          payload = await desktop.readDiskBytes(
-            item.sourceRef.devicePath,
-            item.sourceRef.offset,
-            item.size,
-          );
+          return { bytes: res.bytes, badSectors: res.badSectors || 0 };
         }
+        if (desktop) {
+          const bytes = await desktop.readDiskBytes(
+            devicePath,
+            startByte,
+            wantBytes,
+            tskInode,
+            tskOffset,
+            sectorSize,
+          );
+          return { bytes, badSectors: 0 };
+        }
+        return { bytes: new Uint8Array(0), badSectors: 0 };
+      };
+
+      for (const item of filteredItems) {
+        const outName = resolvePreferredExtension(item.filename, item.extension);
+        let payload = item.data;
+        let itemBadSectors = 0;
+
+        try {
+          if (item.sourceRef?.browserFile) {
+            payload = new Uint8Array(await item.sourceRef.browserFile.arrayBuffer());
+          } else if (desktop && item.sourceRef?.kind === 'native-file' && item.sourceRef.devicePath) {
+            const res = await readDetailed(
+              item.sourceRef.devicePath,
+              0,
+              item.size,
+              undefined,
+              undefined,
+              item.sourceRef.sectorSize,
+            );
+            payload = res.bytes;
+            itemBadSectors += res.badSectors;
+          } else if (
+            desktop &&
+            item.sourceRef?.kind === 'native-tsk' &&
+            item.sourceRef.devicePath
+          ) {
+            const res = await readDetailed(
+              item.sourceRef.devicePath,
+              0,
+              item.size,
+              item.sourceRef.tskInode,
+              item.sourceRef.tskOffset,
+              item.sourceRef.sectorSize,
+            );
+            payload = res.bytes;
+            itemBadSectors += res.badSectors;
+          } else if (
+            desktop &&
+            item.sourceRef?.kind === 'native-runs' &&
+            item.sourceRef.devicePath &&
+            item.sourceRef.runs &&
+            item.sourceRef.runs.length > 0
+          ) {
+            const runsTotal = item.sourceRef.runs.reduce(
+              (s, r) => s + (Number.isFinite(r.length) && r.length > 0 ? Math.floor(r.length) : 0),
+              0,
+            );
+            if (item.size > 0 && runsTotal < item.size) {
+              zipFailures.push({
+                filename: outName,
+                reason: `Incomplete extent run list (${runsTotal} of ${item.size} B) — skipped.`,
+              });
+              continue;
+            }
+            const targetLen = Math.min(item.size, MAX_IN_MEMORY_ZIP_BYTES);
+            const assembled = new Uint8Array(targetLen);
+            let cursor = 0;
+            let shortReadErr: string | null = null;
+            for (const run of item.sourceRef.runs) {
+              if (cursor >= targetLen) break;
+              const want = Math.min(run.length, targetLen - cursor);
+              if (want <= 0) continue;
+              if (run.offset >= 0) {
+                const partRes = await readDetailed(
+                  item.sourceRef.devicePath,
+                  run.offset,
+                  want,
+                  undefined,
+                  undefined,
+                  item.sourceRef.sectorSize,
+                );
+                itemBadSectors += partRes.badSectors;
+                if (partRes.bytes.length < want) {
+                  shortReadErr = `Short read assembling ${outName} (${partRes.bytes.length} < ${want} B).`;
+                  break;
+                }
+                assembled.set(partRes.bytes.subarray(0, want), cursor);
+              }
+              cursor += want;
+            }
+            if (shortReadErr || cursor < targetLen) {
+              zipFailures.push({
+                filename: outName,
+                reason: shortReadErr || `Incomplete extent assembly (${cursor} of ${targetLen} B) — skipped.`,
+              });
+              continue;
+            }
+            payload = assembled.subarray(0, cursor);
+          } else if (
+            desktop &&
+            item.sourceRef?.kind === 'native-device' &&
+            item.sourceRef.devicePath
+          ) {
+            const res = await readDetailed(
+              item.sourceRef.devicePath,
+              item.sourceRef.offset,
+              item.size,
+              undefined,
+              undefined,
+              item.sourceRef.sectorSize,
+            );
+            payload = res.bytes;
+            itemBadSectors += res.badSectors;
+          }
+        } catch (readErr) {
+          zipFailures.push({
+            filename: outName,
+            reason: readErr instanceof Error ? readErr.message : 'Read error while building ZIP entry',
+          });
+          continue;
+        }
+
+        if (item.size > 0 && payload.length < item.size) {
+          zipFailures.push({
+            filename: outName,
+            reason: `Short read (${payload.length} of ${item.size} B) — skipped instead of packing truncated bytes.`,
+          });
+          continue;
+        }
+
+        if (item.discoveryCrc32 !== undefined && payload.length > 0) {
+          const actualHeadCrc = computeCrc32(payload, 0, Math.min(65536, payload.length)) >>> 0;
+          if (actualHeadCrc !== (item.discoveryCrc32 >>> 0)) {
+            zipFailures.push({
+              filename: outName,
+              reason: `64 KiB header CRC mismatch (expected 0x${(item.discoveryCrc32 >>> 0).toString(16)}, got 0x${actualHeadCrc.toString(16)}) — skipped.`,
+            });
+            continue;
+          }
+          if (itemBadSectors === 0) {
+            verifiedCount++;
+          }
+        }
+
+        if (itemBadSectors > 0) {
+          partialCount++;
+          zipFailures.push({
+            filename: outName,
+            reason: `Partial recovery: ${itemBadSectors} unreadable sector(s) zero-filled inside ZIP entry.`,
+          });
+        }
+
+        if (item.ntfsEncrypted) {
+          zipFailures.push({
+            filename: outName,
+            reason: 'Raw NTFS EFS encrypted stream packed without decryption (requires Windows EFS key).',
+          });
+        } else if (item.ntfsCompressed) {
+          zipFailures.push({
+            filename: outName,
+            reason: 'Raw NTFS compressed stream packed without LZNT1 decompression.',
+          });
+        }
+
+        const untouchedPayload = payload;
+        let finalPayload = untouchedPayload;
+        let didRepair = false;
 
         if (
           enableFileRepair &&
           (item.status === 'OK_TRUNCATED' ||
             (item.status === 'HEADER_ONLY' && isNonMediaRepairableExtension(item.extension)))
         ) {
-          const rep = repairFileBuffer(item.extension, payload, referenceVideoBytes ?? undefined);
+          const rep = repairFileBuffer(
+            item.extension,
+            untouchedPayload,
+            referenceVideoBytes ?? undefined,
+          );
           if (rep.repaired) {
-            payload = rep.data;
+            finalPayload = rep.data;
+            didRepair = true;
             repairedCount++;
           }
         }
 
         const folder = resolveOutputFolder(item);
-        const outName = resolvePreferredExtension(item.filename, item.extension);
         const archivePath = makeUniqueArchivePath(folder, outName, usedArchivePaths);
-        archiveFiles.push({ name: archivePath, data: payload });
+        if (didRepair && keepOriginalOnRepair) {
+          const dot = outName.lastIndexOf('.');
+          const stem = dot > 0 ? outName.slice(0, dot) : outName;
+          const ext = dot > 0 ? outName.slice(dot) : '';
+          const origArchivePath = makeUniqueArchivePath(folder, `${stem}_original${ext}`, usedArchivePaths);
+          archiveFiles.push({ name: origArchivePath, data: untouchedPayload });
+          originalKeptCount++;
+        }
+        archiveFiles.push({ name: archivePath, data: finalPayload });
       }
 
       if (includeRepairedImg && repairedDiskBytes) {
@@ -486,6 +675,16 @@ export const RecoveryModal: React.FC<RecoveryModalProps> = ({
           name: diskName.replace(/(\.[^.]+)?$/, '_repaired$1'),
           data: repairedDiskBytes,
         });
+      }
+
+      if (zipFailures.length > 0) {
+        setFailures(zipFailures);
+      }
+
+      if (archiveFiles.length === 0) {
+        setErrorMessage('No valid files passed read/CRC checks to pack into Portable ZIP.');
+        setSaving(false);
+        return;
       }
 
       const zipBytes = createZipArchive(archiveFiles);
@@ -496,8 +695,13 @@ export const RecoveryModal: React.FC<RecoveryModalProps> = ({
       a.download = `recovery_${archiveFiles.length}_files.zip`;
       a.click();
       URL.revokeObjectURL(url);
+      const extras: string[] = [];
+      if (verifiedCount > 0) extras.push(`${verifiedCount} header CRC-verified`);
+      if (partialCount > 0) extras.push(`${partialCount} with zero-filled bad sectors`);
+      if (repairedCount > 0) extras.push(`${repairedCount} repaired`);
+      if (originalKeptCount > 0) extras.push(`${originalKeptCount} untouched originals preserved`);
       setResultMessage(
-        `Saved ${archiveFiles.length} file(s) into recovery_${archiveFiles.length}_files.zip${repairedCount > 0 ? ` (${repairedCount} repaired)` : ''}.`,
+        `Saved ${archiveFiles.length} entry/entries into recovery_${archiveFiles.length}_files.zip${extras.length > 0 ? ` (${extras.join(', ')})` : ''}.`,
       );
     } catch (err) {
       if ((err as { name?: string })?.name !== 'AbortError') {
@@ -705,7 +909,7 @@ export const RecoveryModal: React.FC<RecoveryModalProps> = ({
 
             {enableFileRepair && (
               <label className="flex items-center justify-between px-2 pt-1 text-[11px] text-slate-300 cursor-pointer">
-                <span>Also keep untouched original (.orig) alongside repaired copy</span>
+                <span>Also keep untouched original (_original) alongside repaired copy</span>
                 <input
                   type="checkbox"
                   checked={keepOriginalOnRepair}
@@ -754,12 +958,34 @@ export const RecoveryModal: React.FC<RecoveryModalProps> = ({
             </div>
           )}
 
+          {zipSameDriveRisk && (
+            <div className="flex items-start gap-2 text-xs text-amber-200 bg-amber-500/10 border border-amber-500/35 rounded-md px-3 py-2">
+              <AlertTriangle className="w-4 h-4 text-amber-400 shrink-0 mt-0.5" />
+              <span>
+                Portable ZIP downloads to your browser Downloads folder (often on C:). If{' '}
+                {Array.from(sourceDriveLetters).join(', ')} is the scanned drive, switch to Local
+                Folder on a separate drive to avoid overwriting deleted data.
+              </span>
+            </div>
+          )}
+
+          {hasNtfsRawStreams && (
+            <div className="flex items-start gap-2 text-[11px] text-amber-200 bg-amber-500/10 border border-amber-500/30 rounded-md px-3 py-2">
+              <AlertTriangle className="w-3.5 h-3.5 text-amber-400 shrink-0 mt-0.5" />
+              <span>
+                Selection includes NTFS-compressed or EFS-encrypted records — raw cluster streams
+                are exported without decompression or EFS decryption and logged in the audit report.
+              </span>
+            </div>
+          )}
+
           {scannedDevicePath && (
             <div className="flex items-start gap-2 text-[11px] text-slate-300 bg-[#181B22] border border-[#2D3342] rounded-md px-3 py-2">
               <AlertTriangle className="w-3.5 h-3.5 text-amber-400 shrink-0 mt-0.5" />
               <span>
-                SSD / NVMe TRIM notice: Operating systems zero trimmed blocks shortly after deletion;
-                files showing high zero-fill or CRC mismatch cannot be reconstructed after TRIM.
+                SSD / NVMe TRIM notice: Solid-state drives often reclaim deleted blocks shortly after
+                TRIM/deallocate commands, though host-visible zeroes depend on SSD firmware and
+                I/O errors or overwrites can produce similar zero-fill or CRC mismatches.
               </span>
             </div>
           )}

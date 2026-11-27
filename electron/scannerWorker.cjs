@@ -52,6 +52,13 @@ function checkOffsetAllocation(absOffset, unallocatedOnly, allocatedBitmaps) {
       const lcn = Math.floor((absOffset - bmInfo.volStart) / bmInfo.clusterBytes);
       const bIdx = lcn >>> 3;
       if (bIdx < bmInfo.bitmap.length) {
+        if (bmInfo.sectorValidity) {
+          const secIdx = bIdx >>> 9;
+          const vByte = secIdx >>> 3;
+          if (vByte >= bmInfo.sectorValidity.length || (bmInfo.sectorValidity[vByte] & (1 << (secIdx & 7))) === 0) {
+            return { allocated: false, verified: false };
+          }
+        }
         return {
           allocated: (bmInfo.bitmap[bIdx] & (1 << (lcn & 7))) !== 0,
           verified: true,
@@ -61,6 +68,44 @@ function checkOffsetAllocation(absOffset, unallocatedOnly, allocatedBitmaps) {
     }
   }
   return { allocated: false, verified: false };
+}
+
+function checkRangeAllocation(absOffset, sizeBytes, unallocatedOnly, allocatedBitmaps) {
+  if (!unallocatedOnly || !allocatedBitmaps || allocatedBitmaps.length === 0) {
+    return { anyAllocated: false, allVerified: false };
+  }
+  const len = Math.max(1, Math.min(Number(sizeBytes) || 1, 128 * 1024 * 1024));
+  const endOffset = absOffset + len;
+  let allVerified = true;
+  let pos = absOffset;
+
+  while (pos < endOffset) {
+    let stepBytes = 4096;
+    let matchedBm = null;
+    for (const bmInfo of allocatedBitmaps) {
+      if (pos >= bmInfo.volStart && pos < bmInfo.volEnd) {
+        matchedBm = bmInfo;
+        stepBytes = Math.max(512, bmInfo.clusterBytes || 4096);
+        break;
+      }
+    }
+    const check = checkOffsetAllocation(pos, true, allocatedBitmaps);
+    if (check.allocated) {
+      return { anyAllocated: true, allVerified: false };
+    }
+    if (!check.verified) {
+      allVerified = false;
+    }
+    if (!matchedBm) {
+      allVerified = false;
+      pos += 4096;
+    } else {
+      const clusterIndex = Math.floor((pos - matchedBm.volStart) / stepBytes);
+      const nextClusterPos = matchedBm.volStart + (clusterIndex + 1) * stepBytes;
+      pos = Math.max(pos + 512, nextClusterPos);
+    }
+  }
+  return { anyAllocated: false, allVerified };
 }
 
 function isSectorAllZero(buf, offset) {
@@ -478,8 +523,18 @@ async function scanRange({
   try {
     fd = fs.openSync(devicePath, 'r');
   } catch (err) {
-    emit({ type: 'error', workerIndex, message: err?.message || 'openSync failed' });
-    return { entries: [], skippedBytes: 0, skippedSectors: 0, skippedRanges: [], unverifiedCoverage: false };
+    const errMsg = err?.message || 'openSync failed';
+    emit({ type: 'error', workerIndex, error: errMsg, message: errMsg });
+    return {
+      entries: [],
+      skippedBytes: 0,
+      skippedSectors: 0,
+      skippedRanges: [],
+      unverifiedCoverage: false,
+      earlyEof: true,
+      bytesScanned: 0,
+      expectedBytes: Math.max(0, rangeEnd - rangeStart),
+    };
   }
 
   const sectorSize = requestedSectorSize
@@ -488,7 +543,12 @@ async function scanRange({
   const scanStep = Math.max(512, Number(step) || 512);
   const chunkSize = 4 * 1024 * 1024;
   const chunkBuf = Buffer.allocUnsafe(chunkSize);
-  let cursor = Math.max(0, Math.floor(rangeStart / scanStep) * scanStep);
+  const cursorStart = Math.max(0, Math.floor(rangeStart / scanStep) * scanStep);
+  let cursor = cursorStart;
+  const expectedBytes = Math.max(0, Math.min(totalLimitBytes, rangeEnd) - cursorStart);
+  let totalBytesScanned = 0;
+  let cancelled = false;
+  let readErrorEmitted = false;
   let fileSeq = 1;
   let unverifiedCoverage = Boolean(unallocatedOnly && (!allocatedBitmaps || allocatedBitmaps.length === 0));
   let totalSkippedSectors = 0;
@@ -498,7 +558,10 @@ async function scanRange({
 
   try {
     while (cursor < rangeEnd) {
-      if (checkCtrlSync(ctrl)) break;
+      if (checkCtrlSync(ctrl)) {
+        cancelled = true;
+        break;
+      }
 
       const remaining = rangeEnd - cursor;
       const readStepAlign = Math.max(scanStep, sectorSize);
@@ -512,7 +575,9 @@ async function scanRange({
       try {
         readRes = readAlignedResilientSync(fd, chunkBuf, 0, Math.min(chunkSize, windowLen), cursor, sectorSize);
       } catch (err) {
-        emit({ type: 'error', workerIndex, message: err?.message || 'Read failure' });
+        const errMsg = err?.message || 'Read failure';
+        readErrorEmitted = true;
+        emit({ type: 'error', workerIndex, error: errMsg, message: errMsg });
         break;
       }
 
@@ -538,7 +603,10 @@ async function scanRange({
       const batch = [];
 
       while (local + 16 <= n && cursor + local < rangeEnd) {
-        if (checkCtrlSync(ctrl)) break;
+        if (checkCtrlSync(ctrl)) {
+          cancelled = true;
+          break;
+        }
         const absOffset = cursor + local;
 
         const allocCheck = checkOffsetAllocation(absOffset, unallocatedOnly, allocatedBitmaps);
@@ -817,6 +885,20 @@ async function scanRange({
         }
 
         if (matchedExt && measured && measured.size >= 32) {
+          let spanVerified = allocCheck.verified;
+          if (unallocatedOnly) {
+            const spanAlloc = checkRangeAllocation(absOffset, measured.size, true, allocatedBitmaps);
+            if (spanAlloc.anyAllocated) {
+              local += scanStep;
+              continue;
+            }
+            if (!spanAlloc.allVerified) {
+              unverifiedCoverage = true;
+              spanVerified = false;
+            } else {
+              spanVerified = true;
+            }
+          }
           const pad = String(fileSeq).padStart(5, '0');
           const filename = `${matchedExt.toUpperCase()}_W${workerIndex}_${pad}.${matchedExt}`;
           const headerLen = Math.min(65536, measured.size);
@@ -837,7 +919,7 @@ async function scanRange({
             sizeEstimated: isEstimated,
             modifiedAt: undefined,
             sourceKind: 'carved',
-            isDeleted: unallocatedOnly && allocCheck.verified ? true : undefined,
+            isDeleted: unallocatedOnly && spanVerified ? true : undefined,
             scanPhase: 'deep',
             offset: absOffset,
             sector: Math.floor(absOffset / sectorSize),
@@ -864,6 +946,7 @@ async function scanRange({
       }
       const delta = Math.min(n, Math.max(0, rangeEnd - cursor));
       cursor += delta;
+      totalBytesScanned += delta;
       emit({
         type: 'progress',
         workerIndex,
@@ -872,7 +955,17 @@ async function scanRange({
         latestName: batch.length > 0 ? batch[batch.length - 1].filename : undefined,
       });
 
+      if (n < Math.min(chunkSize, windowLen) && cursor < rangeEnd) {
+        break;
+      }
+
       await new Promise((r) => setTimeout(r, 0));
+    }
+
+    const earlyEof = !cancelled && cursor < Math.min(totalLimitBytes, rangeEnd);
+    if (earlyEof && !readErrorEmitted) {
+      const eofMsg = `Deep scan worker ${workerIndex} ended early at byte ${cursor} of ${Math.min(totalLimitBytes, rangeEnd)} (early EOF or device disconnect).`;
+      emit({ type: 'error', workerIndex, error: eofMsg, message: eofMsg });
     }
 
     emit({
@@ -881,6 +974,9 @@ async function scanRange({
       skippedSectors: totalSkippedSectors,
       skippedBytes: totalSkippedBytes,
       unverifiedCoverage,
+      earlyEof,
+      bytesScanned: totalBytesScanned,
+      expectedBytes,
     });
     return {
       entries: collectedEntries,
@@ -888,6 +984,9 @@ async function scanRange({
       skippedBytes: totalSkippedBytes,
       skippedRanges: allSkippedRanges,
       unverifiedCoverage,
+      earlyEof,
+      bytesScanned: totalBytesScanned,
+      expectedBytes,
     };
   } finally {
     fs.closeSync(fd);
@@ -899,10 +998,12 @@ if (!isMainThread && parentPort && workerData) {
     ...workerData,
     emit: (msg) => parentPort.postMessage(msg),
   }).catch((err) => {
+    const errMsg = err?.message || 'worker error';
     parentPort.postMessage({
       type: 'error',
       workerIndex: workerData?.workerIndex ?? 0,
-      message: err?.message || 'worker error',
+      error: errMsg,
+      message: errMsg,
     });
   });
 }
@@ -910,6 +1011,7 @@ if (!isMainThread && parentPort && workerData) {
 module.exports = {
   scanRange,
   checkOffsetAllocation,
+  checkRangeAllocation,
   measureMp4FromFd,
   measureJpgFromFd,
   measurePngFromFd,
